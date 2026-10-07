@@ -545,3 +545,20 @@ func TestGroupsSkipOriginalsByDefault(t *testing.T) {
 		t.Fatal("explicit on")
 	}
 }
+
+func TestAllowRemoteKeepsHostCheck(t *testing.T) {
+	a := testApp(t)
+	a.allowRemote = true
+	for _, tc := range []struct {
+		host string
+		want int
+	}{{"127.0.0.1:8787", 200}, {"evil.example:8787", 403}} {
+		r := httptest.NewRequest("GET", "/api/state", nil)
+		r.RemoteAddr, r.Host = "172.17.0.1:5000", tc.host // Docker 网桥转发的请求
+		w := httptest.NewRecorder()
+		a.handler().ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("host %s: got %d", tc.host, w.Code)
+		}
+	}
+}

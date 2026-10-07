@@ -59,11 +59,12 @@ type App struct {
 	listeners map[chan struct{}]bool // 网页 SSE 连接
 
 	// 以下只在内存中
-	connection string               // 手机连接状态文字
-	lastError  string               // 最近一次需要提示的错误
-	device     json.RawMessage      // 手机最近一次上报的状态
-	aiCursor   map[string]int64     // 会话 → AI 已检查到的消息序号
-	aiLastRun  map[string]time.Time // 会话 → 上次自动生成时间
+	connection  string               // 手机连接状态文字
+	lastError   string               // 最近一次需要提示的错误
+	allowRemote bool                 // 允许非回环来源地址（容器内运行时使用）
+	device      json.RawMessage      // 手机最近一次上报的状态
+	aiCursor    map[string]int64     // 会话 → AI 已检查到的消息序号
+	aiLastRun   map[string]time.Time // 会话 → 上次自动生成时间
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -203,6 +204,7 @@ func pause(ctx context.Context, d time.Duration) bool {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8787", "监听地址")
+	allowRemote := flag.Bool("allow-remote", false, "允许非本机来源地址访问网页（仅在 Docker 中使用，端口只映射到宿主机 127.0.0.1）")
 	dbPath := flag.String("db", ".state/wechat.db", "SQLite 数据库文件")
 	legacy := flag.String("data", ".state/state.json", "旧版 JSON 数据，数据库为空时自动导入")
 	bootstrap := flag.String("bootstrap", "../wechat-bridge/.state/credentials.json", "首次运行时导入手机 Token 的文件")
@@ -239,6 +241,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	a.ctx = ctx
+	a.allowRemote = *allowRemote
 	go a.eventLoop(ctx)
 	go a.worker(ctx)
 	go a.aiLoop(ctx)

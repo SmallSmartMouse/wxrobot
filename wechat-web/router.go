@@ -17,7 +17,7 @@ import (
 func (a *App) handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery(), localOnly)
+	r.Use(gin.Recovery(), a.localOnly)
 
 	api := r.Group("/api")
 	api.GET("/state", a.getState)
@@ -54,7 +54,9 @@ func (a *App) handler() http.Handler {
 }
 
 // localOnly 只允许本机访问，并拒绝跨站请求和 DNS 重绑定（Host 必须是本机名）。
-func localOnly(c *gin.Context) {
+// 在 Docker 里运行时，浏览器请求经过网桥转发、来源地址不是回环地址，需用 -allow-remote 放开来源检查；
+// Host 和 Origin 检查仍然有效，端口应只映射到宿主机的 127.0.0.1。
+func (a *App) localOnly(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
@@ -69,7 +71,8 @@ func localOnly(c *gin.Context) {
 		sameOrigin = true
 	}
 	ip := net.ParseIP(remote)
-	if ip == nil || !ip.IsLoopback() || (host != "localhost" && host != "127.0.0.1" && host != "::1") || !sameOrigin {
+	fromLocal := a.allowRemote || (ip != nil && ip.IsLoopback())
+	if !fromLocal || (host != "localhost" && host != "127.0.0.1" && host != "::1") || !sameOrigin {
 		fail(c, 403, "仅允许本机网页访问")
 		c.Abort()
 		return

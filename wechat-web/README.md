@@ -18,6 +18,19 @@ Go + Gin + `openai-go`，前端通过 `go:embed` 编进同一个程序。
 | `-phone` | 空；首次启动可填手机 IP，并从 `-bootstrap` 文件导入 Token |
 | `-bootstrap` | `../wechat-bridge/.state/credentials.json` |
 
+## Docker
+
+推送到 `main` 或打 `v*` 标签后，GitHub Actions（`.github/workflows/docker-image.yml`）会测试并构建 amd64/arm64 镜像，推送到 `ghcr.io/smallsmartmouse/wxrobot-web`。
+
+```bash
+docker run -d --name wxrobot-web -p 127.0.0.1:8787:8787 -v wxrobot-data:/data ghcr.io/smallsmartmouse/wxrobot-web:latest
+```
+
+- 端口只映射到宿主机的 `127.0.0.1`：镜像以 `-allow-remote` 启动以接受 Docker 网桥转发的请求，但仍只接受 Host 为本机名的访问。
+- 数据库和图片在 `/data` 卷中。迁移已有数据：停止服务后把 `.state/wechat.db*` 和 `.state/media/` 复制进卷。
+- 容器需要能访问手机所在的局域网（Docker Desktop 默认可以）。日志输出到 `docker logs`，调试页不显示服务日志。
+- 镜像包默认是私有的，拉取前先 `docker login ghcr.io`，或在 GitHub 包设置里改为公开。
+
 ## 代码结构
 
 | 文件 | 内容 |

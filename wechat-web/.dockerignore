@@ -1,0 +1,6 @@
+# 本地数据、凭证和编译产物不进入镜像构建上下文
+.state/
+wechat-web
+*.log
+Dockerfile
+.dockerignore
