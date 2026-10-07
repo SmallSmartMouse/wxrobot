@@ -29,7 +29,7 @@ docker run -d --name wxrobot-web -p 127.0.0.1:8787:8787 -v wxrobot-data:/data gh
 - 端口只映射到宿主机的 `127.0.0.1`：镜像以 `-allow-remote` 启动以接受 Docker 网桥转发的请求，但仍只接受 Host 为本机名的访问。
 - 数据库和图片在 `/data` 卷中。迁移已有数据：停止服务后把 `.state/wechat.db*` 和 `.state/media/` 复制进卷。
 - 容器需要能访问手机所在的局域网（Docker Desktop 默认可以）。日志输出到 `docker logs`，调试页不显示服务日志。
-- 镜像包默认是私有的，拉取前先 `docker login ghcr.io`，或在 GitHub 包设置里改为公开。
+- 仓库公开时镜像包也是公开的，可以直接拉取；仓库改为私有后需要先 `docker login ghcr.io`。
 
 ## 代码结构
 
