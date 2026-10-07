@@ -63,16 +63,18 @@ function avatar(c, className = "avatar") {
     return el("span", group ? "群" : Array.from(c.title)[0], className + (group ? " group" : ""));
 }
 
-// 显示 hash 对应的图片；点击打开 fullHash（原图），没有原图时打开同一张。
-function imageLink(hash, alt, fullHash) {
+// 显示图片，点击在新标签页打开。图片加载后内容变高：如果正停在底部，保持在底部。
+function imageLink(hash, alt) {
     const link = el("a");
-    link.href = "/api/media/" + (fullHash || hash);
+    link.href = "/api/media/" + hash;
     link.target = "_blank";
     link.rel = "noopener";
     const img = el("img", undefined, "chat-image");
-    img.src = "/api/media/" + hash;
+    img.src = link.href;
     img.alt = alt;
-    img.loading = "lazy";
+    img.onload = () => {
+        if (list.stick) scrollToLatest(false);
+    };
     link.append(img);
     return link;
 }
@@ -208,35 +210,95 @@ function renderChat() {
     renderMessages(ops.filter((op) => op.kind === "send" && ["queued", "running"].includes(op.status)).reverse());
 }
 
+// ---------- 消息列表 ----------
+// 按消息编号复用已渲染的节点，只新增或替换有变化的消息：已加载的图片不会重新加载，滚动位置也不会跳。
+// 停在底部时新消息自动跟随；往上翻看历史时不滚动，只提示有几条新消息。
+const list = { conversationId: null, nodes: new Map(), stick: true, unseen: 0 };
+
+function atBottom() {
+    const box = $("messages");
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+}
+
+function scrollToLatest(smooth) {
+    const box = $("messages");
+    box.scrollTo({ top: box.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+    list.stick = true;
+    list.unseen = 0;
+    $("new-messages").hidden = true;
+}
+
+$("messages").onscroll = () => {
+    list.stick = atBottom();
+    if (list.stick) {
+        list.unseen = 0;
+        $("new-messages").hidden = true;
+    }
+};
+$("new-messages").onclick = () => scrollToLatest(true);
+
 // 正文消息 + 尚未完成的发送任务（显示在末尾）。
 function renderMessages(pendingSends) {
     const box = $("messages");
-    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    box.replaceChildren();
-    if (!conversation.messages.length && !pendingSends.length) {
+    const opened = list.conversationId !== conversation.id;
+    if (opened) {
+        list.conversationId = conversation.id;
+        list.nodes = new Map();
+    }
+    const items = [
+        ...conversation.messages.map((m) => ({ key: "m:" + m.id, sig: JSON.stringify(m), incoming: m.direction !== "outgoing", build: () => messageNode(m) })),
+        ...pendingSends.map((op) => ({ key: "op:" + op.id, sig: op.status, incoming: false, build: () => pendingNode(op) }))
+    ];
+    const nodes = new Map();
+    let added = 0;
+    const children = items.map((item) => {
+        let entry = list.nodes.get(item.key);
+        if (!entry && item.incoming) added++;
+        if (!entry || entry.sig !== item.sig) entry = { sig: item.sig, node: item.build() };
+        nodes.set(item.key, entry);
+        return entry.node;
+    });
+    list.nodes = nodes;
+    if (!children.length) {
         const empty = el("div", undefined, "messages-empty");
         empty.append(el("strong", "等待新消息"), el("span", "来信后会自动读取聊天正文，也可以主动从手机读取。"));
-        box.append(empty);
+        children.push(empty);
     }
-    for (const m of conversation.messages) {
-        if (m.gap) box.append(el("div", "此处与之前的记录没能衔接，中间可能有遗漏或重复", "gap-note"));
-        const preview = m.image_hash || m.original_hash;
-        const bubble = el("div", preview ? undefined : m.text, "bubble");
-        if (preview) bubble.append(imageLink(preview, "微信图片", m.original_hash));
-        if (m.image_error && !preview) bubble.append(el("small", m.image_error));
-        if (m.kind === "image" && !m.original_hash && m.original_error) bubble.append(el("small", "原图：" + m.original_error));
-        const meta = [timeLabel(m.time)];
-        if (m.original_hash) meta.push(m.original_note ? "大图截图" : "原图");
-        if (m.original_note) bubble.append(el("small", m.original_note));
-        if (m.direction === "unknown") meta.push("方向未识别");
-        box.append(messageRow(m.direction === "outgoing", bubble, meta));
+    const top = box.scrollTop;
+    box.replaceChildren(...children);
+    if (opened || list.stick) {
+        scrollToLatest(false);
+    } else {
+        box.scrollTop = top;
+        if (added) {
+            list.unseen += added;
+            $("new-messages").textContent = "↓ " + list.unseen + " 条新消息";
+            $("new-messages").hidden = false;
+        }
     }
-    for (const op of pendingSends) {
-        const bubble = el("div", op.text, "bubble");
-        if (op.image_hash) bubble.append(imageLink(op.image_hash, "待发送图片"));
-        box.append(messageRow(true, bubble, [STATUS[op.status]]));
-    }
-    if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function messageNode(m) {
+    const node = el("div");
+    if (m.gap) node.append(el("div", "此处与之前的记录没能衔接，中间可能有遗漏或重复", "gap-note"));
+    // 有原图就直接显示原图，否则显示聊天页面的缩略图。
+    const image = m.original_hash || m.image_hash;
+    const bubble = el("div", image ? undefined : m.text, "bubble");
+    if (image) bubble.append(imageLink(image, "微信图片"));
+    if (m.image_error && !image) bubble.append(el("small", m.image_error));
+    if (m.kind === "image" && !m.original_hash && m.original_error) bubble.append(el("small", "原图：" + m.original_error));
+    if (m.original_note) bubble.append(el("small", m.original_note));
+    const meta = [timeLabel(m.time)];
+    if (m.kind === "image") meta.push(m.original_hash ? (m.original_note ? "大图截图" : "原图") : "缩略图");
+    if (m.direction === "unknown") meta.push("方向未识别");
+    node.append(messageRow(m.direction === "outgoing", bubble, meta));
+    return node;
+}
+
+function pendingNode(op) {
+    const bubble = el("div", op.text, "bubble");
+    if (op.image_hash) bubble.append(imageLink(op.image_hash, "待发送图片"));
+    return messageRow(true, bubble, [STATUS[op.status]]);
 }
 
 function messageRow(outgoing, bubble, meta) {
@@ -254,6 +316,7 @@ function messageRow(outgoing, bubble, meta) {
 async function selectChat(id) {
     active = id;
     conversation = null;
+    list.conversationId = null; // 重新打开会话时跳到最新消息
     document.querySelector(".app").classList.add("chat-open");
     await refresh();
 }

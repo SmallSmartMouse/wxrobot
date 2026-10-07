@@ -41,7 +41,7 @@ func (a *App) storeJPEG(data []byte) (string, error) {
 // saveThumbnail 保存手机截取的聊天图片缩略图，返回哈希或错误说明。
 func (a *App) saveThumbnail(b64 string) (hash, problem string) {
 	data, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil || len(data) > 200000 {
+	if err != nil || len(data) > 400000 {
 		return "", "图片编码无效或过大"
 	}
 	if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > 1080 || cfg.Height > 1920 {

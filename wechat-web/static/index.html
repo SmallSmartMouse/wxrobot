@@ -93,7 +93,10 @@
         <label>读取最近 <input id="limit" type="number" min="1" max="100" value="20" aria-label="读取数量"> 条</label>
         <button id="read" class="text-button">↻ 从手机读取</button>
       </div>
-      <div id="messages" class="messages"></div>
+      <div class="messages-wrap">
+        <div id="messages" class="messages"></div>
+        <button id="new-messages" class="new-messages" hidden></button>
+      </div>
       <div id="operation-note" class="operation-note" hidden></div>
       <div class="composer">
         <textarea id="message" placeholder="输入消息，Enter 发送，Shift + Enter 换行" maxlength="2000" rows="3"></textarea>

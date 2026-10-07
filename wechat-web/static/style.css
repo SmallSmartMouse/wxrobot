@@ -460,11 +460,30 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
   background: #fcfdfb;
 }
 
+.messages-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
 .messages {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 25px 35px 30px;
-  scroll-behavior: smooth;
+}
+.new-messages {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  padding: 8px 16px;
+  border-radius: 18px;
+  background: var(--green);
+  color: #fff;
+  font-size: 12px;
+  box-shadow: 0 4px 14px #142c2730;
 }
 
 .message-row {
@@ -782,8 +801,8 @@ dialog::backdrop {
 
 .chat-image {
   display: block;
-  max-width: 280px;
-  max-height: 300px;
+  max-width: min(360px, 100%);
+  max-height: 420px;
   border-radius: 8px;
   object-fit: contain;
 }

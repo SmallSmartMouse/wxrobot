@@ -395,8 +395,9 @@ module.exports = function (config, workDir) {
         var crop = null;
         try {
             crop = images.clip(shot, b.left, b.top, b.width(), b.height());
-            var data = String(images.toBase64(crop, "jpg", 55));
-            if (data.length > 200000) item.image_error = "缩略图超过大小限制";
+            // 缩略图尺寸受限于手机屏幕上的显示大小，压缩质量尽量高；要清晰原图请开启“取原图”。
+            var data = String(images.toBase64(crop, "jpg", 85));
+            if (data.length > 500000) item.image_error = "缩略图超过大小限制";
             else item.thumbnail = data;
         } catch (_) {
             item.image_error = "缩略图获取失败";

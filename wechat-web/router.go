@@ -475,5 +475,7 @@ func (a *App) getMedia(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "image/jpeg")
+	// 文件名是内容哈希，内容不会变，允许浏览器长期缓存，避免刷新时重复加载图片。
+	c.Header("Cache-Control", "private, max-age=31536000, immutable")
 	c.File(path)
 }
