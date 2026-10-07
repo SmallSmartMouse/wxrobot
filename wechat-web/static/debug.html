@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>执行诊断</title><link rel="stylesheet" href="/debug.css"></head>
+<body>
+<header><a href="/">返回消息台</a><h1>执行诊断</h1><button id="refresh">刷新</button><label><input id="auto" type="checkbox" checked> 每 5 秒刷新</label></header>
+<p>仅本机可访问。任务结果包含手机上报的执行阶段、耗时和异常；服务日志显示最后 64 KB。</p>
+<p id="status" role="status"></p>
+<section><h2>连接与手机状态</h2><pre id="device"></pre></section>
+<section><h2>最近读写任务</h2><p>展开任务查看执行结果。已点击发送但未确认的任务，请先核对手机再决定是否重发。</p><div id="tasks"></div></section>
+<section><h2>最近 AI 任务</h2><div id="jobs"></div></section>
+<section><h2>服务执行日志</h2><p id="log-note"></p><pre id="log"></pre></section>
+<script src="/debug.js"></script>
+</body></html>

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>微信消息台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <aside id="system-sidebar" class="system-sidebar" aria-label="系统配置">
+    <button id="system-toggle" class="system-toggle" aria-expanded="true" title="折叠系统栏">
+      <span aria-hidden="true">☰</span><span class="system-label">系统配置</span>
+    </button>
+<nav class="system-navigation">
+<a class="system-item" href="/debug.html" title="执行诊断"><span aria-hidden="true">🔎</span><span class="system-label">执行诊断</span></a>
+      <button id="settings" class="system-item" title="手机连接设置">
+        <span aria-hidden="true">⚙</span><span class="system-label">手机连接</span>
+      </button>
+      <button id="ai-settings" class="system-item" title="全局 AI 设置">
+        <span aria-hidden="true">AI</span><span class="system-label">全局 AI</span>
+      </button>
+    </nav>
+    <div class="system-footer system-label">微信消息平台</div>
+  </aside>
+
+  <aside class="sidebar">
+    <header class="brand">
+      <span class="logo">聊</span>
+      <div><strong>微信消息台</strong><small>你的手机，连接到网页</small></div>
+    </header>
+    <button id="connection-card" class="connection-card">
+      <span id="status-dot" class="dot"></span>
+      <span><strong id="connection">连接中</strong><small id="phone-address">配置手机连接</small></span>
+      <span class="chevron">›</span>
+    </button>
+    <div class="list-heading">
+      <h2>消息</h2>
+      <button id="new-chat" class="icon-button" title="新建会话">＋</button>
+    </div>
+    <div class="search-box"><span>⌕</span><input id="search" placeholder="搜索联系人或群聊" autocomplete="off"></div>
+    <nav class="filters">
+      <button class="selected" data-filter="all">全部</button>
+      <button data-filter="person">联系人</button>
+      <button data-filter="group">群聊</button>
+      <button data-filter="unread">未读</button>
+    </nav>
+    <div id="conversations" class="conversation-list"></div>
+  </aside>
+
+  <main class="chat-panel">
+    <div id="welcome" class="welcome">
+      <div class="welcome-mark">☏</div>
+      <h1>把手机里的对话<br>带到你的桌面</h1>
+      <p>选择一个会话，或添加微信昵称、群名称。<br>新收到的消息会自动出现在这里。</p>
+      <button id="welcome-new" class="primary">开始对话 <span>↗</span></button>
+    </div>
+
+    <section id="chat" class="chat" hidden>
+      <header class="chat-header">
+        <button id="back" class="icon-button mobile-only">‹</button>
+        <span id="chat-avatar" class="avatar"></span>
+        <div class="chat-title">
+          <h1 id="chat-title"></h1>
+          <div><span id="chat-note"></span></div>
+        </div>
+        <select id="kind" aria-label="会话类型">
+          <option value="unknown">待分类</option>
+          <option value="person">联系人</option>
+          <option value="group">群聊</option>
+        </select>
+        <button id="ai-chat-settings" class="text-button">AI 设置</button>
+        <button id="export" class="text-button">导出</button>
+      </header>
+      <div class="chat-toolbar">
+        <label>定时读取
+          <select id="read-every" aria-label="定时读取间隔">
+            <option value="0">关闭</option>
+            <option value="60">每 1 分钟</option>
+            <option value="300">每 5 分钟</option>
+            <option value="900">每 15 分钟</option>
+            <option value="1800">每 30 分钟</option>
+            <option value="3600">每 1 小时</option>
+          </select>
+        </label>
+        <label>图片
+          <select id="originals" aria-label="收到图片时是否取原图">
+            <option value="on">取原图</option>
+            <option value="off">仅缩略图</option>
+          </select>
+        </label>
+        <span class="toolbar-spacer"></span>
+        <label>读取最近 <input id="limit" type="number" min="1" max="100" value="20" aria-label="读取数量"> 条</label>
+        <button id="read" class="text-button">↻ 从手机读取</button>
+      </div>
+      <div id="messages" class="messages"></div>
+      <div id="operation-note" class="operation-note" hidden></div>
+      <div class="composer">
+        <textarea id="message" placeholder="输入消息，Enter 发送，Shift + Enter 换行" maxlength="2000" rows="3"></textarea>
+        <div class="composer-bottom">
+          <input id="image-file" type="file" accept="image/png,image/jpeg" hidden>
+          <button id="send-image" class="text-button">发送图片</button>
+          <span id="char-count">0 / 2000</span>
+          <button id="send" class="primary">发送 <span>↑</span></button>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="settings-dialog">
+  <form id="settings-form">
+    <div class="dialog-heading"><h2>连接你的手机</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <p class="muted">手机与电脑在同一网络，并保持手机上的微信桥运行。</p>
+    <label class="field">手机 IP 或地址
+      <input id="phone-url" placeholder="192.168.0.186 或 http://192.168.0.186:8766" required>
+    </label>
+    <label class="field">手机 Token
+      <input id="phone-token" type="password" autocomplete="new-password">
+    </label>
+    <div id="settings-error" class="form-error"></div>
+    <div class="dialog-actions">
+      <button type="button" class="secondary close-dialog">取消</button>
+      <button type="submit" class="primary">保存连接</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="new-dialog">
+  <form id="new-form">
+    <div class="dialog-heading"><h2>添加一个会话</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <label class="field">微信完整昵称 / 群名称
+      <input id="new-title" placeholder="手机中显示的完整名称" maxlength="128" required>
+    </label>
+    <label class="field">会话类型
+      <select id="new-kind"><option value="person">联系人</option><option value="group">群聊</option></select>
+    </label>
+    <div id="new-error" class="form-error"></div>
+    <div class="dialog-actions">
+      <button type="button" class="secondary close-dialog">取消</button>
+      <button type="submit" class="primary">添加会话</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 全局 AI 设置：模型 + 名称规则 -->
+<dialog id="ai-dialog">
+  <form id="ai-form">
+    <div class="dialog-heading"><h2>全局 AI 设置</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <p class="muted">兼容 OpenAI Chat Completions 的接口。开启回复的会话会把最近 20 条消息发给该服务。</p>
+    <label class="field">接口地址<input id="ai-url" placeholder="https://你的服务地址/v1" required></label>
+    <label class="field">模型名称<input id="ai-model" required></label>
+    <label class="field">API 密钥<input id="ai-key" type="password" autocomplete="new-password"></label>
+    <label class="field">角色提示词<textarea id="ai-prompt" rows="3"></textarea></label>
+    <label class="field"><span><input id="ai-vision" type="checkbox"> 把聊天图片缩略图发给模型</span></label>
+    <h3>按名称匹配的回复规则</h3>
+    <p class="muted">从上到下第一条匹配的生效，会话单独设置优先。通配符 * 匹配任意字符、? 匹配单个字符；正则使用 Go RE2 语法。</p>
+    <div id="ai-rules"></div>
+    <button type="button" id="ai-rule-add" class="text-button">添加规则</button>
+    <div id="ai-error" class="form-error"></div>
+    <div class="dialog-actions">
+      <button type="button" class="secondary close-dialog">取消</button>
+      <button type="submit" class="primary">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 当前会话的 AI 回复方式 -->
+<dialog id="chat-ai-dialog">
+  <form id="chat-ai-form">
+    <div class="dialog-heading"><h2>当前会话 AI</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <label class="field">回复方式
+      <select id="chat-ai-mode">
+        <option value="inherit">跟随名称规则</option>
+        <option value="off">关闭</option>
+        <option value="auto">自动生成并发送</option>
+      </select>
+    </label>
+    <label class="field">最短间隔（秒）<input id="chat-ai-interval" type="number" min="5" max="86400" value="30" required></label>
+    <label class="field">触发词<input id="chat-ai-keyword" placeholder="例如 @助手（群聊自动回复必填）"></label>
+    <p class="muted">只处理保存之后的新来信。自动发送和手动发送一样等待手机确认。</p>
+    <div id="chat-ai-error" class="form-error"></div>
+    <div class="dialog-actions">
+      <button type="button" class="secondary close-dialog">取消</button>
+      <button type="submit" class="primary">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js" defer></script>
+</body>
+</html>

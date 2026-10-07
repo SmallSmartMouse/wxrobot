@@ -1,0 +1,19 @@
+{
+  "device_id": "c949c417",
+  "phone_api_token": "REPLACE_WITH_PHONE_API_TOKEN_AT_LEAST_32_CHARS",
+  "phone_api_port": 8766,
+  "wechat_version": "8.0.78",
+  "profile": {
+    "title_id": "android:id/text1",
+    "message_id": "com.tencent.mm:id/bkl",
+    "list_id": "com.tencent.mm:id/bp0",
+    "input_id": "com.tencent.mm:id/bkk",
+    "contact_id": "com.tencent.mm:id/kbq"
+  },
+  "chat_aliases": {
+    "通讯录中的名称": {
+      "query": "搜索和标题栏使用的名称",
+      "title": "截图 OCR 识别到的标题"
+    }
+  }
+}
