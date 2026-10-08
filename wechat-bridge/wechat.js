@@ -11,6 +11,13 @@ var DEFAULT_PROFILE = {
     avatar_id: "com.tencent.mm:id/bk1"
 };
 var MAX_THUMBNAILS = 3; // 每次读取最多截取的图片缩略图数量
+var PERMISSION_UI = /packageinstaller|permissioncontroller|lbe\.security/; // 系统权限弹窗所属的包
+// 读取提前停止的原因 → 降级说明（结果可能不完整）
+var READ_STOP_WARNINGS = {
+    unverified_overlap: "向上翻页时相邻两屏没能比对上，读取提前停止，更早的消息可能没读到",
+    page_cap: "翻到 20 页上限仍没读到已有记录，中间的消息可能没读到",
+    scroll_failed: "消息列表滑动失败，读取提前停止"
+};
 
 module.exports = function (config, workDir) {
     // 合并控件编号：默认值在前，配置中非空的值覆盖默认值
@@ -185,11 +192,15 @@ module.exports = function (config, workDir) {
         );
     }
 
-    // 标题比较前的统一处理：去掉群人数后缀“(123)”、空白和表情变体选择符，
+    // 去掉群人数后缀“(123)”（右括号可能被截断）。
+    function withoutMemberCount(title) {
+        return String(title).replace(/\s*[（(]\d{1,6}[）)]?\s*$/, "");
+    }
+
+    // 标题比较前的统一处理：去掉群人数后缀、空白和表情变体选择符，
     // 各种爱心写法（微信通知里的 [心]、❤、♥ 等）统一为 ♥，忽略大小写。
     function normalizeTitle(title) {
-        return String(title)
-            .replace(/\s*[（(]\d{1,6}[）)]?\s*$/, "")
+        return withoutMemberCount(title)
             .replace(/\[心\]|[❤♥♡❣]|\uD83D[\uDC93-\uDC9F]/g, "♥")
             .replace(/[\s\uFE0E\uFE0F]/g, "")
             .toLowerCase();
@@ -210,6 +221,30 @@ module.exports = function (config, workDir) {
         var key = normalizeTitle(label);
         for (var name in aliases) if (titleVariants(name).indexOf(key) >= 0) return name;
         return label;
+    }
+
+    // namedRows 会话行（首页列表、分享页搜索结果都是这种控件）中名称与 name 的某种写法一致的，按位置去重。
+    // listAreaOnly 为 true 时排除标题栏、底部导航处的控件。
+    function namedRows(name, listAreaOnly) {
+        var variants = titleVariants(name);
+        return unique(
+            all(id(profile.contact_id)).filter(function (n) {
+                return variants.indexOf(normalizeTitle(n.text())) >= 0 && (!listAreaOnly || inListArea(n.bounds()));
+            })
+        );
+    }
+
+    // searchFor 等搜索框出现并填入 query；成功返回 true。
+    function searchFor(query) {
+        var box = waitFor(function () {
+            return one(className("android.widget.EditText"));
+        }, 3000);
+        return !!box && box.setText(query);
+    }
+
+    // searchQuery 聊天在搜索时使用的名称（别名配置中的 query），没有就用聊天名称。
+    function searchQuery(name) {
+        return (aliases[name] || {}).query || name;
     }
 
     // ---------- 核对当前聊天 ----------
@@ -291,7 +326,7 @@ module.exports = function (config, workDir) {
     function currentChat() {
         if (!messageList()) return null;
         var title = nativeTitle();
-        return title && title !== "微信" ? chatName(title.replace(/\s*[（(]\d{1,6}[）)]\s*$/, "")) : null;
+        return title && title !== "微信" ? chatName(withoutMemberCount(title)) : null;
     }
 
     // ---------- 打开聊天 ----------
@@ -305,7 +340,7 @@ module.exports = function (config, workDir) {
         });
         if (!waitFor(inWechat, 5000)) {
             var front = foregroundPackage();
-            var hint = /packageinstaller|permissioncontroller|lbe\.security/.test(front) ? "（系统权限弹窗挡在前面，请在手机上处理）" : "";
+            var hint = PERMISSION_UI.test(front) ? "（系统权限弹窗挡在前面，请在手机上处理）" : "";
             fail("WECHAT_NOT_OPEN", "无法打开微信，当前前台是 " + front + hint);
         }
     }
@@ -336,24 +371,11 @@ module.exports = function (config, workDir) {
         fail("HOME_NOT_FOUND", "无法返回微信消息列表，请手动打开微信首页");
     }
 
-    // recentRows 首页会话列表中名称与 name 相符的行（可能多个，由调用方判断是否唯一）。
-    function recentRows(name) {
-        var variants = titleVariants(name);
-        return unique(
-            all(id(profile.contact_id)).filter(function (n) {
-                return variants.indexOf(normalizeTitle(n.text())) >= 0 && inListArea(n.bounds());
-            })
-        );
-    }
-
     // 用微信全局搜索打开聊天：搜索结果必须稳定且唯一。
     function searchChat(name, group, searchButton) {
-        var query = (aliases[name] || {}).query || name;
+        var query = searchQuery(name);
         tap(searchButton);
-        var box = waitFor(function () {
-            return one(className("android.widget.EditText"));
-        }, 3000);
-        if (!box || !box.setText(query)) fail("SEARCH_FAILED", "无法输入联系人搜索名称");
+        if (!searchFor(query)) fail("SEARCH_FAILED", "无法输入联系人搜索名称");
         var candidates = [],
             lastKey = null,
             stableSince = 0;
@@ -371,10 +393,10 @@ module.exports = function (config, workDir) {
                 .join("|");
             if (!candidates.length || key !== lastKey) {
                 lastKey = key;
-                stableSince = Date.now();
+                stableSince = clock();
                 return false;
             }
-            return Date.now() - stableSince >= 180;
+            return clock() - stableSince >= 180;
         }, 3000);
         // 结果必须唯一，否则停止，避免进错聊天
         if (!settled || candidates.length !== 1) failWithScreen("CONTACT_AMBIGUOUS", "未找到唯一精确联系人或群，请使用唯一备注名");
@@ -400,13 +422,13 @@ module.exports = function (config, workDir) {
             launchWechat();
         }
         // 标题一致，或仍在上次确认进入的同一个聊天里（屏幕内容接得上）：不用重新进入
-        if (messageList() && (titleMatches(name) === true || stillInChat(name))) {
-            step("打开聊天", titleMatches(name) === true ? "已在目标聊天（标题一致）" : "仍在上次进入的聊天里（屏幕内容接得上）");
-            return;
+        if (messageList()) {
+            if (titleMatches(name) === true) return step("打开聊天", "已在目标聊天（标题一致）");
+            if (stillInChat(name)) return step("打开聊天", "仍在上次进入的聊天里（屏幕内容接得上）");
         }
         // 否则回首页，在会话列表里找名称完全一致的那一行；找到多个同名就停止
         var home = goHome();
-        var rows = recentRows(name);
+        var rows = namedRows(name, true);
         if (rows.length > 1) failWithScreen("CONTACT_AMBIGUOUS", "消息列表存在多个同名目标，请使用唯一备注名");
         if (rows.length === 1) {
             var label = String(rows[0].text());
@@ -662,13 +684,8 @@ module.exports = function (config, workDir) {
             if (pages) scrollToLatest();
         }
         // 提前停止的读取记为降级：结果可能不完整
-        var STOP_WARNINGS = {
-            unverified_overlap: "向上翻页时相邻两屏没能比对上，读取提前停止，更早的消息可能没读到",
-            page_cap: "翻到 20 页上限仍没读到已有记录，中间的消息可能没读到",
-            scroll_failed: "消息列表滑动失败，读取提前停止"
-        };
         step("读取消息", messages.length + " 条，翻页 " + pages + " 次，停止原因 " + stopReason);
-        if (STOP_WARNINGS[stopReason]) warn("READ_" + stopReason.toUpperCase(), STOP_WARNINGS[stopReason]);
+        if (READ_STOP_WARNINGS[stopReason]) warn("READ_" + stopReason.toUpperCase(), READ_STOP_WARNINGS[stopReason]);
         var thumbFailed = messages.filter(function (m) {
             return m.image_error === "缩略图获取失败" || m.image_error === "缩略图超过大小限制";
         }).length;
@@ -855,10 +872,10 @@ module.exports = function (config, workDir) {
         });
     }
 
-    // 当前屏幕的消息快照；capture 为 true 时附带图片缩略图。
-    function snapshot(capture) {
+    // 当前屏幕的消息快照；withImages 为 true 时附带图片缩略图。
+    function snapshot(withImages) {
         return {
-            messages: withoutPosition(visibleMessages(capture ? { images: MAX_THUMBNAILS } : null)),
+            messages: withoutPosition(visibleMessages(withImages ? { images: MAX_THUMBNAILS } : null)),
             captured_at: new Date().toISOString()
         };
     }
@@ -941,7 +958,7 @@ module.exports = function (config, workDir) {
     function pickShareTarget(name) {
         // 等分享页的搜索按钮出现；如果弹出了系统权限框，说明微信缺少存储权限
         var search = waitFor(function () {
-            if (/packageinstaller|permissioncontroller|lbe\.security/.test(foregroundPackage())) return "permission";
+            if (PERMISSION_UI.test(foregroundPackage())) return "permission";
             return one(descMatches(/搜索/)) || one(text("搜索"));
         }, 5000);
         if (search === "permission")
@@ -949,21 +966,13 @@ module.exports = function (config, workDir) {
         if (!search) fail("SHARE_PICKER_UNSUPPORTED", "未识别微信分享联系人选择页");
         // 点搜索，输入聊天的搜索名称
         tap(search);
-        var box = waitFor(function () {
-            return one(className("android.widget.EditText"));
-        }, 3000);
-        if (!box || !box.setText((aliases[name] || {}).query || name)) fail("SHARE_SEARCH_UNSUPPORTED", "未找到分享搜索框");
+        if (!searchFor(searchQuery(name))) fail("SHARE_SEARCH_UNSUPPORTED", "未找到分享搜索框");
 
-        // 搜索结果是会话行（与首页会话列表同一种控件），名称必须与目标的某种写法一致且唯一。
+        // 搜索结果是会话行，名称必须与目标的某种写法一致且唯一。
         // 不能按搜索词找文字：搜索框本身、“包含: xxx”的群聊行都会误中。
-        var variants = titleVariants(name),
-            rows = [];
+        var rows = [];
         waitFor(function () {
-            rows = unique(
-                all(id(profile.contact_id)).filter(function (n) {
-                    return variants.indexOf(normalizeTitle(n.text())) >= 0;
-                })
-            );
+            rows = namedRows(name, false);
             return rows.length === 1;
         }, 3000);
         if (rows.length !== 1) fail("AMBIGUOUS_SHARE_TARGET", "分享页中没有找到唯一的「" + name + "」");
@@ -973,6 +982,7 @@ module.exports = function (config, workDir) {
         var confirm = waitFor(function () {
             return one(textMatches(/^发送(\(1\))?$/));
         }, 3000);
+        var variants = titleVariants(name);
         var recipientShown = all(className("android.widget.TextView")).some(function (n) {
             return variants.indexOf(normalizeTitle(n.text())) >= 0;
         });
@@ -1022,9 +1032,10 @@ module.exports = function (config, workDir) {
         step("分享图片", "已核对收件人，点击发送");
         clicked = true;
         tap(confirm);
-        sleep(1500);
-        // 外部分享成功后微信会问“返回 xxx / 留在微信”，留在微信才能继续确认结果。
-        var stay = one(text("留在微信"));
+        // 外部分享成功后微信会问“返回 xxx / 留在微信”，留在微信才能继续确认结果；弹窗一出现就点，最多等 1.5 秒。
+        var stay = waitFor(function () {
+            return one(text("留在微信"));
+        }, 1500);
         if (stay) tap(stay);
 
         // 6. 回到聊天确认：发出的图片多了一张，且最后一条就是发出的图片；确认后删除临时文件

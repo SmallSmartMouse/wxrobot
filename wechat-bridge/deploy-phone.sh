@@ -25,17 +25,6 @@ TEMP=""
 FILES=(
     bridge.js
     wechat.js
-    restart.js
-)
-# 旧版双脚本结构的代码文件，部署新版本后删除，避免误启动。
-OBSOLETE=(
-    agent.js
-    phone-server.js
-    visual.js
-    phone-store.js
-    event-store.js
-    restart-agent.js
-    restart-phone-server.js
 )
 
 fail() {
@@ -180,9 +169,6 @@ done
 if [[ "$EXISTS" == 0 ]]; then
     adb_device push "$CONFIG" "$REMOTE/config.json" >/dev/null
 fi
-for file in "${OBSOLETE[@]}"; do
-    adb_device shell rm -f "$REMOTE/$file"
-done
 
 echo "上传及 SHA-256 校验通过，现有运行数据已保留。"
 if [[ "$RESTART" == 0 ]]; then
@@ -190,16 +176,16 @@ if [[ "$RESTART" == 0 ]]; then
     exit 0
 fi
 
-# 七、打开 AutoJs6 并运行 restart.js：它停止旧脚本、等待锁释放后启动 bridge.js。
+# 七、打开 AutoJs6 并运行 bridge.js：新实例会先停止正在运行的旧实例，等锁释放后再启动。
 adb_device shell am start \
     -n org.autojs.autojs6/org.autojs.autojs.ui.main.MainActivity >/dev/null
 
 result="$(adb_device shell am start \
     -n org.autojs.autojs6/org.autojs.autojs.external.open.RunIntentActivity \
     -a android.intent.action.VIEW \
-    -d "file://$REMOTE/restart.js" \
+    -d "file://$REMOTE/bridge.js" \
     -t application/x-javascript 2>&1)"
-[[ "$result" != *Error* && "$result" != *Exception* ]] || fail "无法启动 restart.js"
+[[ "$result" != *Error* && "$result" != *Exception* ]] || fail "无法启动 bridge.js"
 sleep 6
 
 # 八、通过临时 ADB 端口转发检查真实就绪状态，不依赖手机的局域网 IP。

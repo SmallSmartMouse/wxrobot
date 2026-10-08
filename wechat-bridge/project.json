@@ -1,0 +1,28 @@
+{
+    "name": "wechat-bridge",
+    "main": "bridge.js",
+    "packageName": "org.autojs.autojs6.wechatbridge",
+    "versionName": "1.0.0",
+    "versionCode": 1,
+    "assets": [],
+    "useFeatures": [],
+    "launchConfig": {
+        "displaySplash": false,
+        "hideLogs": false,
+        "stableMode": false
+    },
+    "ignore": [
+        "/.state/",
+        "/.vscode/",
+        "/node_modules/",
+        "/declarations/",
+        "/README.md",
+        "/deploy-phone.sh",
+        "/config.json",
+        "/config.example.json",
+        "/package.json",
+        "/package-lock.json",
+        "/jsconfig.json",
+        "/.gitignore"
+    ]
+}

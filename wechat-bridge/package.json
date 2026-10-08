@@ -1,0 +1,14 @@
+{
+    "name": "wechat-bridge",
+    "version": "1.0.0",
+    "private": true,
+    "description": "手机端微信桥（AutoJs6 项目）；npm install 只用于安装 VSCode 代码补全所需的 AutoJs6 声明文件",
+    "main": "bridge.js",
+    "scripts": {
+        "deploy": "./deploy-phone.sh",
+        "deploy:check": "./deploy-phone.sh --dry-run"
+    },
+    "devDependencies": {
+        "@sm003/autojs6-dts": "^4.24.1"
+    }
+}

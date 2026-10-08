@@ -5,10 +5,13 @@
 //   通知回调：微信通知生成消息事件。
 //
 // 任务和事件只保存在内存中。脚本重启后电脑查询不到原任务，会把发送标记为“结果未知”，不会重发。
-// 读取配置，加载微信界面操作模块
+// 代码和数据分开存放：
+//   代码（bridge.js、wechat.js）从本脚本所在目录加载。ADB 部署时就是 BASE；
+//   VSCode“运行项目”时是 AutoJs6 的缓存目录。
+//   数据（config.json、锁、日志、原图）固定放在 BASE，无论从哪里运行都共用同一份配置和同一把锁。
 var BASE = "/sdcard/wechat-bridge/";
 var config = JSON.parse(files.read(BASE + "config.json"));
-var ui = require(BASE + "wechat.js")(config, BASE);
+var ui = require(files.join(files.cwd(), "wechat.js"))(config, BASE);
 
 var PORT = config.phone_api_port || 8766;
 var TASK_TIMEOUT_MS = 150000; // 单个任务的界面操作上限（翻页读取 100 条可能较慢）
@@ -22,14 +25,52 @@ var MAX_BODY_BYTES = 16000000;
 if (!config.phone_api_token || config.phone_api_token.length < 32)
     throw Error("config.json 需要至少 32 字符的 phone_api_token");
 
-// 文件锁防止重复启动。
+// ---------- 接管：停止正在运行的旧实例，拿到文件锁后才继续 ----------
+// 部署和手动运行都直接启动本脚本，旧实例由新实例负责停止，不需要单独的重启脚本。
+
+// isBridge 判断引擎运行的是否是微信桥：脚本名为 bridge.js，且同目录下有 wechat.js。
+// 按文件名而不是目录名判断，ADB 部署的和 VSCode 运行的（在缓存目录里）都能认出来。
+function isBridge(engine) {
+    try {
+        return /\/bridge\.js$/.test(String(engine.getSource())) && files.exists(files.join(String(engine.cwd()), "wechat.js"));
+    } catch (_) {
+        return false; // 引擎正在退出等情况下读不到路径，当作不是
+    }
+}
+
+// stopOtherInstances 停止除自己以外正在运行的微信桥。
+function stopOtherInstances() {
+    var me = engines.myEngine(),
+        running = engines.all();
+    for (var i = 0; i < running.length; i++) {
+        if (running[i].equals(me) || !isBridge(running[i])) continue;
+        log("停止 " + running[i].getSource());
+        running[i].forceStop();
+    }
+}
+
+// acquireProcessLock 等旧实例退出、释放 bridge.lock 后加锁，最多约 15 秒。
+// 旧实例与本实例在同一进程（AutoJs6）里，它仍持有锁时 tryLock 会抛出异常而不是返回 null。
+function acquireProcessLock(file) {
+    for (var attempt = 0; attempt < 60; attempt++) {
+        try {
+            var acquired = file.getChannel().tryLock();
+            if (acquired) return acquired;
+        } catch (_) {}
+        sleep(250);
+    }
+    throw Error("旧的微信桥仍未停止，请稍后重试");
+}
+
+stopOtherInstances();
 var lockFile = new java.io.RandomAccessFile(BASE + "bridge.lock", "rw");
-var processLock = lockFile.getChannel().tryLock();
-if (!processLock) throw Error("微信桥已在运行");
+var processLock = acquireProcessLock(lockFile);
 
 // ---------- 共享状态：HTTP 线程与主线程共用，读写都在 withLock 内 ----------
 
-var lock = threads.lock();
+var lock = new java.util.concurrent.locks.ReentrantLock();
+var taskQueued = lock.newCondition(); // 有新任务时唤醒主循环，不必等下一轮
+var eventAdded = lock.newCondition(); // 有新事件时唤醒长轮询，不必轮询等待
 var tasks = {}; // 任务编号 → 任务
 var tasksByKey = {}; // Idempotency-Key → 任务
 var taskOrder = []; // 任务编号，按创建顺序
@@ -47,6 +88,11 @@ function withLock(fn) {
     } finally {
         lock.unlock();
     }
+}
+
+// awaitSignal 在 withLock 内调用：暂时释放锁，最多等 ms 毫秒或直到 condition 被唤醒。
+function awaitSignal(condition, ms) {
+    if (ms > 0) condition.awaitNanos(ms * 1000000);
 }
 
 // utf8 把字符串转成 UTF-8 字节数组（Java byte[]）。
@@ -214,6 +260,7 @@ function createTask(operation, data, key) {
         tasksByKey[key] = task;
         taskOrder.push(task.id);
         pendingTask = task;
+        taskQueued.signal();
         forgetOldTasks();
         return taskView(task);
     });
@@ -245,7 +292,9 @@ function finishTask(task, status, result) {
         task.result = result;
         task.payload = null; // 释放图片数据
     });
-    var detail = status !== "succeeded" ? result.code : result.messages ? result.messages.length + " 条 " + result.stop_reason : "";
+    var detail = "";
+    if (status !== "succeeded") detail = result.code;
+    else if (result.messages) detail = result.messages.length + " 条 " + result.stop_reason;
     log("任务 " + task.id + " " + task.operation + " " + status + " " + detail);
 }
 
@@ -267,6 +316,14 @@ function takeTask() {
     });
     if (expired) finishTask(expired, "failed", { code: "TASK_EXPIRED", message: "手机长时间未就绪，任务未执行" });
     return task;
+}
+
+// waitForTask 主循环的间歇：最多等 ms 毫秒，期间有可执行的任务就立即返回。
+// 手机未就绪时排队任务暂不能执行，照常等待，避免空转。
+function waitForTask(ms) {
+    withLock(function () {
+        if (!pendingTask || !deviceInfo.ready) awaitSignal(taskQueued, ms);
+    });
 }
 
 var lastChat = null; // 最近一次任务操作的聊天，监测时用于识别读不到标题的当前聊天
@@ -327,6 +384,7 @@ function pushEvent(event) {
         event.received_at = new Date().toISOString();
         eventLog.push(event);
         if (eventLog.length > MAX_EVENTS) eventLog.shift();
+        eventAdded.signalAll();
     });
 }
 
@@ -345,15 +403,18 @@ function readEvents(after, limit) {
     });
 }
 
-// 长轮询：有新事件或等待超时才返回。
+// 长轮询：有新事件立即返回（pushEvent 会唤醒），否则等到超时。
 function waitEvents(query) {
     var after = intParam(query.after, 0, 0, 9007199254740991),
         limit = intParam(query.limit, 20, 1, 100),
         wait = intParam(query.wait, 25, 0, 25);
-    var until = Date.now() + wait * 1000,
-        result;
-    while (!(result = readEvents(after, limit)).events.length && Date.now() < until) sleep(200);
-    return result;
+    var until = Date.now() + wait * 1000;
+    return withLock(function () {
+        var result;
+        while (!(result = readEvents(after, limit)).events.length && Date.now() < until)
+            awaitSignal(eventAdded, until - Date.now());
+        return result;
+    });
 }
 
 var notificationsWatched = false;
@@ -531,21 +592,25 @@ function respondFile(socket, path) {
     file.delete();
 }
 
-// serve 处理一个连接：解析请求、分发，出错时返回错误 JSON，最后关闭连接。
+// handle 解析并分发请求，写出响应；出错时返回错误 JSON。
+function handle(socket) {
+    var reply;
+    try {
+        reply = route(readRequest(socket));
+    } catch (e) {
+        // 主动抛出的错误带状态码，原样返回；其他异常只返回笼统说明，不暴露内部信息
+        var message = e.status ? e.message : "接口内部错误";
+        reply = [e.status || 500, { error: { code: e.code || "INTERNAL_ERROR", message: message } }];
+    }
+    if (reply[2]) respondFile(socket, reply[2]);
+    else respond(socket, reply[0], reply[1]);
+}
+
+// serve 处理一个连接，结束后关闭；写响应时连接已断开的异常直接忽略。
 function serve(socket) {
     try {
-        var reply;
-        try {
-            reply = route(readRequest(socket));
-            if (reply[2]) return respondFile(socket, reply[2]);
-        } catch (e) {
-            // 主动抛出的错误带状态码，原样返回；其他异常只返回笼统说明，不暴露内部信息
-            var message = e.status ? e.message : "接口内部错误";
-            reply = [e.status || 500, { error: { code: e.code || "INTERNAL_ERROR", message: message } }];
-        }
-        respond(socket, reply[0], reply[1]);
+        handle(socket);
     } catch (_) {
-        // 连接已断开
     } finally {
         try {
             socket.close();
@@ -666,5 +731,6 @@ while (true) {
         addDiagnostic("error", e.code || "LOOP_ERROR", "监测或主循环异常：" + String(e.message || e), { source: "monitor" });
         sleep(2000);
     }
-    sleep(400);
+    // 间歇 400 毫秒；期间收到任务立即开始执行
+    waitForTask(400);
 }

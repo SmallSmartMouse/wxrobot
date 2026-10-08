@@ -4,13 +4,14 @@ AutoJs6 脚本，在手机上同时提供 HTTP 接口并操作微信。电脑用
 
 | 文件 | 作用 |
 | --- | --- |
-| `bridge.js` | 主脚本：HTTP 接口、任务执行、消息监测 |
+| `bridge.js` | 主脚本：HTTP 接口、任务执行、消息监测；启动时先停止正在运行的旧实例 |
 | `wechat.js` | 微信界面操作：打开聊天、读取消息、发送文字和图片 |
-| `restart.js` | 停止旧脚本，等锁释放后启动 `bridge.js` |
 | `deploy-phone.sh` | 电脑端部署入口 |
 | `config.example.json` | 首次部署的配置模板 |
+| `project.json` | AutoJs6 项目配置（入口 `bridge.js`，`ignore` 列出不发送到手机的文件） |
+| `package.json`、`jsconfig.json` | VSCode 代码补全：`npm install` 安装 AutoJs6 声明文件 |
 
-手机上的目录固定为 `/sdcard/wechat-bridge/`。
+手机上的目录固定为 `/sdcard/wechat-bridge/`。`config.json`、锁、日志、原图都放在这里；代码从 `bridge.js` 所在目录加载。
 
 ## 运行方式
 
@@ -50,11 +51,24 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 | `--no-restart` | 只更新文件 |
 | `--dry-run` | 只检查，不修改手机 |
 
-脚本上传 3 个运行文件并核对 SHA-256，删除旧版本的代码文件，保留手机上的配置，然后运行 `restart.js` 并通过 ADB 端口转发确认就绪。不要在发送过程中部署。
+脚本上传 2 个运行文件并核对 SHA-256，保留手机上的配置，然后运行 `bridge.js`（它会先停止旧实例、等锁释放）并通过 ADB 端口转发确认就绪。不要在发送过程中部署。
+
+### VSCode 调试
+
+1. 安装插件 AutoJs6 VSCode Extension（`003.autojs6-vscode-ext`），用 VSCode 单独打开 `wechat-bridge` 目录（插件把第一个工作区目录当作项目）。
+2. 在本目录执行 `npm install`，安装 AutoJs6 声明文件，获得 `auto`、`files`、`engines` 等全局对象的补全。
+3. 手机 AutoJs6 开启“服务端模式”或“客户端模式”，在 VSCode 命令面板执行“AutoJs6: 建立设备连接”。
+4. “运行项目”（`Alt+F6`）把 `bridge.js`、`wechat.js` 发送到 AutoJs6 的缓存目录并运行，日志显示在 VSCode 的输出面板。新实例会先停止手机上正在运行的微信桥。
+
+注意：
+
+- 调试运行仍读取 `/sdcard/wechat-bridge/config.json`，手机上需要先用 `deploy-phone.sh` 部署过一次。
+- 调试运行的代码只在缓存目录里，手机重启或再运行 `/sdcard/wechat-bridge/bridge.js` 后又是部署的版本。调试完成后用 `deploy-phone.sh` 正式部署。
+- “保存项目到设备”保存到 AutoJs6 工作目录（默认 `/sdcard/脚本/wechat-bridge/`），不会更新部署目录里的代码。
 
 ## 配置
 
-`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准）、`chat_aliases`（名称不一致时的别名）。旧版本的 `agent_token`、`mode`、`screen` 等字段已不再使用，保留也无影响。
+`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准）、`chat_aliases`（名称不一致时的别名）。
 
 ## 接口
 
