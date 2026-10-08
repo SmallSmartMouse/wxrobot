@@ -1,6 +1,6 @@
 "use strict";
 // 微信消息台前端。数据全部来自 /api/state 和 /api/conversations/{id}；
-// 服务端有变化时通过 SSE 推送 refresh，页面重新拉取并整体重绘。
+// 服务端有变化时通过 SSE 推送 refresh，页面重新拉取并重绘（消息列表增量更新）。
 
 const $ = (id) => document.getElementById(id);
 const STATUS = { queued: "等待手机", running: "手机处理中", succeeded: "已完成", failed: "失败", unknown: "结果未知" };
@@ -12,10 +12,12 @@ let conversation = null; // 当前会话详情
 let filter = "all";
 let busy = false; // 正在提交读写任务
 const knownStatus = new Map(); // 任务 ID → 上次看到的状态，用于结束时提示
-const dismissed = new Set(); // 已点掉的失败提示（任务 ID）
+const dismissed = new Set(); // 已点掉的失败或降级提示（任务 ID）
+const READ_EVERY = { 60: "每 1 分钟", 300: "每 5 分钟", 900: "每 15 分钟", 1800: "每 30 分钟", 3600: "每 1 小时" };
 
 // ---------- 工具 ----------
 
+// el 创建元素；文字一律用 textContent 设置，消息内容不会被当作 HTML 执行。
 function el(tag, text, className) {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -24,6 +26,7 @@ function el(tag, text, className) {
 }
 
 let toastTimer;
+// toast 在页面底部显示提示，5 秒后消失。
 function toast(text) {
     $("toast").textContent = text;
     $("toast").hidden = false;
@@ -31,6 +34,7 @@ function toast(text) {
     toastTimer = setTimeout(() => ($("toast").hidden = true), 5000);
 }
 
+// api 调用 /api/ 接口：有 body 时 POST JSON，否则 GET；失败时抛出带服务端说明的错误。
 async function api(path, body, idempotencyKey) {
     const headers = {};
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -50,14 +54,32 @@ async function api(path, body, idempotencyKey) {
     return data;
 }
 
+// 会话列表用：今天显示时间，其他显示日期。
 function timeLabel(value) {
     const d = new Date(value);
     if (!Number.isFinite(d.getTime())) return "";
-    return d.toDateString() === new Date().toDateString()
-        ? d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
-        : d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+    return d.toDateString() === new Date().toDateString() ? clock(value) : dayLabel(value);
 }
 
+// clock 把时间格式化为“时:分”。
+function clock(value) {
+    const d = new Date(value);
+    return Number.isFinite(d.getTime()) ? d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "";
+}
+
+// 消息日期分隔线：今天、昨天、10月7日、2025年12月31日。
+function dayLabel(value) {
+    const d = new Date(value);
+    if (!Number.isFinite(d.getTime())) return "";
+    const today = new Date();
+    const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return "今天";
+    if (d.toDateString() === yesterday.toDateString()) return "昨天";
+    const options = d.getFullYear() === today.getFullYear() ? { month: "short", day: "numeric" } : { year: "numeric", month: "short", day: "numeric" };
+    return d.toLocaleDateString("zh-CN", options);
+}
+
+// avatar 会话头像：群聊显示“群”，联系人显示名称的第一个字。
 function avatar(c, className = "avatar") {
     const group = c.kind === "group";
     return el("span", group ? "群" : Array.from(c.title)[0], className + (group ? " group" : ""));
@@ -86,18 +108,21 @@ let refreshAgain = false;
 
 // 并发调用时合并为一次后续刷新，避免旧响应覆盖新数据。
 async function refresh() {
+    // 正在刷新时只记一下，等这次结束后再刷新一次
     if (refreshing) {
         refreshAgain = true;
         return;
     }
     refreshing = true;
     try {
+        // 先取总览，再取当前会话详情；等待期间切换了会话就丢弃旧会话的详情
         const id = active;
         state = await api("state");
         const detail = id ? await api("conversations/" + id) : null;
         if (id === active) conversation = detail;
         toastFinishedOperations();
         render();
+        // 正在看的会话有未读，标记为已读
         if (conversation?.unread) await api("conversations/" + conversation.id + "/seen", {});
     } catch (e) {
         $("connection").textContent = "网页服务离线";
@@ -112,6 +137,7 @@ async function refresh() {
     }
 }
 
+// toastFinishedOperations 任务从“进行中”变为结束时弹出提示（自动读取成功不提示）。
 function toastFinishedOperations() {
     for (const op of state.operations) {
         const before = knownStatus.get(op.id);
@@ -125,21 +151,44 @@ function toastFinishedOperations() {
 
 // ---------- 渲染 ----------
 
+// render 重绘连接状态、会话列表和当前聊天。
 function render() {
     renderStatus();
     renderList();
     renderChat();
 }
 
+// renderStatus 显示手机连接状态、地址和未就绪原因，并更新诊断入口红点。
 function renderStatus() {
     const online = state.connection === "在线";
     const broken = /失败|离线/.test(state.connection);
     $("connection").textContent = state.connection;
-    $("phone-address").textContent = state.phone_url || "点击设置手机 IP";
+    $("phone-address").textContent = state.phone_url ? state.phone_url.replace(/^https?:\/\//, "") : "点击设置手机 IP";
     $("status-dot").className = "dot" + (online ? " online" : broken ? " error" : "");
     $("connection-card").title = state.error || state.connection;
+    // 手机未就绪时把原因放进提示，方便直接看出缺什么（例如截图授权、锁屏）。
+    const reasons = state.device?.info?.reasons || [];
+    if (!online && reasons.length) $("connection-card").title += "：" + reasons.join("、");
+    renderDiagBadge();
 }
 
+// 诊断入口红点：最近 24 小时内、上次打开诊断页之后新出现的失败任务、降级任务和手机上报的异常。
+function renderDiagBadge() {
+    let seenAt = 0;
+    try {
+        seenAt = Number(localStorage.getItem("diag-seen-at")) || 0;
+    } catch (_) {}
+    seenAt = Math.max(seenAt, Date.now() - 86400000);
+    const fresh = (time) => new Date(time).getTime() > seenAt;
+    const opIssues = state.operations.filter((op) => fresh(op.created) && (["failed", "unknown"].includes(op.status) || op.warnings?.length));
+    const phoneIssues = (state.device?.diagnostics || []).filter((d) => fresh(d.last_at) && !d.task_id);
+    const count = opIssues.length + phoneIssues.length;
+    $("diag-badge").hidden = !count;
+    $("diag-badge").textContent = count > 99 ? "99+" : String(count);
+    $("diag-link").title = count ? "执行诊断：" + count + " 条新的异常或降级" : "执行诊断";
+}
+
+// renderList 按搜索词和筛选条件显示会话列表。
 function renderList() {
     const search = $("search").value.toLowerCase();
     const items = state.conversations.filter(
@@ -149,6 +198,7 @@ function renderList() {
     );
     const list = $("conversations");
     list.replaceChildren();
+    // 每个会话一行：头像、名称、时间、预览和未读数
     for (const c of items) {
         const item = el("button", undefined, "conversation-item" + (c.id === active ? " active" : ""));
         const top = el("div", undefined, "conversation-top");
@@ -168,10 +218,12 @@ function renderList() {
     }
 }
 
+// operationsOfActive 当前会话的任务（新的在前）。
 function operationsOfActive() {
     return state.operations.filter((op) => op.conversation_id === active);
 }
 
+// renderChat 显示当前聊天：标题和设置摘要、任务提示、按钮状态和消息列表。
 function renderChat() {
     $("welcome").hidden = !!conversation;
     $("chat").hidden = !conversation;
@@ -183,31 +235,62 @@ function renderChat() {
     const head = avatar(conversation);
     head.id = "chat-avatar";
     $("chat-avatar").replaceWith(head);
-    $("kind").value = conversation.kind;
-    $("read-every").value = String(conversation.read_every_seconds || 0);
-    // 未单独设置时：联系人取原图，群聊只要缩略图
-    $("originals").value = conversation.originals || (conversation.kind === "person" ? "on" : "off");
-    $("chat-note").textContent =
-        KINDS[conversation.kind] + " · " + (pending ? "手机处理中" : state.connection === "在线" ? "手机已连接" : "等待手机连接");
+    renderChatNote(pending);
+    renderOperationNote(ops, pending);
 
-    const note = $("operation-note");
-    // 失败提示：只看最近一次手动任务（自动读取失败会自动重试），点一下关闭。
-    const lastManual = ops.find((op) => !op.auto);
-    const failed = lastManual && ["failed", "unknown"].includes(lastManual.status) && !dismissed.has(lastManual.id);
-    note.hidden = !pending && !failed;
-    note.title = failed && !pending ? "点击关闭" : "";
-    note.onclick = () => {
-        if (failed && !pending) {
-            dismissed.add(lastManual.id);
-            renderChat();
-        }
-    };
-    if (pending) note.textContent = (pending.kind === "send" ? "正在发送" : "正在读取") + " · " + STATUS[pending.status];
-    else if (failed) note.textContent = STATUS[lastManual.status] + " · " + (lastManual.error || "请查看手机确认，不会自动重发") + "  ×";
-
+    // 有任务进行中时禁用读取和发送，避免重复提交
     $("read").disabled = $("send-image").disabled = !!pending || busy;
     $("send").disabled = !!pending || busy || !$("message").value.trim();
     renderMessages(ops.filter((op) => op.kind === "send" && ["queued", "running"].includes(op.status)).reverse());
+}
+
+// 标题下的状态和设置摘要，例如：群聊 · 手机已连接 · 定时每 5 分钟 · 仅缩略图 · AI 关闭
+function renderChatNote(pending) {
+    const c = conversation;
+    const connection = pending ? "手机处理中" : state.connection === "在线" ? "手机已连接" : "等待手机连接";
+    const originals = c.originals || (c.kind === "person" ? "on" : "off");
+    const ai = c.ai_effective?.mode === "auto" ? "AI 自动回复" + (c.ai_effective.keyword ? "（" + c.ai_effective.keyword + "）" : "") : "AI 关闭";
+    const parts = [KINDS[c.kind], connection, READ_EVERY[c.read_every_seconds] ? "定时" + READ_EVERY[c.read_every_seconds] : "不定时读取", originals === "on" ? "取原图" : "仅缩略图", ai];
+    $("chat-note").replaceChildren(...parts.map((text, i) => el("span", text, i === 1 && state.connection !== "在线" ? "warn" : "")));
+}
+
+// 消息下方的提示：进行中的任务；最近一次手动任务失败；最近一次任务的降级。失败和降级提示点 × 关闭。
+function renderOperationNote(ops, pending) {
+    const note = $("operation-note");
+    const lastManual = ops.find((op) => !op.auto);
+    const failed = lastManual && ["failed", "unknown"].includes(lastManual.status) && !dismissed.has(lastManual.id) ? lastManual : null;
+    const degraded = ops.find((op) => op.status === "succeeded" && op.warnings?.length);
+    const warned = degraded && !dismissed.has(degraded.id) && degraded === ops.find((op) => op.status !== "queued" && op.status !== "running") ? degraded : null;
+    const shown = pending || failed || warned;
+    // 内容没变就不重建，避免刷新时点击落空。
+    const key = shown ? shown.id + shown.status + [...dismissed].join() : "";
+    if (note.dataset.key === key) return;
+    note.dataset.key = key;
+    note.replaceChildren();
+    note.className = "operation-note";
+    note.hidden = !shown;
+    if (!shown) return;
+    if (pending) {
+        note.append(el("span", (pending.kind === "send" ? "正在发送" : "正在读取") + " · " + STATUS[pending.status]));
+        return;
+    }
+    if (failed) {
+        note.classList.add("error");
+        note.append(el("span", STATUS[failed.status] + " · " + (failed.error || "请查看手机确认，不会自动重发")));
+    } else {
+        note.classList.add("degraded");
+        const more = warned.warnings.length > 1 ? "（共 " + warned.warnings.length + " 处）" : "";
+        note.append(el("span", "⚠ " + (warned.kind === "send" ? "发送" : "读取") + "有降级：" + warned.warnings[0].message + more));
+    }
+    const link = el("a", "查看诊断");
+    link.href = "/debug.html#" + (failed || warned).id;
+    const close = el("button", "×", "note-close");
+    close.title = "关闭提示";
+    close.onclick = () => {
+        dismissed.add((failed || warned).id);
+        renderChat();
+    };
+    note.append(link, close);
 }
 
 // ---------- 消息列表 ----------
@@ -215,11 +298,13 @@ function renderChat() {
 // 停在底部时新消息自动跟随；往上翻看历史时不滚动，只提示有几条新消息。
 const list = { conversationId: null, nodes: new Map(), stick: true, unseen: 0 };
 
+// atBottom 消息列表是否停在底部（距底部 80 像素以内）。
 function atBottom() {
     const box = $("messages");
     return box.scrollHeight - box.scrollTop - box.clientHeight < 80;
 }
 
+// scrollToLatest 滚到最新消息，并清除新消息提示。
 function scrollToLatest(smooth) {
     const box = $("messages");
     box.scrollTo({ top: box.scrollHeight, behavior: smooth ? "smooth" : "auto" });
@@ -228,6 +313,7 @@ function scrollToLatest(smooth) {
     $("new-messages").hidden = true;
 }
 
+// 用户滚动时更新“是否停在底部”；滚回底部就清除新消息提示
 $("messages").onscroll = () => {
     list.stick = atBottom();
     if (list.stick) {
@@ -235,20 +321,29 @@ $("messages").onscroll = () => {
         $("new-messages").hidden = true;
     }
 };
+// 点“N 条新消息”平滑滚到底部
 $("new-messages").onclick = () => scrollToLatest(true);
 
 // 正文消息 + 尚未完成的发送任务（显示在末尾）。
 function renderMessages(pendingSends) {
     const box = $("messages");
+    // 切换了会话：清空已渲染的节点，渲染后跳到最新消息
     const opened = list.conversationId !== conversation.id;
     if (opened) {
         list.conversationId = conversation.id;
         list.nodes = new Map();
     }
-    const items = [
-        ...conversation.messages.map((m) => ({ key: "m:" + m.id, sig: JSON.stringify(m), incoming: m.direction !== "outgoing", build: () => messageNode(m) })),
-        ...pendingSends.map((op) => ({ key: "op:" + op.id, sig: op.status, incoming: false, build: () => pendingNode(op) }))
-    ];
+    // 组装要显示的条目：日期变化处插入分隔线，然后是消息，最后是还没完成的发送
+    const items = [];
+    let lastDay = "";
+    for (const m of conversation.messages) {
+        const day = dayLabel(m.time);
+        if (day !== lastDay) items.push({ key: "d:" + day + ":" + m.id, sig: day, build: () => el("div", day, "day-divider") });
+        lastDay = day;
+        items.push({ key: "m:" + m.id, sig: JSON.stringify(m), incoming: m.direction !== "outgoing", build: () => messageNode(m) });
+    }
+    for (const op of pendingSends) items.push({ key: "op:" + op.id, sig: op.status, build: () => pendingNode(op) });
+    // 内容没变的条目复用原节点，变了才重建；同时统计新出现的来信条数
     const nodes = new Map();
     let added = 0;
     const children = items.map((item) => {
@@ -264,6 +359,7 @@ function renderMessages(pendingSends) {
         empty.append(el("strong", "等待新消息"), el("span", "来信后会自动读取聊天正文，也可以主动从手机读取。"));
         children.push(empty);
     }
+    // 停在底部时跟随到最新；否则保持原滚动位置，有新来信时显示提示
     const top = box.scrollTop;
     box.replaceChildren(...children);
     if (opened || list.stick) {
@@ -278,6 +374,7 @@ function renderMessages(pendingSends) {
     }
 }
 
+// messageNode 一条消息：缺口提示、气泡（文字或图片）以及时间等附加说明。
 function messageNode(m) {
     const node = el("div");
     if (m.gap) node.append(el("div", "此处与之前的记录没能衔接，中间可能有遗漏或重复", "gap-note"));
@@ -288,19 +385,21 @@ function messageNode(m) {
     if (m.image_error && !image) bubble.append(el("small", m.image_error));
     if (m.kind === "image" && !m.original_hash && m.original_error) bubble.append(el("small", "原图：" + m.original_error));
     if (m.original_note) bubble.append(el("small", m.original_note));
-    const meta = [timeLabel(m.time)];
+    const meta = [clock(m.time)];
     if (m.kind === "image") meta.push(m.original_hash ? (m.original_note ? "大图截图" : "原图") : "缩略图");
     if (m.direction === "unknown") meta.push("方向未识别");
     node.append(messageRow(m.direction === "outgoing", bubble, meta));
     return node;
 }
 
+// pendingNode 还在发送中的消息，显示在列表末尾。
 function pendingNode(op) {
     const bubble = el("div", op.text, "bubble");
     if (op.image_hash) bubble.append(imageLink(op.image_hash, "待发送图片"));
     return messageRow(true, bubble, [STATUS[op.status]]);
 }
 
+// messageRow 消息行：发出的消息靠右并显示“我”，收到的显示会话头像。
 function messageRow(outgoing, bubble, meta) {
     const row = el("div", undefined, "message-row" + (outgoing ? " outgoing" : ""));
     const content = el("div", undefined, "message-content");
@@ -313,6 +412,7 @@ function messageRow(outgoing, bubble, meta) {
 
 // ---------- 会话操作 ----------
 
+// selectChat 打开会话；手机窄屏时切换到聊天页面。
 async function selectChat(id) {
     active = id;
     conversation = null;
@@ -324,6 +424,7 @@ async function selectChat(id) {
 // 提交读取或发送任务；每次点击生成新的请求编号，服务端据此防止重复提交。
 async function submit(kind, body) {
     if (!active || busy) return;
+    // 提交期间禁用按钮；发送成功后清空输入框
     busy = true;
     renderChat();
     try {
@@ -341,16 +442,19 @@ async function submit(kind, body) {
     }
 }
 
+// updateComposer 更新字数统计和发送按钮状态。
 function updateComposer() {
     $("char-count").textContent = Array.from($("message").value).length + " / 2000";
     if (conversation) renderChat();
 }
 
+// 从手机读取最近 N 条（1–100）
 $("read").onclick = () => {
     const limit = Number($("limit").value);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) return toast("读取数量必须为 1–100");
     submit("read", { limit });
 };
+// 发送文字；Enter 发送，Shift+Enter 换行（输入法组字时不发送）
 $("send").onclick = () => submit("send", { text: $("message").value });
 $("message").oninput = updateComposer;
 $("message").onkeydown = (e) => {
@@ -360,6 +464,7 @@ $("message").onkeydown = (e) => {
     }
 };
 
+// 发送图片：选择文件 → 读成 Base64 上传保存 → 用返回的图片哈希建立发送任务
 $("send-image").onclick = () => $("image-file").click();
 $("image-file").onchange = async () => {
     const file = $("image-file").files[0];
@@ -380,33 +485,7 @@ $("image-file").onchange = async () => {
     }
 };
 
-$("originals").onchange = async () => {
-    try {
-        await api("conversations/" + active + "/originals", { originals: $("originals").value });
-    } catch (e) {
-        toast(e.message);
-    }
-    await refresh();
-};
-
-$("read-every").onchange = async () => {
-    try {
-        await api("conversations/" + active + "/schedule", { read_every_seconds: Number($("read-every").value) });
-    } catch (e) {
-        toast(e.message);
-    }
-    await refresh();
-};
-
-$("kind").onchange = async () => {
-    try {
-        await api("conversations/" + active + "/kind", { kind: $("kind").value });
-    } catch (e) {
-        toast(e.message);
-    }
-    await refresh();
-};
-
+// 把当前会话（含消息）导出为 JSON 文件
 $("export").onclick = () => {
     const blob = new Blob([JSON.stringify(conversation, null, 2)], { type: "application/json" });
     const link = el("a");
@@ -416,8 +495,10 @@ $("export").onclick = () => {
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 };
 
+// 手机窄屏：返回会话列表；搜索框输入时实时过滤
 $("back").onclick = () => document.querySelector(".app").classList.remove("chat-open");
 $("search").oninput = renderList;
+// 筛选按钮：全部 / 联系人 / 群聊 / 未读
 for (const button of document.querySelectorAll("[data-filter]")) {
     button.onclick = () => {
         filter = button.dataset.filter;
@@ -428,6 +509,7 @@ for (const button of document.querySelectorAll("[data-filter]")) {
 
 // ---------- 对话框 ----------
 
+// 所有对话框的关闭按钮
 for (const button of document.querySelectorAll(".close-dialog")) {
     button.onclick = () => button.closest("dialog").close();
 }
@@ -449,6 +531,7 @@ function handleForm(formId, errorId, save) {
     };
 }
 
+// openNewChat 打开“添加会话”对话框。
 function openNewChat() {
     $("new-error").textContent = "";
     $("new-dialog").showModal();
@@ -462,6 +545,7 @@ handleForm("new-form", "new-error", async () => {
     await selectChat(c.id);
 });
 
+// openSettings 打开“手机连接”对话框；Token 不回显，留空表示保留原值。
 function openSettings() {
     $("phone-url").value = state?.phone_url || "";
     $("phone-token").value = "";
@@ -485,6 +569,7 @@ const RULE_FIELDS = [
     ["interval_seconds", "间隔秒"]
 ];
 
+// ruleRow 名称规则编辑行：按 RULE_FIELDS 生成输入框或下拉框，末尾是删除按钮。
 function ruleRow(rule) {
     const row = el("div", undefined, "rule-row");
     for (const [key, options] of RULE_FIELDS) {
@@ -508,6 +593,7 @@ function ruleRow(rule) {
     return row;
 }
 
+// readRules 从编辑行读出全部名称规则（间隔转为数字）。
 function readRules() {
     return [...$("ai-rules").children].map((row) => {
         const rule = {};
@@ -518,6 +604,7 @@ function readRules() {
     });
 }
 
+// 打开全局 AI 设置：读取当前配置和名称规则填入表单（密钥不回显）
 $("ai-settings").onclick = async () => {
     try {
         const cfg = await api("ai/config");
@@ -534,6 +621,7 @@ $("ai-settings").onclick = async () => {
         toast(e.message);
     }
 };
+// 添加一条名称规则（默认关闭，避免一加就开始自动回复）
 $("ai-rule-add").onclick = () =>
     $("ai-rules").append(ruleRow({ kind: "person", matcher: "wildcard", mode: "off", interval_seconds: 30 }));
 handleForm("ai-form", "ai-error", () =>
@@ -547,28 +635,39 @@ handleForm("ai-form", "ai-error", () =>
     })
 );
 
-// 当前会话 AI：mode 为空表示跟随名称规则。
-$("ai-chat-settings").onclick = () => {
-    const ai = conversation.ai;
-    $("chat-ai-mode").value = ai.mode || "inherit";
-    $("chat-ai-interval").value = ai.interval_seconds || 30;
-    $("chat-ai-keyword").value = ai.keyword || "";
-    $("chat-ai-error").textContent = "";
-    $("chat-ai-dialog").showModal();
+// 会话设置：类型、定时读取、图片、AI 回复。只提交有变化的项。
+$("chat-settings").onclick = () => {
+    const c = conversation;
+    $("set-kind").value = c.kind;
+    $("set-read-every").value = String(c.read_every_seconds || 0);
+    $("set-originals").value = c.originals || (c.kind === "person" ? "on" : "off");
+    $("set-ai-mode").value = c.ai.mode || "inherit";
+    $("set-ai-interval").value = c.ai.interval_seconds || c.ai_effective?.interval_seconds || 30;
+    $("set-ai-keyword").value = c.ai.keyword || "";
+    $("chat-settings-error").textContent = "";
+    $("chat-settings-dialog").showModal();
 };
-handleForm("chat-ai-form", "chat-ai-error", () =>
-    api("conversations/" + active + "/ai", {
-        mode: $("chat-ai-mode").value,
-        interval_seconds: Number($("chat-ai-interval").value),
-        keyword: $("chat-ai-keyword").value
-    })
-);
+handleForm("chat-settings-form", "chat-settings-error", async () => {
+    const c = conversation;
+    const path = "conversations/" + active + "/";
+    const kind = $("set-kind").value;
+    if (kind !== c.kind) await api(path + "kind", { kind });
+    const readEvery = Number($("set-read-every").value);
+    if (readEvery !== (c.read_every_seconds || 0)) await api(path + "schedule", { read_every_seconds: readEvery });
+    const originals = $("set-originals").value;
+    if (originals !== (c.originals || (c.kind === "person" ? "on" : "off"))) await api(path + "originals", { originals });
+    const ai = { mode: $("set-ai-mode").value, interval_seconds: Number($("set-ai-interval").value), keyword: $("set-ai-keyword").value };
+    if (ai.mode !== (c.ai.mode || "inherit") || ai.interval_seconds !== c.ai.interval_seconds || ai.keyword !== (c.ai.keyword || ""))
+        await api(path + "ai", ai);
+});
 
-// ---------- 系统栏折叠（记在本地，浏览器禁用存储时也能切换） ----------
+// ---------- 系统侧边栏折叠（记在浏览器本地，禁用存储时也能切换） ----------
 
+// setSystemCollapsed 折叠或展开系统侧边栏，并记住选择。
 function setSystemCollapsed(collapsed) {
     $("system-sidebar").classList.toggle("collapsed", collapsed);
     $("system-toggle").setAttribute("aria-expanded", String(!collapsed));
+    $("system-toggle").title = collapsed ? "展开侧边栏" : "折叠侧边栏";
     try {
         localStorage.setItem("system-sidebar-collapsed", String(collapsed));
     } catch (_) {}
@@ -580,6 +679,7 @@ $("system-toggle").onclick = () => setSystemCollapsed(!$("system-sidebar").class
 
 // ---------- 启动 ----------
 
+// 服务端数据变化时通过 SSE 通知刷新；另外每 20 秒兜底刷新一次
 const stream = new EventSource("/api/stream");
 stream.onmessage = () => void refresh();
 stream.onerror = () => ($("connection").textContent = "实时连接恢复中");

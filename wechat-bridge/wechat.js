@@ -13,42 +13,83 @@ var DEFAULT_PROFILE = {
 var MAX_THUMBNAILS = 3; // 每次读取最多截取的图片缩略图数量
 
 module.exports = function (config, workDir) {
+    // 合并控件编号：默认值在前，配置中非空的值覆盖默认值
     var profile = {};
     [DEFAULT_PROFILE, config.profile || {}].forEach(function (source) {
         for (var key in source) if (source[key]) profile[key] = source[key];
     });
-    // 聊天名称 → { query: 搜索和原生标题使用的名称, title: OCR 看到的标题, list_name: 会话列表里的名称 }
+    // 聊天名称 → { query: 搜索使用的名称, title: 标题上显示的名称, list_name: 会话列表里的名称 }（都用于名称匹配）
     var aliases = config.chat_aliases || {};
     var deadline = 0;
     var clicked = false; // 本次任务是否已点击发送；点击后出错只能报告“结果未知”
-    var captureFailed = false; // 截图授权失效（例如被其他脚本的截图申请顶掉），需要重启微信桥
+    var captureFailed = false; // 截图授权失效（例如被其他脚本的截图申请顶掉），微信桥会重新申请
     var originalsDir = workDir + "originals/";
 
+    // failWithScreen 先把当前屏幕截图（缩小一半）记入执行记录再报错，诊断页可以看到出错时手机上的画面。
+    function failWithScreen(code, message) {
+        try {
+            var shot = capture(),
+                small = images.scale(shot, 0.5, 0.5);
+            step("出错时的屏幕", message, String(images.toBase64(small, "jpg", 50)));
+            small.recycle();
+            shot.recycle();
+        } catch (_) {}
+        fail(code, message);
+    }
+
+    // fail 抛出带错误代码的异常，由 bridge.js 记入任务结果。
     function fail(code, message) {
         var e = new Error(message);
         e.code = code;
         throw e;
     }
 
+    // clock 返回开机以来的毫秒数，不受系统时间调整影响，用于计时和超时。
     function clock() {
         return android.os.SystemClock.elapsedRealtime();
     }
 
+    // capture 截取整个屏幕并复制一份（调用方用完需 recycle）；失败时标记截图授权失效并抛出异常。
     function capture() {
         try {
             return images.copy(captureScreen());
         } catch (e) {
             captureFailed = true;
-            fail("CAPTURE_FAILED", "截图失败，截图授权可能已失效，请重启微信桥");
+            fail("CAPTURE_FAILED", "截图失败，截图授权可能已失效，微信桥会在手机解锁时重新申请");
         }
     }
 
-    // 开始一次新操作：重设超时并清除“已点击发送”标记。
+    // ---------- 执行记录 ----------
+    // 每次操作记录执行步骤和降级（例如原图改用截图），随结果上报，供诊断页查看。
+    var diag = { started: 0, steps: [], warnings: [] };
+
+    // step 记录一个执行步骤及其距操作开始的毫秒数；image 是可选的截图（JPEG Base64），诊断页会显示。
+    function step(name, detail, image) {
+        var item = { ms: clock() - diag.started, step: name, detail: detail || "" };
+        if (image) item.image = image;
+        diag.steps.push(item);
+    }
+
+    // 降级：操作仍然完成了，但用了不太可靠的办法或结果不完整。同一次操作中相同的降级只记一次。
+    function warn(code, message) {
+        for (var i = 0; i < diag.warnings.length; i++) if (diag.warnings[i].code === code && diag.warnings[i].message === message) return;
+        diag.warnings.push({ code: code, message: message });
+        step("降级", message);
+    }
+
+    // diagnostics 返回本次操作的执行记录：总耗时、步骤和降级。
+    function diagnostics() {
+        return { duration_ms: clock() - diag.started, steps: diag.steps, warnings: diag.warnings };
+    }
+
+    // 开始一次新操作：重设超时、清除“已点击发送”标记和执行记录。
     function begin(timeoutMs) {
         deadline = clock() + timeoutMs;
         clicked = false;
+        diag = { started: clock(), steps: [], warnings: [] };
     }
 
+    // screenLocked 屏幕关闭或处于锁屏界面时返回 true。
     function screenLocked() {
         return !device.isScreenOn() || context.getSystemService("keyguard").isKeyguardLocked();
     }
@@ -60,6 +101,7 @@ module.exports = function (config, workDir) {
         if (screenLocked()) fail("SCREEN_LOCKED", "请保持手机亮屏并解锁");
     }
 
+    // waitFor 每 150 毫秒检查一次 condition，返回它第一次的真值；超时返回 null。每次检查前都会 check()。
     function waitFor(condition, timeoutMs) {
         var until = clock() + timeoutMs;
         do {
@@ -73,6 +115,7 @@ module.exports = function (config, workDir) {
 
     // ---------- 控件查找 ----------
 
+    // all 返回微信中所有可见的匹配控件（转成普通数组）。
     function all(selector) {
         var found = selector.packageName(PKG).visibleToUser(true).find(),
             list = [];
@@ -80,6 +123,7 @@ module.exports = function (config, workDir) {
         return list;
     }
 
+    // one 返回微信中第一个可见的匹配控件，没有返回 null。
     function one(selector) {
         return selector.packageName(PKG).visibleToUser(true).findOnce();
     }
@@ -109,6 +153,7 @@ module.exports = function (config, workDir) {
         return currentPackage();
     }
 
+    // inWechat 判断微信是否在前台。
     function inWechat() {
         return foregroundPackage() === PKG;
     }
@@ -118,6 +163,7 @@ module.exports = function (config, workDir) {
         return inWechat() ? one(id(profile.list_id)) : null;
     }
 
+    // tap 点击控件；控件本身不可点击时向上找最多 8 层可点击的父控件。点击前确认微信在前台。
     function tap(node) {
         check();
         if (!inWechat()) fail("WRONG_APP", "当前前台不是微信");
@@ -149,32 +195,7 @@ module.exports = function (config, workDir) {
             .toLowerCase();
     }
 
-    function editDistance(a, b) {
-        var row = [];
-        for (var j = 0; j <= b.length; j++) row.push(j);
-        for (var i = 1; i <= a.length; i++) {
-            var diagonal = row[0];
-            row[0] = i;
-            for (var k = 1; k <= b.length; k++) {
-                var above = row[k];
-                row[k] = Math.min(row[k] + 1, row[k - 1] + 1, diagonal + (a[i - 1] === b[k - 1] ? 0 : 1));
-                diagonal = above;
-            }
-        }
-        return row[b.length];
-    }
-
-    // OCR 识别结果与名称是否足够接近：数字和字母必须完全一致（避免“1群”与“2群”混淆），
-    // 其余每 5 个字允许错 1 个（OCR 常把“淘”认成“海”）。
-    function ocrSimilar(observed, expected) {
-        var digits = function (t) {
-            return (t.match(/[0-9a-z]/g) || []).join("");
-        };
-        if (digits(observed) !== digits(expected)) return false;
-        return editDistance(observed, expected) <= Math.floor(Math.max(observed.length, expected.length) / 5);
-    }
-
-    // 同一个聊天可能出现的所有写法：通知/会话名、搜索名、OCR 标题、会话列表名。
+    // 同一个聊天可能出现的所有写法：通知/会话名、搜索名、标题、会话列表名（别名配置中的 query、title、list_name）。
     function titleVariants(name) {
         var alias = aliases[name] || {};
         return [name, alias.query, alias.title, alias.list_name]
@@ -184,6 +205,7 @@ module.exports = function (config, workDir) {
             .map(normalizeTitle);
     }
 
+    // chatName 把看到的名称换回配置中的聊天名称（匹配别名的任一写法），没有别名时原样返回。
     function chatName(label) {
         var key = normalizeTitle(label);
         for (var name in aliases) if (titleVariants(name).indexOf(key) >= 0) return name;
@@ -191,9 +213,14 @@ module.exports = function (config, workDir) {
     }
 
     // ---------- 核对当前聊天 ----------
+    // 当前微信（8.0.78）的聊天页不向无障碍服务提供标题控件，进入聊天后读不出“这是谁”。所以：
+    //   - 进入前确认：首页会话列表或搜索结果中，名称与目标完全一致且唯一的那一项，点击它进入；
+    //   - 进入后记下屏幕上的消息，之后（点发送前、读取前后）确认当前屏幕仍能和它接上，以发现中途被切到别的聊天。
+    // 如果某个微信版本提供了标题控件，则优先用标题精确核对。
 
-    var lastSeenTitle = ""; // 最近一次核对时看到的标题，核对失败时写进错误信息
+    var entered = { name: "", screen: [] }; // 最近一次确认进入的聊天，以及最近一次确认时屏幕上的消息
 
+    // nativeTitle 读取聊天页标题控件的文字（只看屏幕顶部 20% 内的），没有返回 null。
     function nativeTitle() {
         var nodes = all(id(profile.title_id));
         for (var i = 0; i < nodes.length; i++) {
@@ -202,47 +229,65 @@ module.exports = function (config, workDir) {
         return null;
     }
 
-    // 标题栏 OCR 识别出的文字。
-    function ocrTitleLabels() {
-        var shot = capture();
-        var strip = images.clip(shot, 0, Math.round(device.height * 0.03), device.width, Math.round(device.height * 0.08));
-        try {
-            var words = ocr.detect(strip),
-                labels = [];
-            for (var i = 0; i < words.length; i++) labels.push(String(words[i].label));
-            return labels;
-        } finally {
-            strip.recycle();
-            shot.recycle();
+    // titleMatches 标题控件可用时返回标题是否就是 name；没有标题控件时返回 null（无法判断）。
+    function titleMatches(name) {
+        var title = nativeTitle();
+        return title === null ? null : titleVariants(name).indexOf(normalizeTitle(title)) >= 0;
+    }
+
+    // sameChatScreen 两屏消息能否接上：有至少 2 条连续相同的消息（消息少时 1 条）。
+    // 新消息把旧消息挤出屏幕、或稍微滚动过，都仍能接上；换成别的聊天则接不上。
+    function sameChatScreen(before, now) {
+        var need = Math.min(2, before.length, now.length);
+        if (!need) return true; // 没有消息可比（例如刚开始的新聊天），无法判断，视为没有切换
+        for (var i = 0; i < before.length; i++) {
+            for (var j = 0; j < now.length; j++) {
+                var k = 0;
+                while (i + k < before.length && j + k < now.length && sameMessage(before[i + k], now[j + k])) k++;
+                if (k >= need) return true;
+            }
         }
+        return false;
     }
 
-    // 先比对原生标题控件（必须完全一致）；读不到或不一致时用 OCR 识别标题栏（允许少量识别错误）。
-    // 群聊页面不暴露标题控件，只能靠 OCR。
-    function chatIs(name) {
-        if (!messageList()) return false;
-        var variants = titleVariants(name),
-            title = nativeTitle();
-        if (title !== null && variants.indexOf(normalizeTitle(title)) >= 0) return true;
-        var labels = ocrTitleLabels();
-        lastSeenTitle = "标题控件「" + title + "」，OCR「" + labels.join(" ") + "」";
-        var matched = labels.filter(function (label) {
-            return variants.some(function (expected) {
-                return ocrSimilar(normalizeTitle(label), expected);
-            });
-        });
-        return matched.length === 1;
+    // chatProblem 检查当前是否仍在 name 的聊天里，没问题返回 null，否则返回 { code, message }。
+    // 通过时用当前屏幕更新比对基准（屏幕会随新消息滚动）。
+    function chatProblem(name) {
+        if (!messageList()) return { code: "CHAT_MISMATCH", message: "已不在聊天页面，已停止操作" };
+        var byTitle = titleMatches(name);
+        if (byTitle === true) return null;
+        if (byTitle === false) return { code: "CHAT_MISMATCH", message: "聊天标题「" + nativeTitle() + "」与「" + name + "」不一致，已停止操作" };
+        // 没有标题控件：必须是刚确认进入的聊天，且屏幕内容和上次确认时接得上
+        if (entered.name !== name) return { code: "CHAT_MISMATCH", message: "没有确认进入「" + name + "」，已停止操作" };
+        var now = visibleMessages(null);
+        if (!sameChatScreen(entered.screen, now))
+            return { code: "CHAT_CHANGED", message: "当前屏幕的消息与进入「" + name + "」时接不上，可能被切换到了别的聊天，已停止操作" };
+        entered.screen = now;
+        return null;
     }
 
-    function verifyChat(name, timeoutMs, message) {
-        lastSeenTitle = "";
-        var ok = waitFor(function () {
-            return chatIs(name);
-        }, timeoutMs || 1800);
-        if (!ok) fail("CHAT_MISMATCH", (message || "聊天标题不匹配，已停止操作") + "：期望「" + name + "」，看到" + (lastSeenTitle || "不在聊天页面"));
+    // verifyChat 确认当前仍在 name 的聊天里（点发送前、读取前后调用），否则附上屏幕截图报错。
+    function verifyChat(name) {
+        waitFor(messageList, 1800);
+        var problem = chatProblem(name);
+        if (problem) failWithScreen(problem.code, problem.message);
     }
 
-    // 当前打开的聊天名称，用于监测手动打开的聊天；读不到标题时返回 null。
+    // stillInChat 不报错的 verifyChat，供后台监测判断是否仍在最近操作的聊天里。
+    function stillInChat(name) {
+        return !chatProblem(name);
+    }
+
+    // confirmEntered 点击会话后等聊天页出现；有标题控件时再核对标题；然后记下当前屏幕作为比对基准。
+    function confirmEntered(name, how) {
+        if (!waitFor(messageList, 3000)) failWithScreen("CHAT_NOT_OPENED", "点击「" + name + "」后没有进入聊天页面，已停止操作");
+        if (titleMatches(name) === false)
+            failWithScreen("CHAT_MISMATCH", "进入后的聊天标题「" + nativeTitle() + "」与「" + name + "」不一致，已停止操作");
+        entered = { name: name, screen: visibleMessages(null) };
+        step("打开聊天", how);
+    }
+
+    // currentChat 当前打开的聊天名称（来自标题控件），用于监测手动打开的聊天；读不到标题时返回 null。
     function currentChat() {
         if (!messageList()) return null;
         var title = nativeTitle();
@@ -251,6 +296,7 @@ module.exports = function (config, workDir) {
 
     // ---------- 打开聊天 ----------
 
+    // launchWechat 启动微信并等它到前台；5 秒内没有到前台就报告当前前台是哪个应用。
     function launchWechat() {
         app.startActivity({
             packageName: PKG,
@@ -277,17 +323,20 @@ module.exports = function (config, workDir) {
             check();
             if (!inWechat()) fail("WRONG_APP", "导航期间微信失去前台，已停止操作");
             var home = homeControls();
+            // 在首页但不在“微信”标签（例如在通讯录）：点底部“微信”标签
             if (home && nativeTitle() !== "微信") {
                 tap(home.tab);
                 home = waitFor(homeControls, 1500);
             }
             if (home) return home;
+            // 还没到首页：按一次返回
             back();
             sleep(350);
         }
         fail("HOME_NOT_FOUND", "无法返回微信消息列表，请手动打开微信首页");
     }
 
+    // recentRows 首页会话列表中名称与 name 相符的行（可能多个，由调用方判断是否唯一）。
     function recentRows(name) {
         var variants = titleVariants(name);
         return unique(
@@ -308,6 +357,8 @@ module.exports = function (config, workDir) {
         var candidates = [],
             lastKey = null,
             stableSince = 0;
+        // 等搜索结果稳定：连续 180 毫秒结果的位置不变，才认为加载完成
+        // 群聊按文字找，联系人按联系人结果控件找；排除搜索框本身和屏幕边缘的控件
         var settled = waitFor(function () {
             var selector = group ? text(query) : id(profile.search_contact_id).text(query);
             candidates = all(selector).filter(function (n) {
@@ -325,7 +376,8 @@ module.exports = function (config, workDir) {
             }
             return Date.now() - stableSince >= 180;
         }, 3000);
-        if (!settled || candidates.length !== 1) fail("CONTACT_AMBIGUOUS", "未找到唯一精确联系人或群，请使用唯一备注名");
+        // 结果必须唯一，否则停止，避免进错聊天
+        if (!settled || candidates.length !== 1) failWithScreen("CONTACT_AMBIGUOUS", "未找到唯一精确联系人或群，请使用唯一备注名");
         tap(candidates[0]);
         // 联系人结果可能先打开资料页，需要再点“发消息”。
         if (
@@ -336,25 +388,37 @@ module.exports = function (config, workDir) {
             fail("CHAT_MISMATCH", "搜索结果未打开可确认的聊天页面");
         var sendButton = one(text("发消息"));
         if (sendButton && !messageList()) tap(sendButton);
-        verifyChat(name, 4000, "无法核对聊天对象");
+        confirmEntered(name, "通过全局搜索「" + query + "」进入");
     }
 
-    // 依次尝试：当前聊天 → 首页最近会话 → 全局搜索。
+    // 打开聊天：依次尝试 仍在该聊天里 → 首页会话列表 → 全局搜索。进入前都按名称精确匹配且必须唯一。
     function openChat(name, group) {
         check();
-        if (!inWechat()) launchWechat();
-        if (chatIs(name)) return;
-        var home = goHome();
-        var rows = recentRows(name);
-        if (rows.length > 1) fail("CONTACT_AMBIGUOUS", "消息列表存在多个同名目标，请使用唯一备注名");
-        if (rows.length === 1) {
-            tap(rows[0]);
-            verifyChat(name, 3000, "最近聊天对象未通过核对");
+        // 微信不在前台就先启动
+        if (!inWechat()) {
+            step("启动微信", "前台是 " + foregroundPackage());
+            launchWechat();
+        }
+        // 标题一致，或仍在上次确认进入的同一个聊天里（屏幕内容接得上）：不用重新进入
+        if (messageList() && (titleMatches(name) === true || stillInChat(name))) {
+            step("打开聊天", titleMatches(name) === true ? "已在目标聊天（标题一致）" : "仍在上次进入的聊天里（屏幕内容接得上）");
             return;
         }
+        // 否则回首页，在会话列表里找名称完全一致的那一行；找到多个同名就停止
+        var home = goHome();
+        var rows = recentRows(name);
+        if (rows.length > 1) failWithScreen("CONTACT_AMBIGUOUS", "消息列表存在多个同名目标，请使用唯一备注名");
+        if (rows.length === 1) {
+            var label = String(rows[0].text());
+            tap(rows[0]);
+            confirmEntered(name, "从首页会话列表点击「" + label + "」进入");
+            return;
+        }
+        step("打开聊天", "首页没有该会话，使用全局搜索");
         searchChat(name, group, home.search);
     }
 
+    // returnToList 在聊天页时按一次返回，回到首页会话列表。
     function returnToList() {
         if (messageList()) {
             back();
@@ -413,9 +477,11 @@ module.exports = function (config, workDir) {
         if (!list) fail("MESSAGE_LIST_MISSING", "消息列表不可用");
         var area = list.bounds(),
             result = [];
+        // 先取所有头像位置，用来判断每条文字消息是收到的还是发出的
         var avatars = all(id(profile.avatar_id)).map(function (n) {
             return n.bounds();
         });
+        // 文字消息：有文字且与消息列表区域有交集的气泡
         unique(all(id(profile.message_id))).forEach(function (n) {
             var b = n.bounds();
             if (!n.text() || b.bottom <= area.top || b.top >= area.bottom) return;
@@ -423,6 +489,7 @@ module.exports = function (config, workDir) {
         });
         var shot = null;
         try {
+            // 图片消息：方向看图片在屏幕左半边还是右半边；需要时截取缩略图（整屏只截一次）
             imageNodes(area).forEach(function (n) {
                 var b = n.bounds();
                 var item = {
@@ -448,6 +515,7 @@ module.exports = function (config, workDir) {
         } finally {
             if (shot) shot.recycle();
         }
+        // 文字和图片合在一起，按屏幕位置从上到下排序
         return result.sort(function (a, b) {
             return a.top - b.top || a.left - b.left;
         });
@@ -470,6 +538,7 @@ module.exports = function (config, workDir) {
 
     // older 的末尾与 newer 的开头重叠多少条。
     function overlap(older, newer) {
+        // 从最大可能的重叠数往下试，第一个完全匹配的就是重叠条数
         for (var size = Math.min(older.length, newer.length); size > 0; size--) {
             var matched = true;
             for (var k = 0; k < size && matched; k++) matched = sameMessage(older[older.length - size + k], newer[k]);
@@ -507,6 +576,7 @@ module.exports = function (config, workDir) {
     // 滑到最新消息处，保证读取从聊天底部开始。
     function scrollToLatest() {
         var before = visibleMessages(null);
+        // 向下滑，直到列表不再移动（最多 25 次）
         for (var i = 0; i < 25 && scroll(false); i++) {
             var after = visibleMessages(null);
             if (samePlace(after, before)) return;
@@ -517,10 +587,12 @@ module.exports = function (config, workDir) {
     // 在 messages 的文字消息（跳过图片）中找最后一次连续出现的 texts，返回其后第一条消息的位置；找不到返回 -1。
     function afterTexts(messages, texts) {
         if (!texts.length) return -1;
+        // 只在文字消息中找（图片的文字都是“[图片]”，无法区分）
         var positions = [];
         messages.forEach(function (m, i) {
             if (m.kind !== "image") positions.push(i);
         });
+        // 从后往前找，返回最后一次出现的位置
         for (var i = positions.length - texts.length; i >= 0; i--) {
             var matched = true;
             for (var k = 0; k < texts.length && matched; k++) matched = messages[positions[i + k]].text === texts[k];
@@ -536,6 +608,7 @@ module.exports = function (config, workDir) {
     function readMessages(name, options) {
         var limit = options.limit,
             until = options.until || [];
+        // 核对聊天后滑到底部，从最新的消息开始读
         verifyChat(name);
         scrollToLatest();
         var budget = { images: MAX_THUMBNAILS };
@@ -544,6 +617,7 @@ module.exports = function (config, workDir) {
             pages = 0,
             stopReason = "limit_reached";
         try {
+            // 向上翻页，直到读够、读到已有记录、到达最早或出现异常
             while (messages.length < limit) {
                 if (afterTexts(messages, until) >= 0) {
                     stopReason = "reached_known";
@@ -559,11 +633,13 @@ module.exports = function (config, workDir) {
                 }
                 pages++;
                 var older = visibleMessages(budget);
+                // 列表没有移动：已经到最早的消息
                 if (samePlace(older, screen)) {
                     stopReason = "history_start";
                     break;
                 }
                 screen = older;
+                // 新的一屏必须和已读部分有重叠，才能确定拼接位置；否则停止，避免拼错顺序
                 var shared = overlap(older, messages);
                 if (!shared) {
                     stopReason = "unverified_overlap";
@@ -578,12 +654,28 @@ module.exports = function (config, workDir) {
                         delete messages[k].image_error;
                     }
                 }
+                // 把新的一屏中更早的部分拼到前面
                 messages = older.slice(0, older.length - shared).concat(messages);
             }
+        // 翻过页就滑回底部，下次操作仍从最新消息开始
         } finally {
             if (pages) scrollToLatest();
         }
+        // 提前停止的读取记为降级：结果可能不完整
+        var STOP_WARNINGS = {
+            unverified_overlap: "向上翻页时相邻两屏没能比对上，读取提前停止，更早的消息可能没读到",
+            page_cap: "翻到 20 页上限仍没读到已有记录，中间的消息可能没读到",
+            scroll_failed: "消息列表滑动失败，读取提前停止"
+        };
+        step("读取消息", messages.length + " 条，翻页 " + pages + " 次，停止原因 " + stopReason);
+        if (STOP_WARNINGS[stopReason]) warn("READ_" + stopReason.toUpperCase(), STOP_WARNINGS[stopReason]);
+        var thumbFailed = messages.filter(function (m) {
+            return m.image_error === "缩略图获取失败" || m.image_error === "缩略图超过大小限制";
+        }).length;
+        if (thumbFailed) warn("THUMBNAIL_FAILED", thumbFailed + " 张图片没能截取缩略图");
+        // 需要取原图时，只处理 until 之后的新图片
         if (options.originals > 0) fetchOriginals(messages, Math.max(0, afterTexts(messages, until)), options.originals, options.tag);
+        // 读完再核对一次，确保读取期间没有被切到别的聊天
         verifyChat(name);
         return {
             messages: withoutPosition(messages.slice(-limit)),
@@ -598,9 +690,11 @@ module.exports = function (config, workDir) {
     // 微信“保存图片”可能写入的目录。只取开始保存之后新出现的文件。
     var SAVE_DIRS = ["/sdcard/Pictures/WeiXin/", "/sdcard/DCIM/WeiXin/", "/sdcard/tencent/MicroMsg/WeiXin/", "/sdcard/Pictures/", "/sdcard/DCIM/Camera/"];
 
+    // newestSavedImage 在保存目录中找 since 之后最新的图片文件，确认已写完后返回路径；没有返回 null。
     function newestSavedImage(since) {
         var best = null,
             bestTime = since - 2000;
+        // 遍历所有可能的目录，挑出修改时间最新的图片（容许 2 秒时钟误差）
         SAVE_DIRS.forEach(function (dir) {
             if (!files.isDir(dir)) return;
             var names = files.listDir(dir);
@@ -640,6 +734,7 @@ module.exports = function (config, workDir) {
         var started = Date.now();
         new java.io.File(originalsDir).mkdirs();
         try {
+            // 1. 点击图片可见部分的中心，等聊天列表消失（大图页面已打开）
             check();
             click(Math.round((b[0] + b[2]) / 2), Math.round((b[1] + b[3]) / 2));
             if (!waitFor(function () {
@@ -647,6 +742,7 @@ module.exports = function (config, workDir) {
             }, 3000))
                 fail("VIEWER_NOT_OPEN", "大图没有打开");
             sleep(800);
+            // 2. 有“查看原图”按钮就点开，等按钮和加载进度消失，最多 20 秒
             var full = one(textStartsWith("查看原图"));
             if (full) {
                 tap(full);
@@ -655,6 +751,7 @@ module.exports = function (config, workDir) {
                 }, 20000);
                 sleep(500);
             }
+            // 3. 微信有存储权限时，长按图片，在菜单中点“保存图片”，等新文件出现
             var saved = null,
                 save = null;
             if (wechatCanSave()) {
@@ -669,12 +766,15 @@ module.exports = function (config, workDir) {
                     return newestSavedImage(started);
                 }, 8000);
             }
+            // 4. 取到文件：复制到原图目录等电脑来取，并删除微信存进相册的副本
             if (saved) {
                 var ext = saved.slice(saved.lastIndexOf(".")).toLowerCase();
                 files.copy(saved, originalsDir + fileName + ext);
                 files.remove(saved); // 删除微信存进相册的副本
                 media.scanFile(saved);
                 message.original_file = fileName + ext;
+                step("取原图", "已保存原图文件");
+            // 没取到文件：关闭可能还开着的菜单，截取大图页面代替，并记一条降级
             } else {
                 if (one(text("取消"))) {
                     back(); // 关闭长按菜单
@@ -688,10 +788,13 @@ module.exports = function (config, workDir) {
                 }
                 message.original_file = fileName + ".jpg";
                 message.original_source = "screenshot";
-                if (!wechatCanSave()) message.original_note = "微信没有“读写照片及文件”权限，用大图截图代替原图";
+                message.original_note = wechatCanSave() ? "没能保存原图文件，用大图截图代替" : "微信没有“读写照片及文件”权限，用大图截图代替原图";
+                warn("ORIGINAL_SCREENSHOT", message.original_note);
             }
         } catch (e) {
             message.original_error = String(e.message || e);
+            warn("ORIGINAL_FAILED", "取原图失败：" + message.original_error);
+        // 无论成功与否都返回聊天页
         } finally {
             leaveViewer();
         }
@@ -700,16 +803,19 @@ module.exports = function (config, workDir) {
     // 为 messages[from:] 中的图片取原图，从最早的开始最多 max 张（电脑把 from 设在最早一张还没有原图的图片处）。
     // 当前在聊天底部：用屏幕内容与 messages 的重叠确定每条消息在屏幕上的位置，必要时向上翻页。
     function fetchOriginals(messages, from, max, tag) {
+        // 选出要取原图的图片在 messages 中的位置
         var targets = [];
         for (var i = from; i < messages.length && targets.length < max; i++) {
             if (messages[i].kind === "image") targets.push(i);
         }
         if (!targets.length) return;
+        // 当前屏幕在聊天底部：屏幕上的第 k 条对应 messages[offset + k]
         var screen = visibleMessages(null),
             mapped = overlap(messages, screen), // screen[0..mapped) 对应 messages 的最后 mapped 条
             offset = messages.length - mapped,
             pages = 0;
         try {
+            // 先处理当前屏幕上能看到的目标图片，再向上翻页处理更早的
             while (targets.length && mapped) {
                 var remaining = [];
                 for (var t = 0; t < targets.length; t++) {
@@ -726,6 +832,7 @@ module.exports = function (config, workDir) {
                         break;
                     }
                 }
+                // 还有没处理的：向上翻一页，用新旧两屏的重叠更新对应关系
                 targets = remaining;
                 if (!targets.length || pages >= 20 || !scroll(true)) break;
                 pages++;
@@ -739,8 +846,12 @@ module.exports = function (config, workDir) {
         } finally {
             if (pages) scrollToLatest();
         }
+        // 翻页后仍没找到的图片，记下原因
         targets.forEach(function (i) {
-            if (!messages[i].original_file && !messages[i].original_error) messages[i].original_error = "没能在屏幕上定位这张图片";
+            if (!messages[i].original_file && !messages[i].original_error) {
+                messages[i].original_error = "没能在屏幕上定位这张图片";
+                warn("ORIGINAL_NOT_LOCATED", "有图片没能在屏幕上定位，未取原图");
+            }
         });
     }
 
@@ -757,6 +868,7 @@ module.exports = function (config, workDir) {
     // 唯一的聊天输入框（排除内部再嵌套一个输入框的外层容器）。
     function input() {
         var nodes = all(profile.input_id ? id(profile.input_id) : className("android.widget.EditText"));
+        // 有的版本输入框外面还包着一个同编号的容器，只保留最内层
         var leaves = nodes.filter(function (n) {
             for (var j = 0; j < n.childCount(); j++) {
                 var child = n.child(j);
@@ -777,6 +889,7 @@ module.exports = function (config, workDir) {
         return waitFor(input, 2500);
     }
 
+    // countText 统计当前屏幕上文字为 content 的消息条数，用来确认发送后多了一条。
     function countText(content) {
         var list = messageList();
         if (!list) fail("MESSAGE_LIST_MISSING", "消息列表不可用");
@@ -790,27 +903,34 @@ module.exports = function (config, workDir) {
     // 填入文字并核对后只点击一次发送；之后以“输入框清空且出现新的同文消息”作为确认。
     function sendText(name, group, content) {
         verifyChat(name);
+        // 1. 记下发送前同样文字的消息数，找到输入框；输入框里已有草稿时不覆盖
         var before = countText(content);
         var box = textInput();
         if (!box) fail("INPUT_NOT_FOUND", "未找到唯一聊天输入框，请切换到文字输入模式");
         if (box.text() && String(box.text()).trim()) fail("DRAFT_EXISTS", "聊天中有未发送草稿，未覆盖");
+        // 2. 填入文字，等“发送”按钮出现
         if (!box.setText(content)) fail("INPUT_FAILED", "无法输入消息");
         var sendButton = waitFor(function () {
             return one(text("发送"));
         }, 2000);
+        // 3. 点发送前再核对一次聊天和输入框内容，防止期间界面被切换
         verifyChat(name);
         box = input();
         if (!sendButton || !box || String(box.text()) !== content) fail("INPUT_MISMATCH", "输入内容或发送按钮不匹配");
+        // 4. 只点一次发送；从这里开始出错只能报告“结果未知”
         clicked = true;
         tap(sendButton);
+        // 5. 确认：输入框已清空，且同样文字的消息多了一条
         var confirmed = waitFor(function () {
             var current = input();
             return current && !String(current.text() || "") && countText(content) > before;
         }, 5000);
-        if (!confirmed) fail("SEND_UNCONFIRMED", "已尝试点击发送，但未确认新增消息；请核对手机，不要直接重发");
+        if (!confirmed) failWithScreen("SEND_UNCONFIRMED", "已尝试点击发送，但未确认新增消息；请核对手机，不要直接重发");
+        step("发送文字", "界面已出现新消息");
         verifyChat(name);
     }
 
+    // outgoingImageCount 统计发出的图片条数，用来确认发图后多了一张。
     function outgoingImageCount(messages) {
         return messages.filter(function (m) {
             return m.kind === "image" && m.direction === "outgoing";
@@ -819,6 +939,7 @@ module.exports = function (config, workDir) {
 
     // 在微信“选择聊天”页搜索并选中唯一的目标，返回确认弹窗里的“发送”按钮。
     function pickShareTarget(name) {
+        // 等分享页的搜索按钮出现；如果弹出了系统权限框，说明微信缺少存储权限
         var search = waitFor(function () {
             if (/packageinstaller|permissioncontroller|lbe\.security/.test(foregroundPackage())) return "permission";
             return one(descMatches(/搜索/)) || one(text("搜索"));
@@ -826,6 +947,7 @@ module.exports = function (config, workDir) {
         if (search === "permission")
             fail("WECHAT_STORAGE_PERMISSION", "微信需要“读取设备上的照片及文件”权限才能发送图片，请在手机上允许后重试");
         if (!search) fail("SHARE_PICKER_UNSUPPORTED", "未识别微信分享联系人选择页");
+        // 点搜索，输入聊天的搜索名称
         tap(search);
         var box = waitFor(function () {
             return one(className("android.widget.EditText"));
@@ -860,6 +982,7 @@ module.exports = function (config, workDir) {
 
     // 通过系统分享把图片发给微信：分享页搜索唯一收件人，发送后回到聊天确认出现新的发出图片。
     function sendImage(name, group, base64, fileTag) {
+        // 1. 解码图片并确认是有效图片，写成临时文件供分享
         var bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT);
         var decoded = images.fromBytes(bytes);
         if (!decoded) fail("BAD_IMAGE", "图片解码失败");
@@ -867,10 +990,12 @@ module.exports = function (config, workDir) {
         var path = workDir + "outgoing-" + fileTag + ".jpg";
         files.writeBytes(path, bytes);
 
+        // 2. 在聊天里记下发送前发出的图片数
         verifyChat(name);
         var before = outgoingImageCount(visibleMessages(null));
         // 允许以 file:// 地址分享文件。
         android.os.StrictMode.setVmPolicy(new android.os.StrictMode.VmPolicy.Builder().build());
+        // 3. 用系统分享把图片发给微信的分享页面
         var intent = new android.content.Intent(android.content.Intent.ACTION_SEND);
         intent.setType("image/jpeg");
         intent.putExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri.fromFile(new java.io.File(path)));
@@ -878,6 +1003,7 @@ module.exports = function (config, workDir) {
         intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
         context.startActivity(intent);
 
+        // 4. 在分享页选中唯一的收件人；失败时退出分享页
         var confirm;
         try {
             confirm = pickShareTarget(name);
@@ -892,6 +1018,8 @@ module.exports = function (config, workDir) {
             }
             throw e;
         }
+        // 5. 点发送；从这里开始出错只能报告“结果未知”
+        step("分享图片", "已核对收件人，点击发送");
         clicked = true;
         tap(confirm);
         sleep(1500);
@@ -899,18 +1027,22 @@ module.exports = function (config, workDir) {
         var stay = one(text("留在微信"));
         if (stay) tap(stay);
 
+        // 6. 回到聊天确认：发出的图片多了一张，且最后一条就是发出的图片；确认后删除临时文件
         openChat(name, group);
         var confirmed = waitFor(function () {
             var now = visibleMessages(null),
                 last = now[now.length - 1];
             return outgoingImageCount(now) > before && last && last.kind === "image" && last.direction === "outgoing";
         }, 5000);
-        if (!confirmed) fail("SEND_UNCONFIRMED", "已点击图片发送，尚未确认新增图片，请检查手机，不要重发");
+        if (!confirmed) failWithScreen("SEND_UNCONFIRMED", "已点击图片发送，尚未确认新增图片，请检查手机，不要重发");
+        step("发送图片", "聊天中已出现新发出的图片");
         files.remove(path);
     }
 
     // ---------- 未读监测 ----------
 
+    // collectRow 递归收集会话行内的文字（最多 8 层），拼成签名；
+    // 描述含“未读”或有 1–3 位数字的小角标时，标记为未读。
     function collectRow(node, depth, info) {
         if (!node || depth > 8) return;
         var t = String(node.text() || ""),
@@ -925,6 +1057,7 @@ module.exports = function (config, workDir) {
     function unreadChats() {
         if (!inWechat() || messageList()) return null;
         var result = {};
+        // 每个会话名称控件：向上找到整行，收集行内文字判断是否有未读
         all(id(profile.contact_id)).forEach(function (n) {
             var b = n.bounds(),
                 label = String(n.text() || "");
@@ -941,6 +1074,7 @@ module.exports = function (config, workDir) {
 
     // ---------- 就绪状态 ----------
 
+    // wechatVersion 返回已安装微信的版本号，读不到返回 null。
     function wechatVersion() {
         try {
             return String(context.getPackageManager().getPackageInfo(PKG, 0).versionName);
@@ -961,6 +1095,7 @@ module.exports = function (config, workDir) {
         return null;
     }
 
+    // status 汇总就绪状态：ready 为 true 才能执行任务；reasons 列出所有未满足的条件。
     function status(captureReady) {
         var reasons = [],
             version = wechatVersion(),
@@ -980,17 +1115,26 @@ module.exports = function (config, workDir) {
         };
     }
 
+    // 提供给 bridge.js 使用的接口
     return {
         begin: begin,
         clicked: function () {
             return clicked;
         },
         status: status,
-        chatIs: chatIs,
+        stillInChat: stillInChat,
         currentChat: currentChat,
         openChat: openChat,
         returnToList: returnToList,
         readMessages: readMessages,
+        diagnostics: diagnostics,
+        // 截图授权是否失效（失效后由 bridge.js 重新申请，成功后调用 captureRestored）
+        captureBroken: function () {
+            return captureFailed;
+        },
+        captureRestored: function () {
+            captureFailed = false;
+        },
         originalsDir: originalsDir,
         snapshot: snapshot,
         sendText: sendText,

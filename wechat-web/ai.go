@@ -47,11 +47,13 @@ type AIJob struct {
 	Created        string `json:"created"`
 }
 
+// matches 判断规则是否适用于会话：类型相同，且名称匹配通配符或正则（整名匹配）。
 func (r AIRule) matches(c *Conversation) bool {
 	if r.Kind != c.Kind {
 		return false
 	}
 	pattern := r.Pattern
+	// 通配符转成正则：先转义，再把 * 换成 .*、? 换成 .，并锚定首尾
 	if r.Matcher == "wildcard" {
 		pattern = regexp.QuoteMeta(pattern)
 		pattern = "^" + strings.NewReplacer(`\*`, ".*", `\?`, ".").Replace(pattern) + "$"
@@ -60,6 +62,7 @@ func (r AIRule) matches(c *Conversation) bool {
 	return err == nil && re.MatchString(c.Title)
 }
 
+// validate 检查回复方式、间隔和触发词；kind 是会话类型（群聊自动回复必须设置触发词）。
 func (s AISetting) validate(kind string) error {
 	if s.Mode != "off" && s.Mode != "auto" {
 		return errors.New("回复方式必须为 off 或 auto")
@@ -78,6 +81,7 @@ func (s AISetting) validate(kind string) error {
 
 // aiSettingLocked 返回会话实际生效的回复方式：会话自己的设置 > 第一条匹配的名称规则 > 关闭。
 func (a *App) aiSettingLocked(c *Conversation) AISetting {
+	// 会话自己设置过就用自己的
 	if c.AI.Mode != "" {
 		return c.AI
 	}
@@ -93,6 +97,7 @@ func (a *App) aiSettingLocked(c *Conversation) AISetting {
 func (a *App) aiLoop(ctx context.Context) {
 	for pause(ctx, time.Second) {
 		a.mu.Lock()
+		// 加锁挑出一个需要回复的会话并建好记录，解锁后再调用模型（耗时操作不持锁）
 		jobID := a.nextAutoJobLocked()
 		a.mu.Unlock()
 		if jobID != "" {
@@ -101,7 +106,10 @@ func (a *App) aiLoop(ctx context.Context) {
 	}
 }
 
+// nextAutoJobLocked 找出一个需要自动回复的会话并建立 AI 记录，返回记录编号；没有返回空字符串。
+// aiCursor 记录每个会话已检查到的消息序号，只看之后的新来信。
 func (a *App) nextAutoJobLocked() string {
+	// 没有配置 AI 接口时不处理
 	if a.state.AI.URL == "" {
 		return ""
 	}
@@ -113,10 +121,12 @@ func (a *App) nextAutoJobLocked() string {
 			a.aiCursor[c.ID] = c.LastSeq
 			continue
 		}
+		// 没有新消息，或距上次生成不足最短间隔：先不处理（游标不动，下次再看）
 		interval := time.Duration(setting.IntervalSeconds) * time.Second
 		if cursor >= c.LastSeq || time.Since(a.aiLastRun[c.ID]) < interval {
 			continue
 		}
+		// 推进游标；新消息里没有满足触发词的来信就不回复
 		a.aiCursor[c.ID] = c.LastSeq
 		if !hasTrigger(c.Messages, cursor, setting.Keyword) {
 			continue
@@ -127,6 +137,7 @@ func (a *App) nextAutoJobLocked() string {
 	return ""
 }
 
+// hasTrigger 判断序号 after 之后是否有来信包含触发词（触发词为空时任何来信都算）。
 func hasTrigger(messages []Message, after int64, keyword string) bool {
 	for _, m := range messages {
 		if m.Seq > after && m.Direction == "incoming" && strings.Contains(m.Text, keyword) {
@@ -136,6 +147,7 @@ func hasTrigger(messages []Message, after int64, keyword string) bool {
 	return false
 }
 
+// newAIJobLocked 建立一条“生成中”的 AI 记录并保存。
 func (a *App) newAIJobLocked(conversationID string) *AIJob {
 	j := &AIJob{ID: randomID(), ConversationID: conversationID, Status: "running", Created: now()}
 	a.state.AIJobs[j.ID] = j
@@ -143,6 +155,7 @@ func (a *App) newAIJobLocked(conversationID string) *AIJob {
 	return j
 }
 
+// aiClient 按配置创建 OpenAI 兼容客户端：不自动重试，不跟随重定向。
 func (a *App) aiClient(cfg AIConfig) *openai.Client {
 	// 不跟随重定向，避免密钥被转发到其他地址。
 	httpClient := &http.Client{
@@ -166,6 +179,7 @@ func (a *App) chatHistoryLocked(cfg AIConfig, c *Conversation) []openai.ChatComp
 	if cfg.Prompt != "" {
 		history = append(history, openai.SystemMessage(cfg.Prompt))
 	}
+	// 逐条转换：过长的文字截到 4000 字；开启看图时，来信图片以 Base64 一并发送
 	for _, m := range c.Messages[max(0, len(c.Messages)-20):] {
 		text := m.Text
 		if r := []rune(text); len(r) > 4000 {
@@ -192,6 +206,7 @@ func (a *App) chatHistoryLocked(cfg AIConfig, c *Conversation) []openai.ChatComp
 // aiLoop 逐个调用，同一时刻只有一个生成任务。
 func (a *App) generateReply(ctx context.Context, jobID string) {
 	log.Printf("AI 任务 %s 开始", jobID)
+	// 加锁取出会话和配置，组装上下文后立即解锁
 	a.mu.Lock()
 	job := a.state.AIJobs[jobID]
 	c := a.state.Conversations[job.ConversationID]
@@ -199,6 +214,7 @@ func (a *App) generateReply(ctx context.Context, jobID string) {
 	history := a.chatHistoryLocked(cfg, c)
 	a.mu.Unlock()
 
+	// 调用模型，最多等 30 秒，回复最多 600 token
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	resp, err := a.aiClient(cfg).Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
@@ -211,6 +227,7 @@ func (a *App) generateReply(ctx context.Context, jobID string) {
 		reply = strings.TrimSpace(resp.Choices[0].Message.Content)
 	}
 
+	// 根据结果记录状态；生成期间自动回复被关掉就不发送，否则建立发送任务交给 worker
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	switch {

@@ -5,6 +5,7 @@
 //   通知回调：微信通知生成消息事件。
 //
 // 任务和事件只保存在内存中。脚本重启后电脑查询不到原任务，会把发送标记为“结果未知”，不会重发。
+// 读取配置，加载微信界面操作模块
 var BASE = "/sdcard/wechat-bridge/";
 var config = JSON.parse(files.read(BASE + "config.json"));
 var ui = require(BASE + "wechat.js")(config, BASE);
@@ -17,6 +18,7 @@ var MAX_EVENTS = 300;
 var MAX_EVENT_RESPONSE_CHARS = 2000000;
 var MAX_BODY_BYTES = 16000000;
 
+// 没有足够长的接口凭证就拒绝启动，避免局域网内任何人都能调用
 if (!config.phone_api_token || config.phone_api_token.length < 32)
     throw Error("config.json 需要至少 32 字符的 phone_api_token");
 
@@ -37,6 +39,7 @@ var lastSeq = Date.now(); // 事件序号从启动时间开始，脚本重启后
 var deviceInfo = { ready: false, reasons: ["STARTING"] };
 var heartbeat = 0; // 主线程最近一次循环的时间
 
+// withLock 在共享锁内执行 fn 并返回其结果。
 function withLock(fn) {
     lock.lock();
     try {
@@ -46,15 +49,18 @@ function withLock(fn) {
     }
 }
 
+// utf8 把字符串转成 UTF-8 字节数组（Java byte[]）。
 function utf8(value) {
     return new java.lang.String(value).getBytes("UTF-8");
 }
 
+// sha256 返回字符串的 SHA-256（Base64），用作任务内容指纹。
 function sha256(value) {
     var digest = java.security.MessageDigest.getInstance("SHA-256").digest(utf8(value));
     return String(android.util.Base64.encodeToString(digest, android.util.Base64.NO_WRAP));
 }
 
+// log 同时输出到控制台和 bridge.log；日志超过 2 MB 时轮转为 bridge.log.1。
 function log(message) {
     var line = new Date().toISOString() + " " + message;
     console.log(line);
@@ -68,6 +74,7 @@ function log(message) {
     } catch (_) {}
 }
 
+// httpError 抛出带 HTTP 状态码和错误代码的异常，由 serve 转成错误响应。
 function httpError(status, code, message) {
     var e = new Error(message);
     e.status = status;
@@ -75,12 +82,62 @@ function httpError(status, code, message) {
     throw e;
 }
 
+// ---------- 诊断事件 ----------
+// 最近的异常（error）和降级（warning），通过 /v1/device 提供给电脑的诊断页。
+// 同一问题（级别、代码、会话、内容相同）10 分钟内重复出现只累加次数，避免监测循环刷屏。
+var diagnosticsLog = [];
+
+// addDiagnostic 记录一条异常或降级，并写入日志。context 可带 task_id、operation、chat、source。
+function addDiagnostic(level, code, message, context) {
+    context = context || {};
+    log((level === "error" ? "异常 " : "降级 ") + code + " " + (context.task_id || "") + " " + message);
+    withLock(function () {
+        var now = Date.now();
+        // 从最新的往前找 10 分钟内的同一问题，找到就累计次数
+        for (var i = diagnosticsLog.length - 1; i >= 0; i--) {
+            var d = diagnosticsLog[i];
+            if (now - d.last_ms > 600000) break;
+            if (d.level === level && d.code === code && d.chat === (context.chat || "") && d.message === message) {
+                d.count++;
+                d.last_ms = now;
+                d.last_at = new Date(now).toISOString();
+                if (context.task_id) d.task_id = context.task_id;
+                return;
+            }
+        }
+        // 新问题：追加一条，最多保留 50 条
+        diagnosticsLog.push({
+            level: level,
+            code: code,
+            message: message,
+            chat: context.chat || "",
+            source: context.source || "task",
+            task_id: context.task_id || "",
+            operation: context.operation || "",
+            count: 1,
+            at: new Date(now).toISOString(),
+            last_at: new Date(now).toISOString(),
+            last_ms: now
+        });
+        if (diagnosticsLog.length > 50) diagnosticsLog.shift();
+    });
+}
+
+// recentDiagnostics 返回诊断事件的副本，供 /v1/device 返回。
+function recentDiagnostics() {
+    return withLock(function () {
+        return diagnosticsLog.slice();
+    });
+}
+
 // ---------- 任务 ----------
 
+// taskView 返回任务对外可见的字段（不含请求内容和指纹）。
 function taskView(task) {
     return { id: task.id, operation: task.operation, status: task.status, result: task.result };
 }
 
+// validatePayload 校验读取或发送请求的参数，返回整理后的任务参数；不合法时抛出 400。
 function validatePayload(operation, data) {
     if (!data || typeof data !== "object") httpError(400, "BAD_BODY", "需要 JSON 对象");
     var chat = data.chat;
@@ -89,6 +146,7 @@ function validatePayload(operation, data) {
     if (data.chat_type !== undefined && data.chat_type !== "person" && data.chat_type !== "group")
         httpError(400, "BAD_CHAT_TYPE", "会话类型必须为 person 或 group");
     var payload = { chat: chat.trim(), group: data.chat_type === "group" };
+    // 读取：条数、读完是否回到首页、读到哪几条已知消息停止、最多取几张原图
     if (operation === "read") {
         var limit = data.limit === undefined ? 20 : data.limit;
         if (typeof limit !== "number" || limit % 1 !== 0 || limit < 1 || limit > 100)
@@ -109,11 +167,13 @@ function validatePayload(operation, data) {
         if (typeof originals !== "number" || originals % 1 !== 0 || originals < 0 || originals > 3)
             httpError(400, "BAD_ORIGINALS", "originals 必须为 0–3 的整数");
         payload.originals = originals;
+    // 发送图片：Base64 图片数据，不能同时带文字
     } else if (data.image_base64 !== undefined) {
         var image = data.image_base64;
         if (data.text !== undefined || typeof image !== "string" || image.length > 12000000 || !/^[A-Za-z0-9+/=]+$/.test(image))
             httpError(400, "BAD_IMAGE", "图片数据无效");
         payload.image_base64 = image;
+    // 发送文字：1–2000 字
     } else {
         if (typeof data.text !== "string" || !data.text.trim() || data.text.length > 2000)
             httpError(400, "BAD_TEXT", "文本必须为 1–2000 字符");
@@ -126,6 +186,7 @@ function validatePayload(operation, data) {
 function createTask(operation, data, key) {
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(key || "")) httpError(400, "BAD_IDEMPOTENCY_KEY", "需要 Idempotency-Key");
     var payload = validatePayload(operation, data);
+    // 任务内容指纹：同一个 key 再次提交时，用来判断内容是否相同
     var fingerprint = sha256(operation + JSON.stringify(payload));
     return withLock(function () {
         var existing = tasksByKey[key];
@@ -133,8 +194,10 @@ function createTask(operation, data, key) {
             if (existing.fingerprint !== fingerprint) httpError(409, "IDEMPOTENCY_CONFLICT", "同一 key 不能用于不同请求");
             return taskView(existing);
         }
+        // 主循环 45 秒没有心跳或手机未就绪时，不接新任务
         if (Date.now() - heartbeat > 45000 || !deviceInfo.ready)
             httpError(409, "DEVICE_NOT_READY", "手机未就绪：" + (deviceInfo.reasons || []).join(", "));
+        // 同一时刻只允许一个排队任务（电脑端本来就是逐个提交）
         if (pendingTask) httpError(429, "BUSY", "手机已有排队任务");
         var task = {
             id: String(java.util.UUID.randomUUID()),
@@ -146,6 +209,7 @@ function createTask(operation, data, key) {
             created: Date.now(),
             result: null
         };
+        // 登记任务，成为待执行任务，并清理过多的旧任务
         tasks[task.id] = task;
         tasksByKey[key] = task;
         taskOrder.push(task.id);
@@ -155,6 +219,7 @@ function createTask(operation, data, key) {
     });
 }
 
+// forgetOldTasks 任务数超过上限时，从最早的开始删除已结束的任务；遇到未结束的就停。
 function forgetOldTasks() {
     while (taskOrder.length > MAX_FINISHED_TASKS) {
         var oldest = tasks[taskOrder[0]];
@@ -165,6 +230,7 @@ function forgetOldTasks() {
     }
 }
 
+// getTask 返回任务状态和结果；任务不存在（例如脚本重启过）时返回 404。
 function getTask(taskId) {
     return withLock(function () {
         if (!tasks[taskId]) httpError(404, "NOT_FOUND", "任务不存在");
@@ -172,6 +238,7 @@ function getTask(taskId) {
     });
 }
 
+// finishTask 记录任务结果并写日志。
 function finishTask(task, status, result) {
     withLock(function () {
         task.status = status;
@@ -204,18 +271,23 @@ function takeTask() {
 
 var lastChat = null; // 最近一次任务操作的聊天，监测时用于识别读不到标题的当前聊天
 
+// runTask 执行一个任务：打开聊天，读取或发送，记录执行步骤和降级，最后保存结果。
 function runTask(task) {
     var p = task.payload,
         status,
         result;
     log("任务 " + task.id + " " + task.operation + " 开始");
+    // 开始一次新操作：设置超时，清空执行记录
     ui.begin(TASK_TIMEOUT_MS);
     try {
+        // 先打开目标聊天（核对标题），再按任务类型读取或发送
         ui.openChat(p.chat, p.group);
         if (task.operation === "read") {
+            // 读取完成后，自动读取会回到首页，方便继续发现其他未读会话
             result = ui.readMessages(p.chat, { limit: p.limit, until: p.until, originals: p.originals, tag: task.id });
             if (p.return_list) ui.returnToList();
         } else {
+            // 发送并确认后，再补读一次当前屏幕，让电脑尽快看到刚发的消息
             if (p.image_base64) ui.sendImage(p.chat, p.group, p.image_base64, task.id);
             else ui.sendText(p.chat, p.group, p.text);
             result = { confirmation: "ui_observed" };
@@ -227,17 +299,28 @@ function runTask(task) {
             }
         }
         status = "succeeded";
+        // 记住最近操作的聊天：后台监测时读不到标题，可以用它来识别当前聊天
         lastChat = { name: p.chat, group: p.group };
     } catch (e) {
         // 已点击发送后出错，结果只能是未知，避免电脑误判后重发。
         status = ui.clicked() ? "unknown" : "failed";
         result = { code: e.code || "UI_ERROR", message: String(e.message || e) };
     }
+    // 执行步骤和降级随结果上报，诊断页可以看到每一步。
+    result.diagnostics = ui.diagnostics();
+    // 降级和失败同时记入诊断事件，诊断页可以集中查看
+    var context = { task_id: task.id, operation: task.operation, chat: p.chat };
+    result.diagnostics.warnings.forEach(function (w) {
+        addDiagnostic("warning", w.code, w.message, context);
+    });
+    if (result.sync_error) addDiagnostic("warning", "SYNC_AFTER_SEND", result.sync_error, context);
+    if (status !== "succeeded") addDiagnostic("error", result.code, result.message, context);
     finishTask(task, status, result);
 }
 
 // ---------- 消息事件 ----------
 
+// pushEvent 追加一条消息事件并分配递增序号；最多保留 300 条，超出时丢掉最早的。
 function pushEvent(event) {
     withLock(function () {
         event.seq = ++lastSeq;
@@ -275,13 +358,16 @@ function waitEvents(query) {
 
 var notificationsWatched = false;
 
+// watchNotifications 开启微信通知监听，返回是否有通知使用权（只开启一次）。
 function watchNotifications() {
     if (notificationsWatched) return true;
+    // 检查系统设置里 AutoJs6 是否有通知使用权
     var listeners = String(
         android.provider.Settings.Secure.getString(context.getContentResolver(), "enabled_notification_listeners") || ""
     );
     if (listeners.indexOf("org.autojs.autojs6") < 0) return false;
     events.observeNotification();
+    // 只处理微信的通知：标题是会话名称，正文是消息预览
     events.onNotification(function (n) {
         if (String(n.getPackageName()) !== "com.tencent.mm") return;
         var chat = String(n.getTitle() || ""),
@@ -298,6 +384,7 @@ var unreadSeen = {},
 
 // 空闲时监测：首页有新的未读会话 → unread_chat；当前聊天内容变化 → visible_snapshot。
 function monitor() {
+    // 在首页时：比较每个未读会话的行内容，变化了说明有新消息
     ui.begin(5000);
     var unread = ui.unreadChats();
     if (unread) {
@@ -307,14 +394,18 @@ function monitor() {
         unreadSeen = unread;
     }
 
+    // 当前聊天内容每 3 秒检查一次
     if (Date.now() - lastVisibleCheck < 3000) return;
     lastVisibleCheck = Date.now();
+    // 识别当前打开的聊天：先看标题控件；当前微信没有标题控件，就看是否仍在最近操作的聊天里（屏幕内容接得上）。
+    // 用户在手机上打开了别的聊天时内容接不上，不生成快照，避免把别的聊天的消息记错地方。
     var name = ui.currentChat();
-    if (!name && lastChat && ui.chatIs(lastChat.name)) name = lastChat.name;
+    if (!name && lastChat && ui.stillInChat(lastChat.name)) name = lastChat.name;
     if (!name) {
         lastSignature = null;
         return;
     }
+    // 先不截图比较屏幕内容，有变化才截图生成快照事件（截图较耗时）
     var signature = name + JSON.stringify(ui.snapshot(false).messages);
     if (signature === lastSignature) return;
     lastSignature = signature;
@@ -324,12 +415,14 @@ function monitor() {
 
 // ---------- HTTP ----------
 
+// intParam 解析查询参数中的非负整数；缺省时返回 fallback，超出范围返回 400。
 function intParam(raw, fallback, min, max) {
     if (raw === undefined) return fallback;
     if (!/^\d+$/.test(raw) || Number(raw) < min || Number(raw) > max) httpError(400, "BAD_QUERY", "查询参数无效");
     return Number(raw);
 }
 
+// readLine 从输入流读一行（到 \n 为止，去掉 \r），单行最多 8 KB。
 function readLine(input) {
     var bytes = new java.io.ByteArrayOutputStream(),
         b;
@@ -341,7 +434,9 @@ function readLine(input) {
     return String(bytes.toString("UTF-8"));
 }
 
+// readRequest 解析一个 HTTP 请求：请求行、请求头和请求体（按 Content-Length 读取）。
 function readRequest(socket) {
+    // 5 秒内必须读完请求，防止慢速连接占住线程
     socket.setSoTimeout(5000);
     var input = new java.io.DataInputStream(new java.io.BufferedInputStream(socket.getInputStream()));
     var first = readLine(input).split(" ");
@@ -353,6 +448,7 @@ function readRequest(socket) {
         if (at < 1) httpError(400, "BAD_HTTP", "无效请求头");
         headers[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim();
     }
+    // 请求体大小有上限（发送图片时最大）
     var length = Number(headers["content-length"] || 0);
     if (!(length >= 0 && length <= MAX_BODY_BYTES)) httpError(413, "BODY_TOO_LARGE", "请求体过大");
     var body = "";
@@ -361,6 +457,7 @@ function readRequest(socket) {
         input.readFully(buffer);
         body = String(new java.lang.String(buffer, "UTF-8"));
     }
+    // 拆分路径和查询参数
     var target = first[1].split("?"),
         query = {};
     (target[1] || "").split("&").forEach(function (pair) {
@@ -370,6 +467,7 @@ function readRequest(socket) {
     return { method: first[0], path: target[0], query: query, headers: headers, body: body };
 }
 
+// parseJSON 解析 JSON 请求体，格式错误时返回 400。
 function parseJSON(body) {
     try {
         return JSON.parse(body);
@@ -385,10 +483,11 @@ function tokenMatches(header) {
 
 // 返回 [状态码, 响应体]，或 [200, null, 文件路径] 表示下载文件。
 function route(req) {
+    // 存活检查不需要凭证，其余接口都要 Bearer Token
     if (req.method === "GET" && req.path === "/health") return [200, { ok: true, device_id: config.device_id }];
     if (!tokenMatches(req.headers.authorization)) httpError(401, "UNAUTHORIZED", "需要有效 Bearer Token");
     if (req.method === "GET" && req.path === "/v1/device")
-        return [200, { online: Date.now() - heartbeat < 45000, info: deviceInfo }];
+        return [200, { online: Date.now() - heartbeat < 45000, info: deviceInfo, diagnostics: recentDiagnostics() }];
     if (req.method === "GET" && req.path === "/v1/events") return [200, waitEvents(req.query)];
     if (req.method === "GET" && req.path.indexOf("/v1/tasks/") === 0) return [200, getTask(req.path.slice(10))];
     var file = /^\/v1\/files\/([A-Za-z0-9._-]+)$/.exec(req.path);
@@ -399,6 +498,7 @@ function route(req) {
     httpError(404, "NOT_FOUND", "接口不存在");
 }
 
+// respond 写出 JSON 响应。每个请求一个连接，响应后关闭。
 function respond(socket, status, value) {
     var body = utf8(JSON.stringify(value));
     var head =
@@ -416,6 +516,7 @@ function respond(socket, status, value) {
 function respondFile(socket, path) {
     var file = new java.io.File(path);
     if (!file.isFile()) return respond(socket, 404, { error: { code: "NOT_FOUND", message: "文件不存在" } });
+    // 先写响应头，再分块写文件内容
     var out = socket.getOutputStream();
     out.write(utf8("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " + file.length() + "\r\nConnection: close\r\n\r\n"));
     var input = new java.io.FileInputStream(file);
@@ -430,6 +531,7 @@ function respondFile(socket, path) {
     file.delete();
 }
 
+// serve 处理一个连接：解析请求、分发，出错时返回错误 JSON，最后关闭连接。
 function serve(socket) {
     try {
         var reply;
@@ -437,6 +539,7 @@ function serve(socket) {
             reply = route(readRequest(socket));
             if (reply[2]) return respondFile(socket, reply[2]);
         } catch (e) {
+            // 主动抛出的错误带状态码，原样返回；其他异常只返回笼统说明，不暴露内部信息
             var message = e.status ? e.message : "接口内部错误";
             reply = [e.status || 500, { error: { code: e.code || "INTERNAL_ERROR", message: message } }];
         }
@@ -453,6 +556,7 @@ function serve(socket) {
 // 每个连接一个线程（事件长轮询会阻塞），最多同时 16 个。
 var connections = new java.util.concurrent.Semaphore(16);
 
+// serveInThread 在新线程中处理连接；同时处理的连接已满时直接关闭。
 function serveInThread(socket) {
     if (!connections.tryAcquire()) {
         socket.close();
@@ -467,6 +571,7 @@ function serveInThread(socket) {
     });
 }
 
+// 监听所有网卡，电脑通过局域网访问；接收连接的循环在独立线程中运行
 var server = new java.net.ServerSocket(PORT, 16, java.net.InetAddress.getByName("0.0.0.0"));
 threads.start(function () {
     while (true) {
@@ -480,6 +585,7 @@ threads.start(function () {
 
 // ---------- 启动与主循环 ----------
 
+// 脚本退出时：取消常亮，关闭监听端口，释放文件锁
 events.on("exit", function () {
     device.cancelKeepingAwake();
     try {
@@ -499,22 +605,65 @@ if (auto.service) {
 // 清理上次运行遗留、电脑没取走的原图。
 files.removeDir(ui.originalsDir);
 
-// 截图用于图片缩略图和标题 OCR。
-var captureReady = requestScreenCapture(false);
+// 截图用于图片缩略图、原图兜底，以及出错时附上屏幕画面。
+// 手机锁屏时申请会失败（授权页打不开），不能因此退出：先照常运行并报告“需要截图授权”，解锁后每分钟重试一次。
+var captureReady = false,
+    lastCaptureRequest = 0;
+
+// requestCapture 申请截图授权；失败时记一条诊断事件，不抛出异常。
+function requestCapture() {
+    lastCaptureRequest = Date.now();
+    // 系统会弹出“AutoJs6 将开始截取屏幕”，在另一个线程里点“立即开始”。
+    var clicker = threads.start(function () {
+        for (var i = 0; i < 60; i++) {
+            sleep(250);
+            if (currentPackage() !== "com.android.systemui") continue;
+            var start = text("立即开始").findOnce();
+            if (start && textMatches(/AutoJs6.*截取.*屏幕.*/).exists()) {
+                start.click();
+                return;
+            }
+        }
+    });
+    try {
+        captureReady = requestScreenCapture(false);
+    } catch (e) {
+        captureReady = false;
+        addDiagnostic("warning", "CAPTURE_REQUEST_FAILED", "截图授权申请失败（手机锁屏或授权页打不开），解锁后自动重试：" + String(e.message || e).split("\n")[0], { source: "monitor" });
+    } finally {
+        clicker.interrupt();
+    }
+    // 申请成功：清除“截图失效”标记
+    if (captureReady) {
+        ui.captureRestored();
+        log("截图授权已就绪");
+    }
+}
+
+requestCapture();
 
 log("微信桥已启动，端口 " + PORT);
+// 主循环：更新就绪状态和心跳；有任务就执行，没有任务且就绪时做后台监测。
+// 主循环不能因为一次异常退出，异常记入诊断后等 2 秒继续。
 while (true) {
     try {
         var info = ui.status(captureReady);
+        // 截图授权缺失或失效时，在解锁状态下每分钟重新申请一次
+        var unlocked = info.reasons.indexOf("SCREEN_LOCKED") < 0;
+        if ((!captureReady || ui.captureBroken()) && unlocked && Date.now() - lastCaptureRequest > 60000) {
+            requestCapture();
+            info = ui.status(captureReady);
+        }
         info.notification_access = watchNotifications();
         deviceInfo = info;
         heartbeat = Date.now();
+        // 保持屏幕常亮，界面操作和截图都需要亮屏
         device.keepScreenOn(30 * 60 * 1000);
         var task = takeTask();
         if (task) runTask(task);
         else if (info.ready) monitor();
     } catch (e) {
-        log("主循环异常：" + (e.code || e.message || e));
+        addDiagnostic("error", e.code || "LOOP_ERROR", "监测或主循环异常：" + String(e.message || e), { source: "monitor" });
         sleep(2000);
     }
     sleep(400);

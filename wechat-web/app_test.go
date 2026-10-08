@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -560,5 +564,59 @@ func TestAllowRemoteKeepsHostCheck(t *testing.T) {
 		if w.Code != tc.want {
 			t.Errorf("host %s: got %d", tc.host, w.Code)
 		}
+	}
+}
+
+func TestTaskDiagnosticsAreKept(t *testing.T) {
+	result := `{"code":"CHAT_MISMATCH","message":"聊天标题不匹配","diagnostics":{"duration_ms":4200,
+		"steps":[{"ms":10,"step":"打开聊天","detail":"从首页会话列表打开"},{"ms":900,"step":"降级","detail":"改用截图 OCR 核对"}],
+		"warnings":[{"code":"TITLE_OCR","message":"改用截图 OCR 核对"}]}}`
+	phone := &fakePhone{status: "failed", result: result}
+	a, c := appWithPhone(t, phone)
+	call(a, "POST", "/api/conversations/"+c.ID+"/read", `{"limit":5}`, "r1")
+	runAll(a)
+	op := a.state.Operations["r1"]
+	if op.Status != "failed" || op.DurationMS != 4200 || len(op.Steps) != 2 || len(op.Warnings) != 1 || op.Warnings[0].Code != "TITLE_OCR" {
+		t.Fatalf("diagnostics not kept: %+v", op)
+	}
+	var state struct {
+		Operations []Operation `json:"operations"`
+	}
+	json.Unmarshal(call(a, "GET", "/api/state", "", "").Body.Bytes(), &state)
+	if len(state.Operations) != 1 || state.Operations[0].Steps != nil || len(state.Operations[0].Warnings) != 1 {
+		t.Fatalf("state should carry warnings but not steps: %+v", state.Operations)
+	}
+}
+
+func TestStepScreenshotSavedAndCleaned(t *testing.T) {
+	// 生成一张 40×8 的 JPEG 作为标题栏截图
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 40, 8)), nil); err != nil {
+		t.Fatal(err)
+	}
+	shot := base64.StdEncoding.EncodeToString(buf.Bytes())
+	result := `{"messages":[],"diagnostics":{"duration_ms":10,"steps":[{"ms":5,"step":"标题核对","detail":"OCR","image":"` + shot + `"}]}}`
+	phone := &fakePhone{status: "succeeded", result: result}
+	a, c := appWithPhone(t, phone)
+	call(a, "POST", "/api/conversations/"+c.ID+"/read", `{"limit":5}`, "r1")
+	runAll(a)
+	img := a.state.Operations["r1"].Steps[0].Image
+	path, ok := a.mediaPath(img)
+	if !ok {
+		t.Fatalf("step image should be saved as a hash, got %q", img)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	a.state.Operations["r1"].Created = "2000-01-01T00:00:00Z" // 最旧，会被清理
+	for i := 0; i < maxFinishedOperations; i++ {
+		id := fmt.Sprintf("op-%03d", i)
+		a.state.Operations[id] = &Operation{ID: id, ConversationID: c.ID, Kind: "read", Status: "succeeded", Created: now()}
+	}
+	a.pruneLocked()
+	a.mu.Unlock()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("screenshot of a pruned task should be removed")
 	}
 }

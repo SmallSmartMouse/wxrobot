@@ -41,6 +41,7 @@ type Message struct {
 
 // migrate 删除旧版本保存的通知、快照等非正文记录（它们没有序号），并补上列表预览。
 func (c *Conversation) migrate() {
+	// 正文消息都有序号，没有序号的是旧版本存下的通知和快照
 	kept := c.Messages[:0]
 	for _, m := range c.Messages {
 		if m.Seq > 0 {
@@ -48,9 +49,11 @@ func (c *Conversation) migrate() {
 		}
 	}
 	c.Messages = kept
+	// 草稿模式已移除，视为关闭
 	if c.AI.Mode == "draft" {
 		c.AI.Mode = "off"
 	}
+	// 旧数据没有预览字段，用最后一条消息补上
 	if c.Preview == "" && len(kept) > 0 {
 		c.Preview = kept[len(kept)-1].Text
 	}
@@ -72,6 +75,7 @@ func (c *Conversation) firstPendingOriginal() int {
 	return -1
 }
 
+// observedMessage 是手机上报的一条消息（来自读取结果或屏幕快照）。
 type observedMessage struct {
 	Text          string `json:"text"`
 	Direction     string `json:"direction"`
@@ -88,9 +92,11 @@ func (a *App) attachImage(m *Message, seen observedMessage) {
 	if m.Kind != "image" {
 		return
 	}
+	// 缩略图：之前没有才保存
 	if m.ImageHash == "" && seen.Thumbnail != "" {
 		m.ImageHash, m.ImageError = a.saveThumbnail(seen.Thumbnail)
 	}
+	// 原图：已有就不动；这次取到了就记下；这次取失败就记下原因并累计次数（满 2 次不再尝试）
 	switch {
 	case m.OriginalHash != "":
 	case seen.OriginalHash != "":
@@ -110,15 +116,19 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 		Messages   []observedMessage `json:"messages"`
 		CapturedAt string            `json:"captured_at"`
 	}
+	// 没有消息时视为已衔接，调用方不需要再处理
 	if json.Unmarshal(raw, &snapshot) != nil || len(snapshot.Messages) == 0 {
 		return true
 	}
+	// 把手机上报的消息转成待比对的窗口，时间统一用这次的观察时间
 	window := make([]Message, len(snapshot.Messages))
 	for i, m := range snapshot.Messages {
 		window[i] = Message{Text: m.Text, Direction: m.Direction, Kind: m.Kind, ImageError: m.ImageError, Time: snapshot.CapturedAt}
 	}
+	// 只和最近 100 条已记录消息比对
 	known := c.Messages[max(0, len(c.Messages)-100):]
 	start, base, aligned := newMessagesStart(known, window)
+	// 接不上且不允许整批追加：什么都不做，由调用方决定（例如加深读取）
 	if !aligned && !appendOnGap {
 		return false
 	}
@@ -132,6 +142,7 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 			}
 		}
 	}
+	// 衔接点之后都是新消息：分配序号、计入未读、更新列表预览，并标记待写入数据库
 	for i := start; i < len(window); i++ {
 		m := window[i]
 		a.attachImage(&m, snapshot.Messages[i])
@@ -157,6 +168,7 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 // newMessagesStart 返回 window 中第一条新消息的位置 start，以及 window[0] 对应 known 中的位置 base
 // （window[i] 与 known[base+i] 是同一条消息，i < start）；aligned 为 false 表示无法确定衔接点。
 func newMessagesStart(known, window []Message) (start, base int, aligned bool) {
+	// 还没有任何记录：整个窗口都是新消息
 	if len(known) == 0 {
 		return 0, 0, true
 	}
@@ -178,6 +190,7 @@ func newMessagesStart(known, window []Message) (start, base int, aligned bool) {
 
 // occurrences 统计 needle 在 hay 中连续出现的次数，并返回最后一次出现的位置。
 func occurrences(hay, needle []Message) (count, pos int) {
+	// 逐个起点比较 needle 的每一条
 	for i := 0; i+len(needle) <= len(hay); i++ {
 		matched := true
 		for j := range needle {

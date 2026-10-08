@@ -1,13 +1,58 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>执行诊断</title><link rel="stylesheet" href="/debug.css"></head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>执行诊断</title>
+  <link rel="stylesheet" href="/debug.css">
+</head>
 <body>
-<header><a href="/">返回消息台</a><h1>执行诊断</h1><button id="refresh">刷新</button><label><input id="auto" type="checkbox" checked> 每 5 秒刷新</label></header>
-<p>仅本机可访问。任务结果包含手机上报的执行阶段、耗时和异常；服务日志显示最后 64 KB。</p>
-<p id="status" role="status"></p>
-<section><h2>连接与手机状态</h2><pre id="device"></pre></section>
-<section><h2>最近读写任务</h2><p>展开任务查看执行结果。已点击发送但未确认的任务，请先核对手机再决定是否重发。</p><div id="tasks"></div></section>
-<section><h2>最近 AI 任务</h2><div id="jobs"></div></section>
-<section><h2>服务执行日志</h2><p id="log-note"></p><pre id="log"></pre></section>
+<header class="top">
+  <a href="/" class="back">‹ 消息台</a>
+  <h1>执行诊断</h1>
+  <span id="status" class="status" role="status"></span>
+  <label class="auto"><input id="auto" type="checkbox" checked> 自动刷新</label>
+  <button id="refresh">刷新</button>
+</header>
+
+<section class="cards">
+  <div class="card" id="card-phone"></div>
+  <div class="card" id="card-tasks"></div>
+  <div class="card" id="card-events"></div>
+</section>
+
+<section>
+  <div class="section-head">
+    <h2>最近的异常与降级</h2>
+    <small>手机上报。降级表示操作完成了，但用了不太可靠的办法（例如原图改用截图）或结果不完整（例如翻页提前停止）；同一问题 10 分钟内只记一条并累计次数。手机桥重启后清空。</small>
+  </div>
+  <div id="events" class="rows"></div>
+</section>
+
+<section>
+  <div class="section-head">
+    <h2>读写任务</h2>
+    <nav class="tabs">
+      <button data-filter="issues" class="selected">有问题的</button>
+      <button data-filter="all">全部</button>
+    </nav>
+  </div>
+  <small class="hint">点开任务查看每一步。已点击发送但结果未知的任务，请先核对手机再决定是否重发。</small>
+  <div id="tasks" class="rows"></div>
+</section>
+
+<section>
+  <div class="section-head"><h2>AI 自动回复</h2></div>
+  <div id="jobs" class="rows"></div>
+</section>
+
+<section>
+  <details id="log-box">
+    <summary><h2>服务日志</h2><small id="log-note"></small></summary>
+    <pre id="log"></pre>
+  </details>
+</section>
+
 <script src="/debug.js"></script>
-</body></html>
+</body>
+</html>

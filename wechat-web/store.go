@@ -51,11 +51,14 @@ type store struct {
 	dirty   map[string]map[int64]bool // 会话编号 → 需要写入的消息序号
 }
 
+// openStore 打开数据库文件并建表（已存在则跳过）。
 func openStore(path string) (*store, error) {
+	// WAL 模式：写入不阻塞读取；synchronous=NORMAL 在 WAL 下兼顾安全和速度；忙时最多等 5 秒
 	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
+	// 只有本服务一个进程使用，单连接避免并发写冲突
 	db.SetMaxOpenConns(1)
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
@@ -79,8 +82,10 @@ func (a *App) settingsLocked() map[string]any {
 
 // loadLocked 从数据库读入全部数据，返回数据库是否为空。
 func (a *App) loadLocked() (empty bool, err error) {
+	// 配置项名 → 内存中对应字段的指针，读出的 JSON 直接解析进去
 	settings := a.settingsLocked()
 	rowsRead := 0
+	// readJSON 逐行读取 (id, data) 表，交给 each 解析，并记下读到的内容，后续保存时用于判断是否变化
 	readJSON := func(table string, each func(id, data string) error) error {
 		rows, err := a.store.db.Query("SELECT id, data FROM " + table)
 		if err != nil {
@@ -100,6 +105,7 @@ func (a *App) loadLocked() (empty bool, err error) {
 		}
 		return rows.Err()
 	}
+	// 依次读配置、会话、任务、AI 记录；任意一步出错就停止
 	err = readJSON("settings", func(id, data string) error {
 		if target, ok := settings[id]; ok {
 			return json.Unmarshal([]byte(data), target)
@@ -130,6 +136,7 @@ func (a *App) loadLocked() (empty bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	// 消息按会话和序号排序读出，依次追加到各自会话
 	rows, err := a.store.db.Query("SELECT " + messageColumns + " FROM messages ORDER BY conversation_id, seq")
 	if err != nil {
 		return false, err
@@ -153,6 +160,7 @@ func (a *App) loadLocked() (empty bool, err error) {
 // saveLocked 在一个事务中写入所有变化。失败时内存不变，下次保存会再次尝试写入。
 func (a *App) saveLocked() error {
 	a.pruneLocked()
+	// 一次保存的所有写入放在同一个事务里，要么全部成功，要么全部不生效
 	tx, err := a.store.db.Begin()
 	if err != nil {
 		return err
@@ -161,6 +169,7 @@ func (a *App) saveLocked() error {
 
 	changed := map[string]string{} // 提交成功后更新到 written
 	current := map[string]bool{}
+	// put 把一条记录序列化为 JSON；与上次写入的内容相同就跳过，不同才写入
 	put := func(table, id string, value any) error {
 		b, err := json.Marshal(value)
 		if err != nil {
@@ -176,6 +185,7 @@ func (a *App) saveLocked() error {
 		return err
 	}
 
+	// 配置、会话（不含消息）、任务、AI 记录：逐条比较后写入变化的
 	for id, value := range a.settingsLocked() {
 		if err = put("settings", id, value); err != nil {
 			return err
@@ -198,6 +208,7 @@ func (a *App) saveLocked() error {
 			return err
 		}
 	}
+	// 上次写过、但内存里已经没有的记录（例如被清理的旧任务），从数据库删除
 	var removed []string
 	for key := range a.store.written {
 		if !current[key] {
@@ -208,12 +219,14 @@ func (a *App) saveLocked() error {
 			removed = append(removed, key)
 		}
 	}
+	// 消息只写被标记过的行（新增的消息、补上图片的消息）
 	for conversationID, seqs := range a.store.dirty {
 		c := a.state.Conversations[conversationID]
 		if c == nil {
 			continue
 		}
 		for seq := range seqs {
+			// 消息按序号有序，二分查找；找不到说明已被删除，跳过
 			i := sort.Search(len(c.Messages), func(i int) bool { return c.Messages[i].Seq >= seq })
 			if i == len(c.Messages) || c.Messages[i].Seq != seq {
 				continue
@@ -227,6 +240,7 @@ func (a *App) saveLocked() error {
 			}
 		}
 	}
+	// 提交成功后才更新“已写入”的记录；提交失败时下次保存会重新写
 	if err = tx.Commit(); err != nil {
 		return err
 	}
@@ -242,6 +256,7 @@ func (a *App) saveLocked() error {
 
 // importJSON 把旧版本的 state.json 导入数据库（只在数据库为空时调用），成功后改名保留为 .migrated。
 func (a *App) importJSON(path string) error {
+	// 没有旧数据文件就什么都不做
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -253,6 +268,7 @@ func (a *App) importJSON(path string) error {
 	if err = json.Unmarshal(b, &legacy); err != nil {
 		return fmt.Errorf("旧数据 %s 无法读取：%w", path, err)
 	}
+	// 用旧数据替换内存状态并整理，然后把所有消息标记为待写入
 	a.state = legacy
 	a.normalizeLocked()
 	for id, c := range a.state.Conversations {
@@ -263,6 +279,7 @@ func (a *App) importJSON(path string) error {
 	if err = a.saveLocked(); err != nil {
 		return err
 	}
+	// 改名保留原文件，需要时可以回退
 	log.Printf("已把 %s 导入数据库", path)
 	return os.Rename(path, path+".migrated")
 }

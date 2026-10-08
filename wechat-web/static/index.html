@@ -8,37 +8,39 @@
 </head>
 <body>
 <div class="app">
-  <aside id="system-sidebar" class="system-sidebar" aria-label="系统配置">
-    <button id="system-toggle" class="system-toggle" aria-expanded="true" title="折叠系统栏">
-      <span aria-hidden="true">☰</span><span class="system-label">系统配置</span>
+  <!-- 系统侧边栏：可折叠为只显示图标的窄条，折叠状态记在浏览器本地 -->
+  <aside id="system-sidebar" class="system-sidebar" aria-label="系统">
+    <button id="system-toggle" class="system-toggle" aria-expanded="true" title="折叠侧边栏">
+      <span class="system-icon" aria-hidden="true">☰</span><span class="system-label">系统</span>
     </button>
-<nav class="system-navigation">
-<a class="system-item" href="/debug.html" title="执行诊断"><span aria-hidden="true">🔎</span><span class="system-label">执行诊断</span></a>
-      <button id="settings" class="system-item" title="手机连接设置">
-        <span aria-hidden="true">⚙</span><span class="system-label">手机连接</span>
+    <nav class="system-nav">
+      <a id="diag-link" class="system-item" href="/debug.html" title="执行诊断">
+        <span class="system-icon" aria-hidden="true">诊</span><span class="system-label">执行诊断</span>
+        <span id="diag-badge" class="alert-badge" hidden></span>
+      </a>
+      <button id="settings" class="system-item" title="手机连接">
+        <span class="system-icon" aria-hidden="true">⚙</span><span class="system-label">手机连接</span>
       </button>
-      <button id="ai-settings" class="system-item" title="全局 AI 设置">
-        <span aria-hidden="true">AI</span><span class="system-label">全局 AI</span>
+      <button id="ai-settings" class="system-item" title="全局 AI">
+        <span class="system-icon" aria-hidden="true">AI</span><span class="system-label">全局 AI</span>
       </button>
     </nav>
-    <div class="system-footer system-label">微信消息平台</div>
   </aside>
 
   <aside class="sidebar">
     <header class="brand">
       <span class="logo">聊</span>
-      <div><strong>微信消息台</strong><small>你的手机，连接到网页</small></div>
+      <strong>微信消息台</strong>
     </header>
-    <button id="connection-card" class="connection-card">
+    <button id="connection-card" class="connection-card" title="手机连接">
       <span id="status-dot" class="dot"></span>
-      <span><strong id="connection">连接中</strong><small id="phone-address">配置手机连接</small></span>
-      <span class="chevron">›</span>
+      <strong id="connection">连接中</strong>
+      <small id="phone-address"></small>
     </button>
-    <div class="list-heading">
-      <h2>消息</h2>
+    <div class="search-row">
+      <div class="search-box"><span>⌕</span><input id="search" placeholder="搜索联系人或群聊" autocomplete="off"></div>
       <button id="new-chat" class="icon-button" title="新建会话">＋</button>
     </div>
-    <div class="search-box"><span>⌕</span><input id="search" placeholder="搜索联系人或群聊" autocomplete="off"></div>
     <nav class="filters">
       <button class="selected" data-filter="all">全部</button>
       <button data-filter="person">联系人</button>
@@ -62,47 +64,26 @@
         <span id="chat-avatar" class="avatar"></span>
         <div class="chat-title">
           <h1 id="chat-title"></h1>
-          <div><span id="chat-note"></span></div>
+          <div id="chat-note" class="chat-note"></div>
         </div>
-        <select id="kind" aria-label="会话类型">
-          <option value="unknown">待分类</option>
-          <option value="person">联系人</option>
-          <option value="group">群聊</option>
-        </select>
-        <button id="ai-chat-settings" class="text-button">AI 设置</button>
-        <button id="export" class="text-button">导出</button>
+        <div class="read-control">
+          <button id="read" class="text-button" title="从手机读取最近的消息">↻ 读取</button>
+          <input id="limit" type="number" min="1" max="100" value="20" aria-label="读取条数">
+          <span>条</span>
+        </div>
+        <button id="chat-settings" class="text-button">会话设置</button>
+        <button id="export" class="text-button" title="导出为 JSON">导出</button>
       </header>
-      <div class="chat-toolbar">
-        <label>定时读取
-          <select id="read-every" aria-label="定时读取间隔">
-            <option value="0">关闭</option>
-            <option value="60">每 1 分钟</option>
-            <option value="300">每 5 分钟</option>
-            <option value="900">每 15 分钟</option>
-            <option value="1800">每 30 分钟</option>
-            <option value="3600">每 1 小时</option>
-          </select>
-        </label>
-        <label>图片
-          <select id="originals" aria-label="收到图片时是否取原图">
-            <option value="on">取原图</option>
-            <option value="off">仅缩略图</option>
-          </select>
-        </label>
-        <span class="toolbar-spacer"></span>
-        <label>读取最近 <input id="limit" type="number" min="1" max="100" value="20" aria-label="读取数量"> 条</label>
-        <button id="read" class="text-button">↻ 从手机读取</button>
-      </div>
       <div class="messages-wrap">
         <div id="messages" class="messages"></div>
         <button id="new-messages" class="new-messages" hidden></button>
       </div>
       <div id="operation-note" class="operation-note" hidden></div>
       <div class="composer">
-        <textarea id="message" placeholder="输入消息，Enter 发送，Shift + Enter 换行" maxlength="2000" rows="3"></textarea>
+        <textarea id="message" placeholder="输入消息，Enter 发送，Shift + Enter 换行" maxlength="2000" rows="2"></textarea>
         <div class="composer-bottom">
           <input id="image-file" type="file" accept="image/png,image/jpeg" hidden>
-          <button id="send-image" class="text-button">发送图片</button>
+          <button id="send-image" class="text-button">＋ 图片</button>
           <span id="char-count">0 / 2000</span>
           <button id="send" class="primary">发送 <span>↑</span></button>
         </div>
@@ -168,21 +149,49 @@
   </form>
 </dialog>
 
-<!-- 当前会话的 AI 回复方式 -->
-<dialog id="chat-ai-dialog">
-  <form id="chat-ai-form">
-    <div class="dialog-heading"><h2>当前会话 AI</h2><button type="button" class="icon-button close-dialog">×</button></div>
-    <label class="field">回复方式
-      <select id="chat-ai-mode">
-        <option value="inherit">跟随名称规则</option>
-        <option value="off">关闭</option>
-        <option value="auto">自动生成并发送</option>
+<!-- 当前会话的设置：类型、自动读取、图片、AI 回复 -->
+<dialog id="chat-settings-dialog">
+  <form id="chat-settings-form">
+    <div class="dialog-heading"><h2>会话设置</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <label class="field">会话类型
+      <select id="set-kind">
+        <option value="unknown">待分类</option>
+        <option value="person">联系人</option>
+        <option value="group">群聊</option>
       </select>
     </label>
-    <label class="field">最短间隔（秒）<input id="chat-ai-interval" type="number" min="5" max="86400" value="30" required></label>
-    <label class="field">触发词<input id="chat-ai-keyword" placeholder="例如 @助手（群聊自动回复必填）"></label>
-    <p class="muted">只处理保存之后的新来信。自动发送和手动发送一样等待手机确认。</p>
-    <div id="chat-ai-error" class="form-error"></div>
+    <label class="field">定时读取
+      <select id="set-read-every">
+        <option value="0">关闭（只在收到通知或未读提示时读取）</option>
+        <option value="60">每 1 分钟</option>
+        <option value="300">每 5 分钟</option>
+        <option value="900">每 15 分钟</option>
+        <option value="1800">每 30 分钟</option>
+        <option value="3600">每 1 小时</option>
+      </select>
+    </label>
+    <label class="field">收到图片
+      <select id="set-originals">
+        <option value="on">点开大图取原图（清晰，读取较慢）</option>
+        <option value="off">只要聊天缩略图</option>
+      </select>
+    </label>
+    <fieldset class="field-group">
+      <legend>AI 自动回复</legend>
+      <label class="field">回复方式
+        <select id="set-ai-mode">
+          <option value="inherit">跟随全局名称规则</option>
+          <option value="off">关闭</option>
+          <option value="auto">自动生成并发送</option>
+        </select>
+      </label>
+      <div class="field-pair">
+        <label class="field">最短间隔（秒）<input id="set-ai-interval" type="number" min="5" max="86400" value="30" required></label>
+        <label class="field">触发词<input id="set-ai-keyword" placeholder="群聊必填，例如 @助手"></label>
+      </div>
+      <p class="muted">只处理保存之后的新来信，发送同样等待手机确认。</p>
+    </fieldset>
+    <div id="chat-settings-error" class="form-error"></div>
     <div class="dialog-actions">
       <button type="button" class="secondary close-dialog">取消</button>
       <button type="submit" class="primary">保存</button>

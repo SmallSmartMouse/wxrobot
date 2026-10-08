@@ -14,9 +14,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// handler 注册所有接口；不是接口的路径返回内嵌的网页文件。
 func (a *App) handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// 所有请求先经过本机访问检查
 	r.Use(gin.Recovery(), a.localOnly)
 
 	api := r.Group("/api")
@@ -41,6 +43,7 @@ func (a *App) handler() http.Handler {
 	api.POST("/media", a.uploadMedia)
 	api.GET("/media/:hash", a.getMedia)
 
+	// 其他路径：/api/ 开头的返回 404，其余当作网页静态文件
 	static, _ := fs.Sub(assets, "static")
 	files := http.FileServer(http.FS(static))
 	r.NoRoute(func(c *gin.Context) {
@@ -57,9 +60,11 @@ func (a *App) handler() http.Handler {
 // 在 Docker 里运行时，浏览器请求经过网桥转发、来源地址不是回环地址，需用 -allow-remote 放开来源检查；
 // Host 和 Origin 检查仍然有效，端口应只映射到宿主机的 127.0.0.1。
 func (a *App) localOnly(c *gin.Context) {
+	// 安全相关的响应头：不缓存、不猜测内容类型、只加载本站资源、禁止被嵌入其他页面
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
+	// 取出请求来源地址、Host 中的主机名，以及跨站请求时浏览器带的 Origin
 	remote, _, _ := net.SplitHostPort(c.Request.RemoteAddr)
 	host, _, err := net.SplitHostPort(c.Request.Host)
 	if err != nil {
@@ -70,6 +75,7 @@ func (a *App) localOnly(c *gin.Context) {
 	if u, err := url.Parse(origin); err == nil && u.Host == c.Request.Host {
 		sameOrigin = true
 	}
+	// 三项都满足才放行：来自本机（或已允许远程）、Host 是本机名、同源
 	ip := net.ParseIP(remote)
 	fromLocal := a.allowRemote || (ip != nil && ip.IsLoopback())
 	if !fromLocal || (host != "localhost" && host != "127.0.0.1" && host != "::1") || !sameOrigin {
@@ -77,13 +83,16 @@ func (a *App) localOnly(c *gin.Context) {
 		c.Abort()
 		return
 	}
+	// 请求体最多 16 MB（上传图片）
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<20)
 }
 
+// fail 返回 {"error": message}。
 func fail(c *gin.Context, status int, message string) {
 	c.JSON(status, gin.H{"error": message})
 }
 
+// bind 解析 JSON 请求体到 target；格式错误时已返回 400，调用方直接 return。
 func bind(c *gin.Context, target any) bool {
 	if err := c.ShouldBindJSON(target); err != nil {
 		fail(c, 400, "请求格式无效")
@@ -112,9 +121,11 @@ func (a *App) saved(c *gin.Context, value any) {
 
 // ---------- 总览与连接 ----------
 
+// getState 返回页面总览：会话列表（不含消息）、最近 50 个任务、连接状态和手机状态。
 func (a *App) getState(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 会话按最近更新时间排序，去掉消息正文
 	conversations := make([]Conversation, 0, len(a.state.Conversations))
 	for _, conv := range a.state.Conversations {
 		summary := *conv
@@ -123,9 +134,12 @@ func (a *App) getState(c *gin.Context) {
 	}
 	sort.Slice(conversations, func(i, j int) bool { return conversations[i].Updated > conversations[j].Updated })
 
+	// 任务按创建时间倒序，只取最近 50 个
 	operations := make([]*Operation, 0, len(a.state.Operations))
 	for _, op := range a.state.Operations {
-		operations = append(operations, op)
+		summary := *op
+		summary.Steps = nil // 步骤明细只在诊断页显示
+		operations = append(operations, &summary)
 	}
 	sort.Slice(operations, func(i, j int) bool { return operations[i].Created > operations[j].Created })
 	operations = operations[:min(len(operations), 50)]
@@ -170,6 +184,7 @@ func (a *App) stream(c *gin.Context) {
 	}
 }
 
+// setPhoneConfig 保存手机地址和 Token；有任务在执行时不允许更换。
 func (a *App) setPhoneConfig(c *gin.Context) {
 	var body struct {
 		PhoneURL string `json:"phone_url"`
@@ -193,6 +208,7 @@ func (a *App) setPhoneConfig(c *gin.Context) {
 		fail(c, 400, "请输入有效的手机 Token（至少 32 字符）")
 		return
 	}
+	// 换手机前必须等任务结束，否则执行中的任务会去查询新手机
 	for _, op := range a.state.Operations {
 		if op.active() {
 			fail(c, 409, "请等待当前读写任务完成后再更换手机配置")
@@ -206,8 +222,10 @@ func (a *App) setPhoneConfig(c *gin.Context) {
 
 // ---------- 会话 ----------
 
+// validKind 检查会话类型是否合法。
 func validKind(kind string) bool { return kind == "person" || kind == "group" || kind == "unknown" }
 
+// createConversation 手动添加会话（名称必须与手机上显示的完整名称一致）。已存在时更新类型。
 func (a *App) createConversation(c *gin.Context) {
 	var body struct {
 		Title string `json:"title"`
@@ -228,14 +246,20 @@ func (a *App) createConversation(c *gin.Context) {
 	a.saved(c, conv)
 }
 
+// getConversation 返回会话详情和全部消息。
 func (a *App) getConversation(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if conv := a.conversation(c); conv != nil {
-		c.JSON(200, conv)
+		// 附带实际生效的 AI 回复方式（会话未单独设置时来自名称规则），页面用来显示设置摘要。
+		c.JSON(200, struct {
+			*Conversation
+			AIEffective AISetting `json:"ai_effective"`
+		}{conv, a.aiSettingLocked(conv)})
 	}
 }
 
+// markSeen 清除会话的未读数。
 func (a *App) markSeen(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -245,6 +269,7 @@ func (a *App) markSeen(c *gin.Context) {
 	}
 }
 
+// setKind 设置会话类型（联系人 / 群聊 / 待分类）。
 func (a *App) setKind(c *gin.Context) {
 	var body struct {
 		Kind string `json:"kind"`
@@ -312,6 +337,7 @@ func (a *App) createOperation(kind string) gin.HandlerFunc {
 	return func(c *gin.Context) { a.addOperation(c, kind) }
 }
 
+// addOperation 校验参数并建立 kind（read 或 send）任务，交给 worker 执行。
 func (a *App) addOperation(c *gin.Context, kind string) {
 	var body struct {
 		Text      string `json:"text"`
@@ -321,6 +347,7 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 	if !bind(c, &body) {
 		return
 	}
+	// 校验：请求编号格式、读取条数、发送内容（图片和文字二选一，文字 1–2000 字）
 	key := c.GetHeader("Idempotency-Key")
 	switch {
 	case !idempotencyKey.MatchString(key):
@@ -336,6 +363,7 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 		fail(c, 400, "消息必须为 1–2000 字符")
 		return
 	}
+	// 发图片时，图片必须已经上传过
 	if body.ImageHash != "" {
 		if _, err := a.readImage(body.ImageHash); err != nil {
 			fail(c, 400, "图片不存在")
@@ -350,6 +378,7 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 		return
 	}
 	op := &Operation{ID: key, ConversationID: conv.ID, Kind: kind, Text: body.Text, ImageHash: body.ImageHash, Limit: body.Limit, Status: "queued", Created: now()}
+	// 同一请求编号已经提交过：内容相同就返回原任务（网页重试不会重复发送），不同则拒绝
 	if old := a.state.Operations[key]; old != nil {
 		if old.ConversationID != op.ConversationID || old.Kind != op.Kind || old.Text != op.Text || old.ImageHash != op.ImageHash || old.Limit != op.Limit {
 			fail(c, 409, "请求编号已用于不同内容")
@@ -362,6 +391,7 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 		fail(c, 409, "请先配置手机连接")
 		return
 	}
+	// 保存成功后才唤醒 worker 执行
 	a.state.Operations[key] = op
 	if err := a.commitLocked(); err != nil {
 		delete(a.state.Operations, key) // 未保存的任务不执行，避免网页以为失败后重试导致重复发送
@@ -374,6 +404,7 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 
 // ---------- AI ----------
 
+// getAIConfig 返回全局 AI 设置和名称规则；不返回密钥本身，只返回是否已设置。
 func (a *App) getAIConfig(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -388,6 +419,7 @@ func (a *App) getAIConfig(c *gin.Context) {
 	})
 }
 
+// setAIConfig 校验并保存全局 AI 设置和名称规则。
 func (a *App) setAIConfig(c *gin.Context) {
 	var body struct {
 		AIConfig
@@ -397,6 +429,7 @@ func (a *App) setAIConfig(c *gin.Context) {
 		return
 	}
 	cfg := body.AIConfig
+	// 接口地址去掉末尾的 / 和 /chat/completions，统一保存为根地址
 	cfg.URL = strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(cfg.URL), "/"), "/chat/completions")
 	u, err := url.Parse(cfg.URL)
 	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || strings.TrimSpace(cfg.Model) == "" {
@@ -407,6 +440,7 @@ func (a *App) setAIConfig(c *gin.Context) {
 		fail(c, 400, "最多 100 条名称规则")
 		return
 	}
+	// 每条规则：类型、表达式必填，回复方式和间隔合法，正则能编译
 	for _, rule := range body.Rules {
 		if err := rule.validate(rule.Kind); err != nil || (rule.Kind != "person" && rule.Kind != "group") || rule.Pattern == "" {
 			fail(c, 400, "名称规则无效：需要类型、表达式；群自动回复必须设置触发词；周期 5–86400 秒")
@@ -456,6 +490,7 @@ func (a *App) setConversationAI(c *gin.Context) {
 
 // ---------- 图片 ----------
 
+// uploadMedia 保存网页上传的图片（Base64），返回图片哈希，发送图片时使用。
 func (a *App) uploadMedia(c *gin.Context) {
 	var body struct {
 		Data string `json:"data"`
@@ -471,6 +506,7 @@ func (a *App) uploadMedia(c *gin.Context) {
 	c.JSON(200, gin.H{"image_hash": hash})
 }
 
+// getMedia 返回图片文件。
 func (a *App) getMedia(c *gin.Context) {
 	path, ok := a.mediaPath(c.Param("hash"))
 	if !ok {
