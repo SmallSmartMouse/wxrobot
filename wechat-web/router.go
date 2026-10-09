@@ -57,7 +57,7 @@ func (a *App) handler() http.Handler {
 }
 
 // localOnly 只允许本机访问，并拒绝跨站请求和 DNS 重绑定（Host 必须是本机名）。
-// 在 Docker 里运行时，浏览器请求经过网桥转发、来源地址不是回环地址，需用 -allow-remote 放开来源检查；
+// 在 Docker 里运行时，浏览器请求经过网桥转发、来源地址不是回环地址，需在 config.json 中开启 allow_remote 放开来源检查；
 // Host 和 Origin 检查仍然有效，端口应只映射到宿主机的 127.0.0.1。
 func (a *App) localOnly(c *gin.Context) {
 	// 安全相关的响应头：不缓存、不猜测内容类型、只加载本站资源、禁止被嵌入其他页面

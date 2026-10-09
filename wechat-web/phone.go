@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -148,26 +147,6 @@ func normalizePhone(raw string) (string, error) {
 	}
 	u.Path = ""
 	return u.String(), nil
-}
-
-// importPhoneConfig 首次启动时从 bridge 的凭证文件导入 Token。
-func (a *App) importPhoneConfig(phone, credentials string) error {
-	address, err := normalizePhone(phone)
-	if err != nil {
-		return err
-	}
-	var keys struct {
-		Token string `json:"phone_api_token"`
-	}
-	// 凭证文件不存在或没有 Token 时不导入，之后在网页上配置
-	if b, err := os.ReadFile(credentials); err == nil {
-		_ = json.Unmarshal(b, &keys)
-	}
-	if keys.Token == "" {
-		return nil
-	}
-	a.state.Phone = PhoneConfig{URL: address, Token: keys.Token}
-	return a.saveLocked()
 }
 
 // setConnection 更新手机连接状态和手机上报的状态，并通知网页刷新（不写数据库）。
@@ -325,8 +304,8 @@ func (a *App) nextOperation() string {
 
 const (
 	triggerReadGap = 5 * time.Second // 收到提示后，同一会话两次读取的最短间隔
-	shallowRead    = 30              // 自动读取的条数
-	deepRead       = 100             // 接不上已有记录时加深读取的条数
+	shallowRead    = 30              // 没有已记录的文字可作停止点时，自动读取的条数
+	deepRead       = 100             // 有停止点时自动读取的条数（读到已记录的消息就停）；也是接不上时加深读取的条数
 )
 
 // scheduleAutoRead 选出一个需要读取的会话并建立读取任务，返回是否建立了任务。
@@ -363,7 +342,13 @@ func (a *App) scheduleAutoRead() bool {
 	if pick == nil {
 		return false
 	}
-	a.queueReadLocked(pick, shallowRead, pickReason)
+	// 有已记录的文字作停止点时直接按 100 条读：手机读到它们就停，新消息少时不会多翻页；
+	// 新消息多时一次读完，不必先读 30 条接不上、再从头读 100 条。
+	limit := shallowRead
+	if len(autoReadUntil(pick)) > 0 {
+		limit = deepRead
+	}
+	a.queueReadLocked(pick, limit, pickReason)
 	return true
 }
 
@@ -395,16 +380,10 @@ func (a *App) runOperation(ctx context.Context, id string) {
 		body["limit"] = op.Limit
 		body["return_list"] = op.Auto // 自动读取后回到首页，便于继续发现其他未读会话
 		if op.Auto {
-			// 手机向上翻页读到这几条已记录的消息就停，不必每次都读满 limit 条。
-			// 需要取原图时，停在最早一张还没有原图的图片之前，让它落在“新消息”范围里，由手机点开取原图。
-			known := c.Messages
 			if c.wantsOriginals() {
 				body["originals"] = 2
-				if i := c.firstPendingOriginal(); i >= 0 {
-					known = c.Messages[:i]
-				}
 			}
-			body["until"] = lastTexts(known, 3)
+			body["until"] = autoReadUntil(c)
 		}
 	// 发图片：把本地保存的图片以 Base64 发给手机
 	case op.ImageHash != "":
@@ -539,6 +518,18 @@ func (a *App) phoneDownload(ctx context.Context, cfg PhoneConfig, path string) (
 	return data, nil
 }
 
+// autoReadUntil 自动读取的停止点：已记录的最后 3 条文字，手机向上翻页读到它们就停，不必每次都读满 limit 条。
+// 需要取原图时，停在最早一张还没有原图的图片之前，让它落在“新消息”范围里，由手机点开取原图。
+func autoReadUntil(c *Conversation) []string {
+	known := c.Messages
+	if c.wantsOriginals() {
+		if i := c.firstPendingOriginal(); i >= 0 {
+			known = c.Messages[:i]
+		}
+	}
+	return lastTexts(known, 3)
+}
+
 // lastTexts 返回最后 n 条文字消息（跳过图片，图片的文字都是“[图片]”，无法区分）。
 func lastTexts(messages []Message, n int) []string {
 	texts := []string{}
@@ -564,8 +555,9 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 	var r struct {
 		Code        string          `json:"code"`
 		Message     string          `json:"message"`
-		Snapshot    json.RawMessage `json:"snapshot"`   // 发送后补读的当前屏幕
-		SyncError   string          `json:"sync_error"` // 发送成功但补读失败
+		StopReason  string          `json:"stop_reason"` // 读取停止的原因
+		Snapshot    json.RawMessage `json:"snapshot"`    // 发送后补读的当前屏幕
+		SyncError   string          `json:"sync_error"`  // 发送成功但补读失败
 		Diagnostics struct {
 			DurationMS int64         `json:"duration_ms"`
 			Steps      []TaskStep    `json:"steps"`
@@ -597,11 +589,14 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 		}
 	case op.Kind == "read":
 		// 自动读取的 30 条接不上已有记录，说明期间新消息较多：先加深到 100 条再读，仍接不上才整批追加并标记缺口。
-		deepEnough := !op.Auto || op.Limit >= deepRead
+		// 手机不是因为读满条数而停止时（翻页上限、两屏比对不上、遇到无法识别的一屏等），加深读取会在同样的地方停下，不再重读。
+		stoppedEarly := r.StopReason != "" && r.StopReason != "limit_reached"
+		deepEnough := !op.Auto || op.Limit >= deepRead || stoppedEarly
 		pendingBefore := c.firstPendingOriginal()
-		if !a.mergeLocked(c, result, deepEnough) {
+		// 接不上时 mergeLocked 返回 false；deepEnough 为 true 时它已整批追加并标记缺口，不再加深读取。
+		if aligned := a.mergeLocked(c, result, deepEnough); !aligned && !deepEnough {
 			a.queueReadLocked(c, deepRead, "deep")
-		} else if c.wantsOriginals() && c.firstPendingOriginal() >= 0 && c.firstPendingOriginal() != pendingBefore {
+		} else if aligned && c.wantsOriginals() && c.firstPendingOriginal() >= 0 && c.firstPendingOriginal() != pendingBefore {
 			c.NeedsRead = true // 还有图片没取原图，且这次有进展：接着读
 		}
 	default:

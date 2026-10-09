@@ -10,13 +10,16 @@ RUN go mod download
 COPY . .
 ARG TARGETOS TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/wechat-web . \
-    && mkdir -p /out/data
+    && mkdir -p /out/data /out/app && ln -s /data /out/app/.state
 
 # 运行阶段：只含程序本身，以非 root 用户运行。数据库、图片都在 /data。
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/wechat-web /app/wechat-web
 COPY --from=build --chown=nonroot:nonroot /out/data /data
+COPY --from=build /out/app/ /app/
 VOLUME /data
 EXPOSE 8787
 # 容器内需监听所有地址，并允许经过 Docker 网桥转发的请求；端口只映射到宿主机 127.0.0.1。
-ENTRYPOINT ["/app/wechat-web", "-listen", "0.0.0.0:8787", "-allow-remote", "-db", "/data/wechat.db", "-data", "/data/state.json"]
+WORKDIR /app
+COPY config.docker.json /app/config.json
+ENTRYPOINT ["/app/wechat-web"]

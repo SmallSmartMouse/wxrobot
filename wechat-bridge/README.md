@@ -88,6 +88,7 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 - `wechat.js` 在每次操作中记录步骤和降级（`steps`、`warnings`），`bridge.js` 把它们附在任务结果的 `diagnostics` 里。
 - `bridge.js` 保留最近 50 条异常和降级事件，`GET /v1/device` 的 `diagnostics` 字段返回，电脑的诊断页展示。
 - 截图授权申请失败（例如锁屏时重启）不会让脚本退出：状态报告 `CAPTURE_PERMISSION_REQUIRED`，解锁后每分钟自动重试，并自动点系统弹窗的“立即开始”。
+  申请授权要打开 AutoJs6 的界面：MIUI 等系统需要给 AutoJs6 开启“后台弹出界面”权限，否则 AutoJs6 不在前台时申请会超时（`Start activity to request screen capture timeout`），自动重试也不会成功。没开这个权限时，用 `deploy-phone.sh` 重新部署即可（它会先把 AutoJs6 切到前台）。
 
 ## 排查
 

@@ -17,7 +17,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -234,22 +233,21 @@ func pause(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// main 解析参数、加锁防止重复启动、加载数据，然后启动后台循环和网页服务。
+// main 加载配置、加锁防止重复启动，然后启动后台循环和网页服务。
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8787", "监听地址")
-	allowRemote := flag.Bool("allow-remote", false, "允许非本机来源地址访问网页（仅在 Docker 中使用，端口只映射到宿主机 127.0.0.1）")
-	dbPath := flag.String("db", ".state/wechat.db", "SQLite 数据库文件")
-	legacy := flag.String("data", ".state/state.json", "旧版 JSON 数据，数据库为空时自动导入")
-	bootstrap := flag.String("bootstrap", "../wechat-bridge/.state/credentials.json", "首次运行时导入手机 Token 的文件")
-	phone := flag.String("phone", "", "首次运行时的手机 IP，例如 192.168.0.186")
-	flag.Parse()
+	config, err := loadServerConfig("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	const dbPath = ".state/wechat.db"
+	const legacy = ".state/state.json"
 
 	// 数据目录只允许当前用户访问
-	if err := os.MkdirAll(filepath.Dir(*dbPath), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
 		log.Fatal(err)
 	}
 	// 文件锁：同一份数据只能有一个服务在用
-	lockFile, err := os.OpenFile(*dbPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	lockFile, err := os.OpenFile(dbPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -258,19 +256,13 @@ func main() {
 		log.Fatal("已有服务正在使用此数据文件，请勿重复启动")
 	}
 
-	a, err := newApp(*dbPath)
+	a, err := newApp(dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// 数据库为空：导入旧版 state.json（如果有）
 	if len(a.state.Conversations) == 0 && len(a.state.Operations) == 0 {
-		if err = a.importJSON(*legacy); err != nil {
-			log.Fatal(err)
-		}
-	}
-	// 首次运行时可以用 -phone 指定手机地址，并从 bridge 的凭证文件导入 Token
-	if a.state.Phone.URL == "" && *phone != "" {
-		if err = a.importPhoneConfig(*phone, *bootstrap); err != nil {
+		if err = a.importJSON(legacy); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -279,21 +271,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	a.ctx = ctx
-	a.allowRemote = *allowRemote
+	a.allowRemote = config.AllowRemote
 	// 三个后台循环：拉取手机事件、执行读写任务、AI 自动回复
 	go a.eventLoop(ctx)
 	go a.worker(ctx)
 	go a.aiLoop(ctx)
 
 	// 网页服务；退出时最多等 5 秒让进行中的请求完成
-	server := &http.Server{Addr: *listen, Handler: a.handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: config.Listen, Handler: a.handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
-	log.Printf("微信消息台已启动：http://%s", *listen)
+	log.Printf("微信消息台已启动：http://%s", config.Listen)
 	if err = server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

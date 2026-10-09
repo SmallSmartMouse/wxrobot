@@ -11,12 +11,21 @@ var DEFAULT_PROFILE = {
     avatar_id: "com.tencent.mm:id/bk1"
 };
 var MAX_THUMBNAILS = 3; // 每次读取最多截取的图片缩略图数量
+var MAX_PAGES = 20; // 一次读取最多向上翻页次数
+// 向上翻页：手指滑过消息列表高度的 80%，用时 500 毫秒。
+// Mi Note 3（微信 8.0.78）实测：内容实际移动约 64% 屏（1006/1571 像素），没有惯性，350 毫秒内已停稳；
+// 相邻两屏保留约三分之一屏的重叠，足够比对。原来的半屏滑动实际只移动约 37% 屏。
+var PAGE_SPAN = 0.8;
+var PAGE_SWIPE_MS = 500;
+var PAGE_SETTLE_MS = 350; // 翻页后等列表停稳再读取
+var ACTION_SCROLL_BACKWARD = 8192; // 列表还能向上（更早的消息）滚动时，它的无障碍操作里才有这一项
 var PERMISSION_UI = /packageinstaller|permissioncontroller|lbe\.security/; // 系统权限弹窗所属的包
 // 读取提前停止的原因 → 降级说明（结果可能不完整）
 var READ_STOP_WARNINGS = {
     unverified_overlap: "向上翻页时相邻两屏没能比对上，读取提前停止，更早的消息可能没读到",
-    page_cap: "翻到 20 页上限仍没读到已有记录，中间的消息可能没读到",
-    scroll_failed: "消息列表滑动失败，读取提前停止"
+    page_cap: "翻到 " + MAX_PAGES + " 页上限仍没读到已有记录，中间的消息可能没读到",
+    scroll_failed: "消息列表滑动失败，读取提前停止",
+    empty_screen: "向上翻到的一屏没有能识别的消息（链接卡片、表情等），无法和已读部分比对，读取提前停止"
 };
 
 module.exports = function (config, workDir) {
@@ -569,22 +578,36 @@ module.exports = function (config, workDir) {
         return 0;
     }
 
-    // 在消息列表内滑动；toOlder 为 true 时向上翻看更早的消息。
-    function scroll(toOlder) {
+    // pageUp 向上翻一页（看更早的消息）：慢速滑动，保证相邻两屏有重叠的消息可以比对。
+    function pageUp() {
         var list = messageList();
         if (!list) return false;
         var b = list.bounds(),
-            x = b.centerX();
-        // 每次滑动半屏，较慢的滑动减少惯性，保证相邻两屏有重叠的消息可以比对。
-        var upper = Math.round(b.top + b.height() * 0.25),
-            lower = Math.round(b.top + b.height() * 0.75);
-        var ok = toOlder ? swipe(x, upper, x, lower, 400) : swipe(x, lower, x, upper, 400);
-        sleep(toOlder ? 350 : 200);
+            x = b.centerX(),
+            margin = (b.height() * (1 - PAGE_SPAN)) / 2;
+        var ok = swipe(x, Math.round(b.top + margin), x, Math.round(b.bottom - margin), PAGE_SWIPE_MS);
+        sleep(PAGE_SETTLE_MS);
         return ok;
     }
 
-    // 两屏内容和位置都相同，说明列表没有移动（已到顶部或底部）。
+    // canScrollUp 消息列表能否继续向上滚动：看列表报告的无障碍操作里有没有“向后滚动”。
+    // 不比较屏幕内容，所以一条长消息占满整屏、或整屏没有能识别的消息时也能判断。
+    // 到顶时微信可能正在加载更早的消息，暂时报告不能向上，所以最多再等 waitMs 毫秒确认。
+    function canScrollUp(waitMs) {
+        var until = clock() + waitMs;
+        while (true) {
+            var list = messageList();
+            if (!list) return false;
+            var actions = list.getActionList();
+            for (var i = 0; i < actions.size(); i++) if (actions.get(i).getId() === ACTION_SCROLL_BACKWARD) return true;
+            if (clock() >= until) return false;
+            sleep(250);
+        }
+    }
+
+    // 两屏内容和位置都相同，说明列表停在原处（用于确认点开大图返回后列表没有移动）。
     function samePlace(a, b) {
+        if (!a.length && !b.length) return false;
         var key = function (list) {
             return JSON.stringify(
                 list.map(function (m) {
@@ -595,14 +618,13 @@ module.exports = function (config, workDir) {
         return key(a) === key(b);
     }
 
-    // 滑到最新消息处，保证读取从聊天底部开始。
+    // 滑到最新消息处，保证读取从聊天底部开始：用列表自己的“向前滚动”操作逐页向下，到底时操作返回 false。
+    // 不用手势：没有惯性，正好停在底部，也不必比较屏幕内容判断是否到底。
     function scrollToLatest() {
-        var before = visibleMessages(null);
-        // 向下滑，直到列表不再移动（最多 25 次）
-        for (var i = 0; i < 25 && scroll(false); i++) {
-            var after = visibleMessages(null);
-            if (samePlace(after, before)) return;
-            before = after;
+        for (var i = 0; i < 80; i++) {
+            var list = messageList();
+            if (!list || !list.scrollForward()) return;
+            sleep(300);
         }
     }
 
@@ -625,7 +647,7 @@ module.exports = function (config, workDir) {
 
     // 读取最近 limit 条消息：先滑到底部，屏幕不够时向上翻页，只有和已读部分确认重叠才拼接，结束后滑回底部。
     // until 是电脑已记录的最后几条消息，读到它们就停止（之前的消息电脑已有）。
-    // 很长的消息一屏放不下，翻一页可能没有新消息，此时继续翻；只有列表不再移动才算到了最早。
+    // 很长的消息一屏放不下，翻一页可能没有新消息，此时继续翻；列表报告不能再向上滚动才算到了最早。
     // options：limit 条数；until 已记录的最后几条文字；originals 最多取几张原图（只取 until 之后的新图片）；tag 原图文件名前缀。
     function readMessages(name, options) {
         var limit = options.limit,
@@ -633,9 +655,11 @@ module.exports = function (config, workDir) {
         // 核对聊天后滑到底部，从最新的消息开始读
         verifyChat(name);
         scrollToLatest();
+        // 滑到底部是自己的操作，和滑动前的屏幕接不上是正常的（例如进入时停在较早的未读位置）。
+        // 改用底部这一屏作为读完后核对的基准：读完滑回底部后，两屏应当接得上。
+        entered.screen = visibleMessages(null);
         var budget = { images: MAX_THUMBNAILS };
-        var screen = visibleMessages(budget),
-            messages = screen,
+        var messages = visibleMessages(budget),
             pages = 0,
             stopReason = "limit_reached";
         try {
@@ -645,22 +669,25 @@ module.exports = function (config, workDir) {
                     stopReason = "reached_known";
                     break;
                 }
-                if (pages >= 20) {
+                if (pages >= MAX_PAGES) {
                     stopReason = "page_cap";
                     break;
                 }
-                if (!scroll(true)) {
+                if (!canScrollUp(1000)) {
+                    stopReason = "history_start";
+                    break;
+                }
+                if (!pageUp()) {
                     stopReason = "scroll_failed";
                     break;
                 }
                 pages++;
                 var older = visibleMessages(budget);
-                // 列表没有移动：已经到最早的消息
-                if (samePlace(older, screen)) {
-                    stopReason = "history_start";
+                // 这一屏没有能识别的消息：无法和已读部分比对，停止
+                if (!older.length) {
+                    stopReason = "empty_screen";
                     break;
                 }
-                screen = older;
                 // 新的一屏必须和已读部分有重叠，才能确定拼接位置；否则停止，避免拼错顺序
                 var shared = overlap(older, messages);
                 if (!shared) {
@@ -851,11 +878,11 @@ module.exports = function (config, workDir) {
                 }
                 // 还有没处理的：向上翻一页，用新旧两屏的重叠更新对应关系
                 targets = remaining;
-                if (!targets.length || pages >= 20 || !scroll(true)) break;
+                if (!targets.length || pages >= MAX_PAGES || !canScrollUp(1000) || !pageUp()) break;
                 pages++;
                 var older = visibleMessages(null),
                     shared = overlap(older, screen);
-                if (!shared || samePlace(older, screen)) break;
+                if (!shared) break;
                 offset -= older.length - shared;
                 screen = older;
                 mapped = older.length;

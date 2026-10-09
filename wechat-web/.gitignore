@@ -1,3 +1,4 @@
 .state/
 wechat-web
 *.log
+config.json

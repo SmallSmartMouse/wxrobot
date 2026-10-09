@@ -426,6 +426,65 @@ func TestShallowAutoReadDeepensBeforeMarkingGap(t *testing.T) {
 	if texts(c) != "a,b,|p,q" {
 		t.Fatalf("deep read should append with gap: %s", texts(c))
 	}
+	deeps := 0
+	for _, op := range a.state.Operations {
+		if op.Reason == "deep" {
+			deeps++
+		}
+	}
+	if deeps != 1 {
+		t.Fatalf("a deep read that appended with gap must not queue another one: %d", deeps)
+	}
+}
+
+func TestAutoReadStoppedEarlyAppendsWithoutDeepening(t *testing.T) {
+	a := testApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c := a.conversationLocked("小王")
+	a.mergeLocked(c, snapshotJSON("a", "b"), true)
+	op := &Operation{ID: "s", ConversationID: c.ID, Kind: "read", Limit: shallowRead, Auto: true, Status: "running", Created: now()}
+	a.state.Operations[op.ID] = op
+	var result map[string]any
+	_ = json.Unmarshal(snapshotJSON("x", "y"), &result)
+	result["stop_reason"] = "page_cap"
+	raw, _ := json.Marshal(result)
+	a.finishLocked(op, "succeeded", raw, "")
+	if texts(c) != "a,b,|x,y" {
+		t.Fatalf("read that stopped at the page cap should append with gap: %s", texts(c))
+	}
+	for _, other := range a.state.Operations {
+		if other.Reason == "deep" {
+			t.Fatal("deep read would stop at the same place and must not be queued")
+		}
+	}
+}
+
+func TestAutoReadLimitDependsOnKnownTexts(t *testing.T) {
+	a := testApp(t)
+	a.connection = "在线"
+	a.mu.Lock()
+	fresh := a.conversationLocked("新会话")
+	fresh.NeedsRead = true
+	a.mu.Unlock()
+	if !a.scheduleAutoRead() {
+		t.Fatal("expected a read for the new conversation")
+	}
+	a.mu.Lock()
+	known := a.conversationLocked("老会话")
+	a.mergeLocked(known, snapshotJSON("a", "b"), true)
+	known.NeedsRead = true
+	a.mu.Unlock()
+	if !a.scheduleAutoRead() {
+		t.Fatal("expected a read for the known conversation")
+	}
+	limits := map[string]int{}
+	for _, op := range a.state.Operations {
+		limits[op.ConversationID] = op.Limit
+	}
+	if limits[fresh.ID] != shallowRead || limits[known.ID] != deepRead {
+		t.Fatalf("limits: new=%d known=%d", limits[fresh.ID], limits[known.ID])
+	}
 }
 
 func TestSendSnapshotGapTriggersRead(t *testing.T) {
