@@ -18,11 +18,14 @@ import (
 
 // PhoneConfig 是一台手机（微信桥）的连接。
 type PhoneConfig struct {
-	ID      string `json:"id"`
-	URL     string `json:"phone_url"`
-	Token   string `json:"token"`
-	Cursor  int64  `json:"cursor"`            // 已处理的手机事件序号
-	Account string `json:"account,omitempty"` // 手机最近一次上报的微信号
+	Name      string `json:"name,omitempty"`
+	ID        string `json:"id"`
+	URL       string `json:"phone_url"`
+	Token     string `json:"token"`
+	Cursor    int64  `json:"cursor"`              // 已处理的手机事件序号
+	Account   string `json:"account,omitempty"`   // 手机最近一次上报的微信号
+	DeviceID  string `json:"device_id,omitempty"` // 经过 Token 验证的稳定设备标识，用于 IP 变化后重连
+	Transport string `json:"transport,omitempty"` // reverse：手机主动建立的加密连接
 	// 从单手机版本迁移来的手机：旧数据没有记录账号，这台手机第一次上报微信号时，旧会话都归到这个账号。
 	Legacy bool `json:"legacy,omitempty"`
 }
@@ -57,6 +60,9 @@ func (p *PhoneConfig) owns(c *Conversation) bool {
 
 // phoneForLocked 返回负责这个会话的手机，没有返回 nil。
 func (a *App) phoneForLocked(c *Conversation) *PhoneConfig {
+	if selected := a.selectDeviceLocked(c, ""); selected != nil {
+		return selected
+	}
 	for _, p := range a.state.Phones {
 		if p.owns(c) {
 			return p
@@ -90,6 +96,10 @@ func (a *App) syncPhonesLocked() {
 	}
 	for id, rt := range a.phones {
 		if !ids[id] {
+			if l := a.links[id]; l != nil {
+				l.cancel()
+				delete(a.links, id)
+			}
 			if rt.cancel != nil {
 				rt.cancel()
 			}
@@ -113,10 +123,19 @@ func (a *App) setPhoneStatus(id, status string, device json.RawMessage, err erro
 	}
 	if err != nil {
 		rt.err = err.Error()
-	} else if status == "在线" {
+	} else if device != nil || status == "在线" {
 		rt.err = "" // 连接恢复后清掉之前的连接错误
 	}
-	if account := deviceAccount(device); account != "" && (account != p.Account || p.Legacy) {
+	account, nickname := deviceAccountProfile(device)
+	nameChanged := false
+	if account != "" && nickname != "" && a.state.AccountNames[account] != nickname {
+		if a.state.AccountNames == nil {
+			a.state.AccountNames = map[string]string{}
+		}
+		a.state.AccountNames[account] = nickname
+		nameChanged = true
+	}
+	if account != "" && (account != p.Account || p.Legacy || nameChanged) {
 		if account != p.Account {
 			log.Printf("手机 %s 当前账号 %s（之前 %q）", p.ID, account, p.Account)
 		}
@@ -136,27 +155,36 @@ func (a *App) setPhoneStatus(id, status string, device json.RawMessage, err erro
 	a.notifyLocked()
 }
 
-// deviceAccount 从手机上报的状态里取当前微信号，没有返回空字符串。
-func deviceAccount(device json.RawMessage) string {
+// deviceAccountProfile 从手机上报的状态里取当前微信号和昵称，没有返回空字符串。
+func deviceAccountProfile(device json.RawMessage) (wechatID, nickname string) {
 	var d struct {
 		Info struct {
 			Account struct {
 				WechatID string `json:"wechat_id"`
+				Nickname string `json:"nickname"`
 			} `json:"account"`
 		} `json:"info"`
 	}
 	_ = json.Unmarshal(device, &d)
-	return d.Info.Account.WechatID
+	return d.Info.Account.WechatID, strings.TrimSpace(d.Info.Account.Nickname)
 }
 
 // failOrphansLocked 让没有手机可以执行的排队任务失败（未执行，可安全重试）：
 // 会话的账号没有任何手机登录着，例如手机换了账号或被删除。
 func (a *App) failOrphansLocked() {
 	for _, op := range a.state.Operations {
-		if op.Status != "queued" || op.PhoneID != "" {
+		if op.Status != "queued" {
 			continue
 		}
 		c := a.state.Conversations[op.ConversationID]
+		if op.PhoneID != "" {
+			p := a.phoneLocked(op.PhoneID)
+			if p != nil && c != nil && p.owns(c) {
+				continue
+			}
+			a.finishLocked(op, "failed", nil, "指定设备已移除或微信号已变化，任务未执行")
+			continue
+		}
 		if c != nil && a.phoneForLocked(c) != nil {
 			continue
 		}
@@ -170,6 +198,7 @@ func (a *App) failOrphansLocked() {
 
 // accountView 是网页上的一个账号：微信号，以及当前登录着它的手机。
 type accountView struct {
+	Nickname   string `json:"nickname,omitempty"`
 	WechatID   string `json:"wechat_id"`
 	PhoneID    string `json:"phone_id,omitempty"`
 	Connection string `json:"connection"`
@@ -198,6 +227,7 @@ func (a *App) accountsLocked() []accountView {
 	}
 	out := make([]accountView, 0, len(seen))
 	for _, v := range seen {
+		v.Nickname = a.state.AccountNames[v.WechatID]
 		out = append(out, *v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].WechatID < out[j].WechatID })
@@ -210,8 +240,9 @@ func (a *App) phoneViewsLocked() []gin.H {
 	for _, p := range a.state.Phones {
 		rt := a.phones[p.ID]
 		out = append(out, gin.H{
-			"id": p.ID, "phone_url": p.URL, "token_set": p.Token != "", "account": p.Account,
+			"id": p.ID, "phone_url": p.URL, "token_set": p.Token != "", "account": p.Account, "device_id": p.DeviceID, "transport": p.Transport,
 			"connection": rt.connection, "error": rt.err, "device": rt.device,
+			"name": p.Name, "available": a.deviceAvailableLocked(p), "task_count": a.deviceTaskCountLocked(p.ID),
 		})
 	}
 	return out
@@ -270,7 +301,7 @@ func (a *App) addPhone(c *gin.Context) {
 			return
 		}
 	}
-	p := &PhoneConfig{ID: randomID()[:12], URL: address, Token: token}
+	p := &PhoneConfig{ID: randomID()[:12], URL: address, Token: token, DeviceID: a.verifiedDeviceLocked(address, token)}
 	a.state.Phones = append(a.state.Phones, p)
 	a.syncPhonesLocked()
 	a.saved(c, gin.H{"id": p.ID})
@@ -287,6 +318,10 @@ func (a *App) updatePhone(c *gin.Context) {
 	p := a.phoneLocked(c.Param("id"))
 	if p == nil {
 		fail(c, 404, "手机不存在")
+		return
+	}
+	if p.Transport == "reverse" {
+		fail(c, 400, "已授权手机的地址会自动更新；如需重新配对，请先撤销授权")
 		return
 	}
 	address, token, problem := validPhone(body, p.Token)
@@ -306,6 +341,10 @@ func (a *App) updatePhone(c *gin.Context) {
 	}
 	if p.URL != address {
 		p.Cursor = 0 // 换了手机，事件从头同步
+		p.DeviceID = ""
+	}
+	if id := a.verifiedDeviceLocked(address, token); id != "" {
+		p.DeviceID = id
 	}
 	p.URL, p.Token = address, token
 	a.phones[p.ID].connection = "连接中"

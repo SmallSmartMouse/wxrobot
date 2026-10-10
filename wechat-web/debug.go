@@ -2,9 +2,10 @@ package main
 
 import (
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -15,20 +16,9 @@ import (
 func (a *App) getDebug(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// 最近 100 个任务（含执行步骤），新的在前
-	operations := make([]*Operation, 0, len(a.state.Operations))
-	for _, op := range a.state.Operations {
-		operations = append(operations, op)
-	}
-	sort.Slice(operations, func(i, j int) bool { return operations[i].Created > operations[j].Created })
-	operations = operations[:min(100, len(operations))]
-	// 最近 50 条 AI 记录
-	jobs := make([]*AIJob, 0, len(a.state.AIJobs))
-	for _, job := range a.state.AIJobs {
-		jobs = append(jobs, job)
-	}
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Created > jobs[j].Created })
-	jobs = jobs[:min(50, len(jobs))]
+	// 最近 100 个任务（含执行步骤）和 50 条 AI 记录，新的在前
+	operations := a.recentOperationsLocked(100)
+	jobs := newest(slices.Collect(maps.Values(a.state.AIJobs)), func(j *AIJob) string { return j.Created }, 50)
 	logText := ""
 	logError := ""
 	// 服务日志只读最后 64 KB
@@ -49,6 +39,9 @@ func (a *App) getDebug(c *gin.Context) {
 	}
 	// 日志里如果出现 Token 或密钥，替换掉再返回
 	secrets := []string{a.state.AI.Key}
+	for _, cfg := range a.state.AccountAI {
+		secrets = append(secrets, cfg.Model.Key)
+	}
 	for _, p := range a.state.Phones {
 		secrets = append(secrets, p.Token)
 	}

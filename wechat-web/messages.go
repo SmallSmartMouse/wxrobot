@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 )
 
 type Conversation struct {
@@ -26,8 +27,18 @@ type Conversation struct {
 	Members map[string]string `json:"members,omitempty"`
 	// 网页上删除聊天记录时留下的最后几条消息：不显示，只用来和之后读到的屏幕衔接，
 	// 避免手机屏幕上还在的旧消息又被当作新消息导入。
-	Anchor   []Message `json:"anchor,omitempty"`
-	Messages []Message `json:"messages"`
+	LiveSignal     bool      `json:"live_signal,omitempty"` // 有新消息提示，不能把首次读取整屏吞作基准
+	LiveUnread     int       `json:"live_unread,omitempty"`
+	LiveNotices    []string  `json:"live_notices,omitempty"`
+	LiveSignalAt   string    `json:"live_signal_at,omitempty"`
+	LiveObservedAt string    `json:"live_observed_at,omitempty"`
+	ReadRetryAt    string    `json:"read_retry_at,omitempty"`
+	ReadFailures   int       `json:"read_failures,omitempty"` // 连续没能读到内容的自动读取次数，决定重读的等待时间
+	ReadWarning    string    `json:"read_warning,omitempty"`
+	LiveReady      bool      `json:"live_ready,omitempty"`  // 空聊天也可以完成基准初始化
+	LiveAnchor     []Message `json:"live_anchor,omitempty"` // 仅新增模式的最近观察窗口；未导入的基准消息 Seq 为 0
+	Anchor         []Message `json:"anchor,omitempty"`
+	Messages       []Message `json:"messages"`
 }
 
 // anchorSize 删除聊天记录时留作衔接点的消息条数。
@@ -196,12 +207,42 @@ func (a *App) rememberAvatar(c *Conversation, seen observedMessage) {
 // 在已记录消息的末尾与新窗口之间找唯一的衔接点，只追加衔接点之后的消息。
 // 找不到衔接点时：appendOnGap 为 true 则整窗追加并标记缺口，否则什么都不做，由调用方决定是否加深读取。
 func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool) bool {
+	return a.mergeModeLocked(c, raw, appendOnGap, false)
+}
+
+// atLatest 只由主动读取设置；用户手动浏览历史产生的被动快照不能重置基准。
+func (a *App) mergeModeLocked(c *Conversation, raw json.RawMessage, appendOnGap, atLatest bool) bool {
+	var position struct {
+		AtLatest bool `json:"at_latest"`
+	}
+	_ = json.Unmarshal(raw, &position)
+	return a.mergeSnapshotLocked(c, raw, appendOnGap, atLatest || position.AtLatest, a.state.NewMessagesOnly)
+}
+
+func (a *App) mergeSnapshotLocked(c *Conversation, raw json.RawMessage, appendOnGap, atLatest, live bool) bool {
 	var snapshot struct {
 		Messages   []observedMessage `json:"messages"`
 		CapturedAt string            `json:"captured_at"`
+		ChatType   string            `json:"chat_type"`
 	}
 	// 没有消息时视为已衔接，调用方不需要再处理
-	if json.Unmarshal(raw, &snapshot) != nil || len(snapshot.Messages) == 0 {
+	if json.Unmarshal(raw, &snapshot) != nil {
+		return true
+	}
+	// 只补齐未分类会话，不覆盖用户已设置的类型；空聊天也能识别。
+	if (c.Kind == "unknown" || c.Kind == "") && (snapshot.ChatType == "person" || snapshot.ChatType == "group") {
+		c.Kind = snapshot.ChatType
+	}
+	stale := live && olderSnapshot(snapshot.CapturedAt, c.LiveObservedAt)
+	if len(snapshot.Messages) == 0 {
+		if live && atLatest {
+			// 有新消息提示却是空屏（聊天还没加载出来，或消息都无法识别）：按退避稍后重读，不能每 5 秒读一次
+			if c.LiveSignal {
+				a.retryReadLocked(c)
+			} else if !c.LiveReady {
+				c.LiveReady = true
+			}
+		}
 		return true
 	}
 	// 把手机上报的消息转成待比对的窗口，时间统一用这次的观察时间
@@ -215,8 +256,42 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 	if len(recent) < 100 {
 		known = c.withAnchor(recent)
 	}
-	prefix := len(known) - len(recent) // known 开头这么多条是衔接点，不对应 c.Messages
+	if stale {
+		if count, _ := occurrences(known, window); count > 0 {
+			return true
+		}
+	}
+	if live {
+		c.seedLiveAnchor(false)
+		known = c.LiveAnchor
+	}
+	prefix := len(known) - len(recent)
 	start, base, aligned := newMessagesStart(known, window)
+	if live && !c.LiveReady {
+		if !atLatest {
+			c.NeedsRead = true
+			return true
+		}
+		if !c.LiveSignal {
+			c.LiveAnchor, c.LiveReady, c.LiveObservedAt = liveAnchorOf(window), true, snapshot.CapturedAt
+			return true
+		}
+		// 未读/通知先于首次打开聊天：用未读条数或通知正文定位新增部分。
+		start, aligned = liveIncomingStart(c, window)
+		base = -start
+		c.LiveReady = true
+	}
+	if live && !aligned {
+		if !atLatest {
+			c.NeedsRead = true
+			return true
+		}
+		// 已读边界不在这一屏时保留已观察到的内容，标记缺口，不能把整屏吞成新基准。
+		appendOnGap = true
+		c.ReadWarning = "消息衔接有缺口，已保留当前屏，可能重复或漏读。"
+	} else if live && atLatest && !stale {
+		c.ReadWarning = "" // 底部这一屏已和记录衔接，之前的缺口提示不再适用
+	}
 	// 接不上且不允许整批追加：什么都不做，由调用方决定（例如加深读取）
 	if !aligned && !appendOnGap {
 		return false
@@ -226,24 +301,53 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 	}
 	// 衔接上的部分对应已有消息：补上之前没取到的发送人、缩略图和原图。
 	for i := 0; aligned && i < start; i++ {
-		if k := base + i - prefix; k >= 0 && k < len(recent) {
-			m := &c.Messages[len(c.Messages)-len(recent)+k]
-			if a.attachObserved(m, snapshot.Messages[i]) {
-				a.markMessage(c.ID, m.Seq)
+		var m *Message
+		if live {
+			// 仅新增模式按观察窗口衔接；窗口里没导入过的基准消息序号为 0，找不到对应的消息
+			if k := base + i; k >= 0 && k < len(known) {
+				window[i] = known[k]
+				m = c.messageBySeq(known[k].Seq)
 			}
+		} else if k := base + i - prefix; k >= 0 && k < len(recent) {
+			m = &c.Messages[len(c.Messages)-len(recent)+k]
+		}
+		if m != nil && a.attachObserved(m, snapshot.Messages[i]) {
+			a.markMessage(c.ID, m.Seq)
 		}
 	}
-	// 衔接点之后都是新消息：分配序号、计入未读、更新列表预览，并标记待写入数据库
+	a.appendNewLocked(c, window, snapshot.Messages, start, !aligned)
+	if live {
+		if start < len(window) && !stale {
+			c.LiveAnchor = liveAnchorOf(window)
+		}
+		if snapshot.CapturedAt != "" && !stale {
+			c.LiveObservedAt = snapshot.CapturedAt
+		}
+		if atLatest && !stale && !olderSnapshot(snapshot.CapturedAt, c.LiveSignalAt) {
+			c.LiveSignal, c.LiveUnread, c.LiveNotices = false, 0, nil
+		}
+	}
+	if !aligned {
+		// 缺口批次可能包含已经回复、转发过的消息，不触发 AI 和转发。
+		a.skipNewMessagesLocked(c)
+	}
+	return aligned
+}
+
+// appendNewLocked 把 window[start:] 作为新消息追加：分配序号、计入未读、更新列表预览，并标记待写入数据库。
+// gap 为 true 时第一条标记缺口。追加后 window 里对应的条目换成带序号的消息，仅新增模式用它作观察窗口。
+func (a *App) appendNewLocked(c *Conversation, window []Message, observed []observedMessage, start int, gap bool) {
 	for i := start; i < len(window); i++ {
 		m := window[i]
-		a.attachObserved(&m, snapshot.Messages[i])
+		a.attachObserved(&m, observed[i])
 		c.LastSeq++
 		m.Seq = c.LastSeq
 		m.ID = fmt.Sprintf("%s:%d", c.ID, m.Seq)
-		m.Gap = !aligned && i == start
+		m.Gap = gap && i == start
 		if m.Direction == "incoming" {
 			c.Unread++
 		}
+		window[i] = m
 		c.Messages = append(c.Messages, m)
 		a.markMessage(c.ID, m.Seq)
 		// 系统提示不作为列表预览
@@ -252,11 +356,15 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 			c.Updated = now()
 		}
 	}
-	if !aligned {
-		// 缺口批次可能包含已经回复、转发过的消息，不触发 AI 和转发。
-		a.skipNewMessagesLocked(c)
+}
+
+// messageBySeq 按序号找消息（消息按序号递增保存），没有返回 nil。
+func (c *Conversation) messageBySeq(seq int64) *Message {
+	i := sort.Search(len(c.Messages), func(i int) bool { return c.Messages[i].Seq >= seq })
+	if i == len(c.Messages) || c.Messages[i].Seq != seq {
+		return nil
 	}
-	return aligned
+	return &c.Messages[i]
 }
 
 // newMessagesStart 返回 window 中第一条新消息的位置 start，以及 window[0] 对应 known 中的位置 base

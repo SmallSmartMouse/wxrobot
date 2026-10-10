@@ -964,8 +964,32 @@ dialog h3 {
 
 /* 手机连接对话框：手机列表 + 添加 / 修改表单 */
 #settings-dialog {
-  width: 560px;
+  width: 680px;
 }
+
+.discovery-settings { margin: 18px 0; padding: 14px; border: 1px solid #dce9e1; border-radius: 12px; background: #f7faf8; }
+.discovery-settings summary, .manual-phone summary { cursor: pointer; font-size: 14px; font-weight: 600; }
+.discovery-settings summary span { display: block; padding: 5px 0 0 16px; font-size: 12px; font-weight: 400; }
+.discovery-toggle { display: flex; align-items: center; gap: 9px; margin: 14px 0; font-size: 13px; }
+.discovery-toggle input { width: auto; margin: 0; accent-color: #287a54; }
+.network-add { display: flex; gap: 8px; flex-wrap: wrap; }
+.network-add input, .network-add select { padding: 10px 12px; border: 1px solid #dfe8e0; border-radius: 8px; background: #fbfcfa; color: var(--ink); font: inherit; font-size: 12px; }
+.network-add input:focus, .network-add select:focus { outline: 2px solid #8bbda4; outline-offset: 1px; }
+.network-add input { flex: 1 1 170px; min-width: 0; }
+.network-add select { flex: 1 1 140px; width: auto; }
+.network-list { margin: 10px 0; }
+.network-range { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #e1ebe4; }
+.network-range span { flex: 1; font-size: 13px; }
+.network-range small { display: block; color: #78857e; font-size: 11px; margin-top: 3px; overflow-wrap: anywhere; }
+.network-budget { display: flex; gap: 8px; justify-content: space-between; flex-wrap: wrap; font-size: 11px; }
+#network-budget { width: 100%; height: 6px; accent-color: #287a54; }
+.pairing-card { margin: 12px 0; padding: 16px; border: 1px solid #bad6c6; border-radius: 12px; background: #f5faf7; }
+.pairing-card h3 { margin: 0 0 6px; }
+.pairing-card p { font-size: 12px; line-height: 1.6; color: #61786b; }
+.pairing-code { font-size: 24px; letter-spacing: .35em; text-align: center; font-variant-numeric: tabular-nums; }
+.pairing-checks { padding: 8px 0; }
+.manual-phone { margin-top: 20px; padding-top: 16px; border-top: 1px solid #e4ebe7; color: #697a70; }
+#settings-dialog .phone-copy small { white-space: normal; overflow: visible; line-height: 1.6; overflow-wrap: anywhere; }
 
 .phone-list {
   margin-top: 14px;
@@ -1293,3 +1317,20 @@ dialog h3 {
     transition: none;
   }
 }
+
+.reading-settings { margin: 16px 0; padding: 16px; border: 1px solid var(--line, #e2e7ed); border-radius: 12px; }
+.reading-toggle { display: flex; align-items: center; justify-content: space-between; gap: 20px; cursor: pointer; }
+.reading-toggle small { display: block; color: var(--muted, #687586); margin-top: 5px; }
+.reading-toggle input { appearance: none; flex: 0 0 42px; width: 42px; height: 24px; padding: 3px; border: 0; border-radius: 20px; background: #a5afba; cursor: pointer; transition: background .15s; }
+.reading-toggle input::before { content: ""; display: block; width: 18px; height: 18px; border-radius: 50%; background: white; transition: transform .15s; }
+.reading-toggle input:checked { background: #249474; }
+.reading-toggle input:checked::before { transform: translateX(18px); }
+.reading-toggle input:focus-visible { outline: 2px solid #249474; outline-offset: 3px; }
+.reading-toggle input:disabled { opacity: .6; cursor: wait; }
+.reading-settings p { margin: 10px 0 0; line-height: 1.6; }
+#reading-status { margin-top: 8px; font-size: 12px; color: var(--muted, #687586); }
+
+.list-account { padding: 8px 20px 0; color: #738078; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.outgoing .message-sender { text-align: right; margin-right: 2px; }
+
+.read-gap-note { color: #9b641c; font-size: 12px; margin-top: 5px; line-height: 1.5; }

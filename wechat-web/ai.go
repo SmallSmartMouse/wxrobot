@@ -85,7 +85,9 @@ func (a *App) aiSettingLocked(c *Conversation) AISetting {
 	if c.AI.Mode != "" {
 		return c.AI
 	}
-	for _, r := range a.state.AIRules {
+	rules := append([]AIRule{}, a.state.AccountAI[c.Account].Rules...)
+	rules = append(rules, a.state.AIRules...)
+	for _, r := range rules {
 		if r.matches(c) {
 			return r.AISetting
 		}
@@ -112,10 +114,11 @@ func (a *App) aiLoop(ctx context.Context) {
 // aiCursor 记录每个会话已检查到的消息序号，只看之后的新来信。
 func (a *App) nextAutoJobLocked() string {
 	// 没有配置 AI 接口时不处理
-	if a.state.AI.URL == "" {
-		return ""
-	}
+
 	for _, c := range a.state.Conversations {
+		if a.effectiveAIConfigLocked(c.Account).URL == "" {
+			continue
+		}
 		setting := a.aiSettingLocked(c)
 		cursor, seen := a.aiCursor[c.ID]
 		// 首次见到的会话和关闭回复的会话只跟上最新位置：开启后只回复之后的新消息。
@@ -219,7 +222,7 @@ func (a *App) generateReply(ctx context.Context, jobID string) {
 	a.mu.Lock()
 	job := a.state.AIJobs[jobID]
 	c := a.state.Conversations[job.ConversationID]
-	cfg := a.state.AI
+	cfg := a.effectiveAIConfigLocked(c.Account)
 	history := a.chatHistoryLocked(cfg, c)
 	a.mu.Unlock()
 
@@ -251,7 +254,7 @@ func (a *App) generateReply(ctx context.Context, jobID string) {
 	case a.phoneForLocked(c) == nil:
 		job.Status, job.Error = "failed", "会话的账号当前没有连接的手机，未发送"
 	default:
-		op := &Operation{ID: "ai-" + job.ID, ConversationID: c.ID, Kind: "send", Text: reply, Status: "queued", Created: now()}
+		op := &Operation{PhoneID: a.phoneForLocked(c).ID, Account: c.Account, ID: "ai-" + job.ID, ConversationID: c.ID, Kind: "send", Text: reply, Status: "queued", Created: now()}
 		a.state.Operations[op.ID] = op
 		job.Status, job.Reply, job.OperationID = "sent", reply, op.ID
 		a.wakeWorker()

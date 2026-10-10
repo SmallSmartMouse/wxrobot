@@ -25,6 +25,7 @@ TEMP=""
 FILES=(
     bridge.js
     wechat.js
+    connection.js
 )
 
 fail() {

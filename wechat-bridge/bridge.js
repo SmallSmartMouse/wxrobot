@@ -6,7 +6,7 @@
 //
 // 任务和事件只保存在内存中。脚本重启后电脑查询不到原任务，会把发送标记为“结果未知”，不会重发。
 // 代码和数据分开存放：
-//   代码（bridge.js、wechat.js）从本脚本所在目录加载。ADB 部署时就是 BASE；
+//   代码（bridge.js、wechat.js、connection.js）从本脚本所在目录加载。ADB 部署时就是 BASE；
 //   VSCode“运行项目”时是 AutoJs6 的缓存目录。
 //   数据（config.json、锁、日志、原图）固定放在 BASE，无论从哪里运行都共用同一份配置和同一把锁。
 var BASE = "/sdcard/wechat-bridge/";
@@ -65,6 +65,14 @@ function acquireProcessLock(file) {
 stopOtherInstances();
 var lockFile = new java.io.RandomAccessFile(BASE + "bridge.lock", "rw");
 var processLock = acquireProcessLock(lockFile);
+
+// 没有配置设备编号时生成一次并持久保存；IP 变化和脚本重启不会改变这个编号。
+if (!config.device_id) {
+    var deviceIDPath = BASE + "device-id";
+    config.device_id = files.exists(deviceIDPath) ? String(files.read(deviceIDPath)).trim() : String(java.util.UUID.randomUUID());
+    if (!config.device_id) config.device_id = String(java.util.UUID.randomUUID());
+    files.write(deviceIDPath, config.device_id);
+}
 
 // ---------- 共享状态：HTTP 线程与主线程共用，读写都在 withLock 内 ----------
 
@@ -203,6 +211,10 @@ function validatePayload(operation, data) {
         if (typeof limit !== "number" || limit % 1 !== 0 || limit < 1 || limit > 100)
             httpError(400, "BAD_LIMIT", "limit 必须为 1–100 的整数");
         payload.limit = limit;
+        if (data.read_history !== undefined && typeof data.read_history !== "boolean")
+            httpError(400, "BAD_READ_HISTORY", "read_history 必须是布尔值");
+        payload.read_history = data.read_history !== false;
+        payload.identify_kind = data.identify_kind === true;
         payload.return_list = data.return_list === true;
         // until：已记录的最后几条消息文字，翻页读到它们就停止。
         var until = data.until === undefined ? [] : data.until;
@@ -345,7 +357,7 @@ var lastChat = null; // 最近一次任务操作的聊天，监测时用于识�
 function runTask(task) {
     var p = task.payload,
         status,
-        result;
+        result, returnListError = "";
     log("任务 " + task.id + " " + task.operation + " 开始");
     // 开始一次新操作：设置超时，清空执行记录
     ui.begin(TASK_TIMEOUT_MS);
@@ -355,8 +367,11 @@ function runTask(task) {
         ui.openChat(p.chat, p.group);
         if (task.operation === "read") {
             // 读取完成后，自动读取会回到首页，方便继续发现其他未读会话
-            result = ui.readMessages(p.chat, { limit: p.limit, until: p.until, originals: p.originals, tag: task.id });
-            if (p.return_list) ui.returnToList();
+            result = ui.readMessages(p.chat, { limit: p.limit, until: p.until, originals: p.originals, readHistory: p.read_history, identifyKind: p.identify_kind, tag: task.id });
+            if (p.return_list) {
+                try { ui.returnToList(); }
+                catch (e) { returnListError = String(e.message || e); }
+            }
         } else {
             // 发送并确认后，再补读一次当前屏幕，让电脑尽快看到刚发的消息
             if (p.image_base64) ui.sendImage(p.chat, p.group, p.image_base64, task.id);
@@ -380,6 +395,7 @@ function runTask(task) {
     // 执行步骤和降级随结果上报，诊断页可以看到每一步。
     result.account = currentAccountId(); // 执行时登录的微信号，电脑再核对一次
     result.diagnostics = ui.diagnostics();
+    if (returnListError) result.diagnostics.warnings.push({ code: "RETURN_LIST_FAILED", message: "消息已读取，但返回列表失败：" + returnListError });
     // 降级和失败同时记入诊断事件，诊断页可以集中查看
     var context = { task_id: task.id, operation: task.operation, chat: p.chat };
     result.diagnostics.warnings.forEach(function (w) {
@@ -446,7 +462,7 @@ function readAccount() {
     var before = currentAccountId();
     if (before && before !== found.wechat_id) log("当前账号变为 " + found.wechat_id + "（之前 " + before + "）");
     withLock(function () {
-        account = { wechat_id: found.wechat_id, identified_at: new Date().toISOString(), error: null };
+        account = { wechat_id: found.wechat_id, nickname: found.nickname || "", identified_at: new Date().toISOString(), error: null };
         accountCheckedAt = Date.now();
         accountWanted = false;
     });
@@ -455,7 +471,7 @@ function readAccount() {
 
 // identifyAccount 空闲时识别当前账号；日志只记操作流程、结果和耗时。
 function identifyAccount() {
-    ui.begin(15000);
+    ui.begin(25000);
     var id = "";
     try {
         id = readAccount();
@@ -555,18 +571,24 @@ function watchNotifications() {
     return true;
 }
 
+var monitorAccount = "";
 var unreadSeen = {},
     lastSignature = null,
     lastVisibleCheck = 0;
 
 // 空闲时监测：首页有新的未读会话 → unread_chat；当前聊天内容变化 → visible_snapshot。
 function monitor() {
+    var owner = currentAccountId();
+    if (!owner) return;
+    if (owner !== monitorAccount) {
+        monitorAccount = owner; unreadSeen = {}; lastSignature = null; lastChat = null;
+    }
     // 在首页时：比较每个未读会话的行内容，变化了说明有新消息
     ui.begin(5000);
     var unread = ui.unreadChats();
     if (unread) {
         for (var chat in unread) {
-            if (unreadSeen[chat] !== unread[chat]) pushEvent({ kind: "unread_chat", chat: chat });
+            if (!unreadSeen[chat] || unreadSeen[chat].signature !== unread[chat].signature) pushEvent({ kind: "unread_chat", chat: chat, unread_count: unread[chat].count });
         }
         unreadSeen = unread;
     }
@@ -583,11 +605,13 @@ function monitor() {
         return;
     }
     // 先不截图比较屏幕内容，有变化才截图生成快照事件（截图较耗时）
-    var signature = name + JSON.stringify(ui.snapshot(false).messages);
+    var observed = ui.snapshot(false);
+    var signature = owner + "|" + name + JSON.stringify([observed.messages, observed.at_latest]);
     if (signature === lastSignature) return;
-    lastSignature = signature;
     var snapshot = ui.snapshot(true);
-    if (snapshot.messages.length) pushEvent({ kind: "visible_snapshot", chat: name, snapshot: snapshot });
+    // 截图/上报失败时不更新签名，下轮仍会重试；空聊天也上报，才能保住第一条增量。
+    pushEvent({ kind: "visible_snapshot", chat: name, snapshot: snapshot });
+    lastSignature = signature;
 }
 
 // ---------- HTTP ----------
@@ -765,10 +789,44 @@ threads.start(function () {
     }
 });
 
+// ---------- 电脑主动连接的请求 ----------
+// 授权后的主动连接复用同一套任务/事件路由，原图按块返回，避免 WebSocket 队列一次装入大文件。
+function handleLinkedRequest(message) {
+    if ((message.method !== "GET" && message.method !== "POST") || typeof message.path !== "string" || message.path.length > 4096)
+        httpError(400, "BAD_REQUEST", "请求格式无效");
+    var target = message.path.split("?"), query = {};
+    (target[1] || "").split("&").forEach(function (pair) {
+        var kv = pair.split("="); if (kv[0]) query[kv[0]] = kv[1];
+    });
+    var body = message.body == null ? "" : JSON.stringify(message.body);
+    if (body.length > MAX_BODY_BYTES) httpError(413, "BODY_TOO_LARGE", "请求体过大");
+    var result = route({ method: message.method, path: target[0], query: query,
+        headers: { authorization: "Bearer " + config.phone_api_token, "idempotency-key": message.key || "" }, body: body });
+    if (!result[2]) return result;
+    var file = new java.io.File(result[2]);
+    if (!file.isFile()) httpError(404, "NOT_FOUND", "原图文件不存在");
+    if (file.length() > 40 * 1024 * 1024) httpError(413, "FILE_TOO_LARGE", "原图文件过大");
+    if (query.done === "1") { file.delete(); return [200, { ok: true }]; }
+    var offset = intParam(query.offset, 0, 0, Number(file.length()));
+    var input = new java.io.RandomAccessFile(file, "r");
+    try {
+        input.seek(offset);
+        var bytes = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, Math.min(256 * 1024, Number(file.length()) - offset));
+        input.readFully(bytes);
+        return [200, { size: Number(file.length()), data: String(android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)) }];
+    } finally { input.close(); }
+}
+// 局域网发现与电脑主动连接（connection.js）：回复电脑的 UDP 发现请求，授权后经加密连接接收任务。
+var computerLinks = require(files.join(files.cwd(), "connection.js"))({
+    config: config, base: BASE, port: Number(PORT), handle: handleLinkedRequest, log: log, diagnostic: addDiagnostic, onReady: requestAccountRefresh
+});
+computerLinks.startDiscovery();
+
 // ---------- 启动与主循环 ----------
 
 // 脚本退出时：取消常亮，关闭监听端口，释放文件锁
 events.on("exit", function () {
+    computerLinks.close();
     device.cancelKeepingAwake();
     try {
         server.close();
@@ -795,8 +853,21 @@ var captureReady = false,
 // requestCapture 申请截图授权；失败时记一条诊断事件，不抛出异常。
 function requestCapture() {
     lastCaptureRequest = Date.now();
+    // 锁屏时无法显示授权 Activity；启动阶段也应等待解锁再申请。
+    if (!device.isScreenOn() || context.getSystemService("keyguard").isKeyguardLocked()) return;
+    var clicker = null;
+    try {
+        // Android 会限制后台启动授权 Activity。每次申请前先打开运行脚本的应用。
+        var capturePackage = String(context.getPackageName());
+        if (currentPackage() !== capturePackage) {
+            app.launchPackage(capturePackage);
+            for (var attempt = 0; attempt < 20 && currentPackage() !== capturePackage; attempt++) sleep(250);
+            if (currentPackage() !== capturePackage) {
+                throw new Error("AutoJs6 未能进入前台，请手动打开 AutoJs6；若仍失败，请允许后台弹出界面，稍后自动重试");
+            }
+        }
     // 系统会弹出“AutoJs6 将开始截取屏幕”，在另一个线程里点“立即开始”。
-    var clicker = threads.start(function () {
+    clicker = threads.start(function () {
         for (var i = 0; i < 60; i++) {
             sleep(250);
             if (currentPackage() !== "com.android.systemui") continue;
@@ -807,13 +878,13 @@ function requestCapture() {
             }
         }
     });
-    try {
         captureReady = requestScreenCapture(false);
+        if (!captureReady) throw new Error("截图授权未获允许，请在系统授权窗口允许截图");
     } catch (e) {
         captureReady = false;
-        addDiagnostic("warning", "CAPTURE_REQUEST_FAILED", "截图授权申请失败（手机锁屏或授权页打不开），解锁后自动重试：" + String(e.message || e).split("\n")[0], { source: "monitor" });
+        addDiagnostic("warning", "CAPTURE_REQUEST_FAILED", "截图授权申请失败，请解锁并打开 AutoJs6，允许截图授权；每分钟自动重试：" + String(e.message || e).split("\n")[0], { source: "monitor" });
     } finally {
-        clicker.interrupt();
+        if (clicker) clicker.interrupt();
     }
     // 申请成功：清除“截图失效”标记
     if (captureReady) {
@@ -829,6 +900,12 @@ log("微信桥已启动，端口 " + PORT);
 // 主循环不能因为一次异常退出，异常记入诊断后等 2 秒继续。
 while (true) {
     try {
+        if (computerLinks.isPairing()) {
+            deviceInfo = { ready: false, reasons: ["PAIRING_CONFIRMATION_REQUIRED"] };
+            heartbeat = Date.now();
+            sleep(400);
+            continue;
+        }
         var info = ui.status(captureReady);
         // 截图授权缺失或失效时，在解锁状态下每分钟重新申请一次
         var unlocked = info.reasons.indexOf("SCREEN_LOCKED") < 0;

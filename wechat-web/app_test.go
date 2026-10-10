@@ -1305,3 +1305,35 @@ func TestForwardAPI(t *testing.T) {
 		t.Fatalf("rule after restart: %+v", r)
 	}
 }
+
+func TestForwardDedupOnlyAfterForwarded(t *testing.T) {
+	a, source, _ := forwardApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	offline := a.conversationLocked("另一个号", "外部群")
+	offline.Kind = "group"
+	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{offline.ID}, DedupMinutes: 30}}
+	a.forwardLocked()
+	a.mergeLocked(source, screen("甲：好价"), true)
+	a.forwardLocked()
+	// 目标账号的手机连上之后，相同内容再出现时应该能转发
+	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "p2", URL: "http://phone2.test", Token: strings.Repeat("t", 32), Account: "另一个号"})
+	a.mergeLocked(source, screen("甲：好价", "乙：好价"), false)
+	a.forwardLocked()
+	if got := forwards(a, offline.ID); len(got) != 1 || got[0] != "好价" {
+		t.Fatalf("message not forwarded earlier must not be treated as a duplicate: %v", got)
+	}
+}
+
+func TestEmptyListsAreJSONArrays(t *testing.T) {
+	a := testApp(t)
+	for _, path := range []string{"/api/state", "/api/debug"} {
+		var body map[string]json.RawMessage
+		json.Unmarshal(call(a, "GET", path, "", "").Body.Bytes(), &body)
+		for _, key := range []string{"operations", "ai_jobs", "conversations", "phones"} {
+			if v, ok := body[key]; ok && string(v) == "null" {
+				t.Fatalf("%s %s must be [] for the web page, got null", path, key)
+			}
+		}
+	}
+}

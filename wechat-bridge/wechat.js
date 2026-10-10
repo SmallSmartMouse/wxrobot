@@ -9,6 +9,7 @@ var DEFAULT_PROFILE = {
     contact_id: "com.tencent.mm:id/kbq",
     search_contact_id: "com.tencent.mm:id/odf",
     avatar_id: "com.tencent.mm:id/bk1",
+    nickname_id: "com.tencent.mm:id/kbb", // “我”页面的微信名，仅展示，不用作账号标识
     account_id: "com.tencent.mm:id/ouv", // “我”页面的“微信号：xxx”
     // 表情包消息的控件描述（正则）；也可以用 sticker_id 指定控件编号。
     // 群成员昵称默认取头像控件的描述“xxx头像”；微信显示群昵称时可以用 sender_id 指定昵称控件编号，优先使用。
@@ -21,6 +22,8 @@ var HOME_TABS = ["微信", "通讯录", "发现", "我"];
 // 不处理的会话：公众号（旧版微信叫“订阅号消息”）是文章推送的汇总入口，不是聊天；“微信”是微信自己的系统通知。
 var IGNORED_CHATS = ["公众号", "订阅号消息", "微信"];
 var MAX_PAGES = 20; // 一次读取最多向上翻页次数
+// 仅新增模式最多向上翻页次数：只为翻回上次读到的位置（until），让新的一屏能和已有记录接上，不读更早的历史
+var NEW_ONLY_MAX_PAGES = 5;
 var MAX_ORIGINAL_PAGES = 8; // 读完后为取原图回头找图片时最多向上翻页次数（电脑只要最近 10 条消息里的原图）
 // 向上翻页：手指滑过消息列表高度的 80%，用时 500 毫秒。
 // Mi Note 3（微信 8.0.78）实测：内容实际移动约 64% 屏（1006/1571 像素），没有惯性，350 毫秒内已停稳；
@@ -28,6 +31,7 @@ var MAX_ORIGINAL_PAGES = 8; // 读完后为取原图回头找图片时最多向�
 var PAGE_SPAN = 0.8;
 var PAGE_SWIPE_MS = 500;
 var PAGE_SETTLE_MS = 350; // 翻页后等列表停稳再读取
+var ACTION_SCROLL_FORWARD = 4096;
 var ACTION_SCROLL_BACKWARD = 8192; // 列表还能向上（更早的消息）滚动时，它的无障碍操作里才有这一项
 var PERMISSION_UI = /packageinstaller|permissioncontroller|lbe\.security/; // 系统权限弹窗所属的包
 // 读取提前停止的原因 → 降级说明（结果可能不完整）
@@ -348,19 +352,62 @@ module.exports = function (config, workDir) {
         return title && title !== "微信" ? chatName(withoutMemberCount(title)) : null;
     }
 
+    // 只在主动读取未分类会话时打开详情；不凭名称、消息人数或缺少群人数猜测。
+    function identifyChatKind(name) {
+        verifyChat(name);
+        var button = one(desc("聊天信息"));
+        if (!button) return "unknown";
+        var opened = false;
+        try {
+            tap(button);
+            opened = !!waitFor(function () { return !messageList(); }, 1500);
+            if (!opened) return "unknown";
+            var kind = waitFor(function () {
+                if (!inWechat()) return null;
+                var activity = String(currentActivity());
+                if (activity === "com.tencent.mm.ui.SingleChatInfoUI") return "person";
+                if (activity === "com.tencent.mm.chatroom.ui.ChatroomInfoUI") return "group";
+                return null;
+            }, 1500);
+            return kind || "unknown";
+        } finally {
+            if (opened && inWechat()) {
+                back();
+                verifyChat(name);
+            }
+        }
+    }
+
     // ---------- 打开聊天 ----------
 
-    // launchWechat 启动微信并等它到前台；5 秒内没有到前台就报告当前前台是哪个应用。
+    // 先恢复微信已有任务；部分系统会拦截指定 Activity，失败后用系统启动入口重试。
     function launchWechat() {
-        app.startActivity({
-            packageName: PKG,
-            className: "com.tencent.mm.ui.LauncherUI",
-            flags: ["activity_new_task", "activity_reset_task_if_needed"]
-        });
+        if (inWechat()) return;
+        var launchError = "";
+        try {
+            app.startActivity({
+                packageName: PKG,
+                className: "com.tencent.mm.ui.LauncherUI",
+                flags: ["activity_new_task", "activity_reset_task_if_needed"]
+            });
+        } catch (e) { launchError = String(e.message || e); }
+        if (waitFor(inWechat, 5000)) return;
+        step("重试启动微信", "使用系统应用启动入口");
+        try {
+            var intent = context.getPackageManager().getLaunchIntentForPackage(PKG);
+            if (!intent) fail("WECHAT_NOT_INSTALLED", "未找到微信，请确认微信已安装在当前用户空间");
+            intent.addFlags(0x10000000); // FLAG_ACTIVITY_NEW_TASK
+            context.startActivity(intent);
+        } catch (e) {
+            if (e.code === "WECHAT_NOT_INSTALLED") throw e;
+            launchError = String(e.message || e);
+        }
         if (!waitFor(inWechat, 5000)) {
             var front = foregroundPackage();
-            var hint = PERMISSION_UI.test(front) ? "（系统权限弹窗挡在前面，请在手机上处理）" : "";
-            fail("WECHAT_NOT_OPEN", "无法打开微信，当前前台是 " + front + hint);
+            var hint = PERMISSION_UI.test(front)
+                ? "；系统权限弹窗挡在前面，请在手机上处理"
+                : "；请解锁手机，并允许手机端服务在后台弹出界面";
+            fail("WECHAT_NOT_OPEN", "自动打开微信失败，当前前台是 " + front + hint + (launchError ? "（" + launchError + "）" : ""));
         }
     }
 
@@ -432,6 +479,12 @@ module.exports = function (config, workDir) {
         return m ? m[1] : null;
     }
 
+    // 只在已核实“我”页面的微信号后读取昵称；读取不到留空，不猜测账号名称。
+    function accountNickname() {
+        var node = one(id(profile.nickname_id));
+        return node ? String(node.text() || "").trim() : "";
+    }
+
     // accountOnMePage 在“我”页面读取微信号，不在“我”页面或读不到返回 null。
     // “我”是四个标签中唯一顶部没有搜索按钮的页面；聊天列表里的“微信号：xxx”不会被误认为当前账号。
     function accountOnMePage() {
@@ -439,12 +492,12 @@ module.exports = function (config, workDir) {
         // 优先按控件编号读取
         var byId = one(id(profile.account_id));
         var found = byId && wechatIdOf(byId);
-        if (found) return { wechat_id: found, source: "控件编号" };
+        if (found) return { wechat_id: found, nickname: accountNickname(), source: "控件编号" };
         // 控件编号随微信版本失效时：在“我”页面上半部分找文字或描述符合格式的控件
         var nodes = all(textMatches(WECHAT_ID)).concat(all(descMatches(WECHAT_ID)));
         for (var i = 0; i < nodes.length; i++) {
             found = nodes[i].bounds().top < device.height * 0.5 && wechatIdOf(nodes[i]);
-            if (found) return { wechat_id: found, source: "文字匹配" };
+            if (found) return { wechat_id: found, nickname: accountNickname(), source: "文字匹配" };
         }
         return null;
     }
@@ -832,9 +885,11 @@ module.exports = function (config, workDir) {
     function scrollToLatest() {
         for (var i = 0; i < 80; i++) {
             var list = messageList();
-            if (!list || !list.scrollForward()) return;
+            if (!list) return false;
+            if (!list.scrollForward()) return true;
             sleep(300);
         }
+        return false;
     }
 
     // 在 messages 的文字消息（跳过图片、表情和系统提示）中找最后一次连续出现的 texts，返回其后第一条消息的位置；找不到返回 -1。
@@ -856,30 +911,33 @@ module.exports = function (config, workDir) {
 
     // 读取最近 limit 条消息：先滑到底部，屏幕不够时向上翻页，只有和已读部分确认重叠才拼接，结束后滑回底部。
     // until 是电脑已记录的最后几条消息，读到它们就停止（之前的消息电脑已有）。
+    // 仅新增模式（readHistory 为 false）不受 limit 限制，只在有 until 时向上翻，最多 NEW_ONLY_MAX_PAGES 页：
+    // 两次读取之间新消息多、上次读到的已被挤出屏幕时翻回去，避免接不上而整批跳过。
     // 很长的消息一屏放不下，翻一页可能没有新消息，此时继续翻；列表报告不能再向上滚动才算到了最早。
     // options：limit 条数；until 已记录的最后几条文字；originals 最多取几张原图（只取 until 之后的新图片）；tag 原图文件名前缀。
     function readMessages(name, options) {
+        var allowHistory = options.readHistory !== false;
         var limit = options.limit,
             until = options.until || [];
         // 核对聊天后滑到底部，从最新的消息开始读
         verifyChat(name);
-        scrollToLatest();
+        if (!scrollToLatest()) fail("LATEST_NOT_REACHED", "未能到达聊天底部，保留待读取状态");
         // 滑到底部是自己的操作，和滑动前的屏幕接不上是正常的（例如进入时停在较早的未读位置）。
         // 改用底部这一屏作为读完后核对的基准：读完滑回底部后，两屏应当接得上。
         entered.screen = visibleMessages(null);
         var budget = newBudget();
         var messages = visibleMessages(budget),
             pages = 0,
-            stopReason = "limit_reached";
+            stopReason = allowHistory ? "limit_reached" : "new_messages_only";
         try {
             // 向上翻页，直到读够、读到已有记录、到达最早或出现异常
-            while (messages.length < limit) {
+            while (allowHistory ? messages.length < limit : until.length > 0) {
                 if (afterTexts(messages, until) >= 0) {
                     stopReason = "reached_known";
                     break;
                 }
-                if (pages >= MAX_PAGES) {
-                    stopReason = "page_cap";
+                if (pages >= (allowHistory ? MAX_PAGES : NEW_ONLY_MAX_PAGES)) {
+                    if (allowHistory) stopReason = "page_cap"; // 仅新增模式翻不回去时由电脑按缺口处理
                     break;
                 }
                 if (!canScrollUp(1000)) {
@@ -932,13 +990,26 @@ module.exports = function (config, workDir) {
             var sample = unrecognizedSample(budget.unrecognized);
             warn("UNRECOGNIZED_MESSAGES", "有 " + budget.unrecognized.length + " 处消息没能识别内容（语音、链接卡片等）" + (sample.length ? "，附近控件描述：" + sample.join("、") : ""));
         }
+        var capturedAt = new Date().toISOString();
         // 需要取原图时，只处理 until 之后的新图片
-        if (options.originals > 0) fetchOriginals(messages, Math.max(0, afterTexts(messages, until)), options.originals, options.tag);
+        if (options.originals > 0) fetchOriginals(messages, Math.max(0, afterTexts(messages, until)), options.originals, options.tag, allowHistory);
         // 读完再核对一次，确保读取期间没有被切到别的聊天
         verifyChat(name);
+        var chatKind = "unknown";
+        if (options.identifyKind) {
+            try {
+                chatKind = identifyChatKind(name);
+                if (chatKind !== "unknown") step("识别会话类型", chatKind === "group" ? "群聊" : "联系人");
+            } catch (_) {
+                // 已读消息必须保留；类型识别失败时下次读取重试。
+                warn("CHAT_KIND_UNAVAILABLE", "消息已读取，会话类型暂未识别");
+            }
+        }
         return {
-            messages: withoutPosition(messages.slice(-limit)),
-            captured_at: new Date().toISOString(),
+            chat_type: chatKind,
+            messages: withoutPosition(allowHistory ? messages.slice(-limit) : messages),
+            captured_at: capturedAt,
+            at_latest: true,
             history_pages: pages,
             stop_reason: stopReason
         };
@@ -1061,7 +1132,7 @@ module.exports = function (config, workDir) {
 
     // 为 messages[from:] 中的图片取原图，从最早的开始最多 max 张（电脑把 from 设在最早一张还没有原图的图片处）。
     // 当前在聊天底部：用屏幕内容与 messages 的重叠确定每条消息在屏幕上的位置，必要时向上翻页。
-    function fetchOriginals(messages, from, max, tag) {
+    function fetchOriginals(messages, from, max, tag, allowHistory) {
         // 选出要取原图的图片在 messages 中的位置
         var targets = [];
         for (var i = from; i < messages.length && targets.length < max; i++) {
@@ -1093,7 +1164,7 @@ module.exports = function (config, workDir) {
                 }
                 // 还有没处理的：向上翻一页，用新旧两屏的重叠更新对应关系
                 targets = remaining;
-                if (!targets.length || pages >= MAX_ORIGINAL_PAGES || !canScrollUp(1000) || !pageUp()) break;
+                if (!allowHistory || !targets.length || pages >= MAX_ORIGINAL_PAGES || !canScrollUp(1000) || !pageUp()) break;
                 pages++;
                 var older = visibleMessages(null),
                     shared = overlap(older, screen);
@@ -1114,10 +1185,23 @@ module.exports = function (config, workDir) {
         });
     }
 
+    // 只读检查当前是否在底部，不滑动用户界面；不能判断时按非底部处理。
+    function isAtLatest() {
+        var list = messageList();
+        if (!list) return false;
+        try {
+            list.refresh();
+            var actions = list.getActionList();
+            for (var i = 0; i < actions.size(); i++) if (actions.get(i).getId() === ACTION_SCROLL_FORWARD) return false;
+            return true;
+        } catch (_) { return false; }
+    }
+
     // 当前屏幕的消息快照；withImages 为 true 时附带图片缩略图。
     function snapshot(withImages) {
         return {
             messages: withoutPosition(visibleMessages(withImages ? newBudget() : null)),
+            at_latest: isAtLatest(),
             captured_at: new Date().toISOString()
         };
     }
@@ -1186,7 +1270,9 @@ module.exports = function (config, workDir) {
         }, 5000);
         if (!confirmed) failWithScreen("SEND_UNCONFIRMED", "已尝试点击发送，但未确认新增消息；请核对手机，不要直接重发");
         step("发送文字", "界面已出现新消息");
-        verifyChat(name);
+        // 已确认本聊天多了这条消息，不再比对屏幕：长消息会把旧消息挤出屏幕，比对会误报“被切换”。
+        // 只更新比对基准，供之后的操作核对
+        entered.screen = visibleMessages(null);
     }
 
     // outgoingImageCount 统计发出的图片条数，用来确认发图后多了一张。
@@ -1301,6 +1387,9 @@ module.exports = function (config, workDir) {
         var t = String(node.text() || ""),
             d = String(node.desc() || "");
         if (/未读|unread/i.test(d) || (/^\d{1,3}\+?$/.test(t) && node.bounds().width() < 100)) info.unread = true;
+        var count = /^(\d{1,3})$/.exec(t), described = /(\d{1,3})\s*(?:条)?\s*未读|未读\s*(\d{1,3})/.exec(d);
+        if (count && node.bounds().width() < 100) info.count = Math.max(info.count, Number(count[1]));
+        if (described) info.count = Math.max(info.count, Number(described[1] || described[2]));
         info.signature += t + "|" + d;
         for (var i = 0; i < node.childCount(); i++) collectRow(node.child(i), depth + 1, info);
     }
@@ -1318,9 +1407,9 @@ module.exports = function (config, workDir) {
             var row = n; // 向上找到整行：高度不超过屏幕四分之一的最外层
             for (var i = 0; i < 6 && row.parent() && row.parent().bounds().height() <= device.height / 4; i++)
                 row = row.parent();
-            var info = { unread: false, signature: "" };
+            var info = { unread: false, count: 0, signature: "" };
             collectRow(row, 0, info);
-            if (info.unread) result[chatName(label)] = info.signature;
+            if (info.unread) result[chatName(label)] = { signature: info.signature, count: info.count };
         });
         return result;
     }
@@ -1365,6 +1454,7 @@ module.exports = function (config, workDir) {
         if (!captureReady || captureFailed) reasons.push("CAPTURE_PERMISSION_REQUIRED");
         if (!profile.message_id || !profile.list_id || !profile.input_id) reasons.push("PROFILE_NOT_CALIBRATED");
         return {
+            read_history_control: true,
             ready: !reasons.length,
             reasons: reasons,
             wechat_version: version,

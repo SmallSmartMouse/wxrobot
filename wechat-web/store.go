@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -95,7 +94,7 @@ func (a *App) markMessage(conversationID string, seq int64) {
 
 // settings 表中的配置项。
 func (a *App) settingsLocked() map[string]any {
-	return map[string]any{"phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules, "forward_rules": &a.state.ForwardRules}
+	return map[string]any{"account_ai": &a.state.AccountAI, "phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules, "forward_rules": &a.state.ForwardRules, "discovery": &a.state.Discovery, "new_messages_only": &a.state.NewMessagesOnly, "account_names": &a.state.AccountNames}
 }
 
 // legacySettingsLocked 单手机版本的配置项：只读取，迁移后不再写入（保存时从数据库删除）。
@@ -258,12 +257,11 @@ func (a *App) saveLocked() error {
 			continue
 		}
 		for seq := range seqs {
-			// 消息按序号有序，二分查找；找不到说明已被删除，跳过
-			i := sort.Search(len(c.Messages), func(i int) bool { return c.Messages[i].Seq >= seq })
-			if i == len(c.Messages) || c.Messages[i].Seq != seq {
+			// 找不到说明已被删除，跳过
+			m := c.messageBySeq(seq)
+			if m == nil {
 				continue
 			}
-			m := c.Messages[i]
 			_, err = tx.Exec("INSERT OR REPLACE INTO messages("+messageColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 				conversationID, m.Seq, m.ID, m.Text, m.Direction, m.Sender, m.Kind, m.ImageHash, m.ImageError,
 				m.OriginalHash, m.OriginalError, m.OriginalTries, m.OriginalNote, m.Time, m.Gap)

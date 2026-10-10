@@ -37,15 +37,19 @@ const (
 )
 
 type State struct {
-	Phones        []*PhoneConfig           `json:"phones"`
-	Phone         PhoneConfig              `json:"config"` // 单手机版本的手机连接，启动时迁移到 Phones
-	Cursor        int64                    `json:"cursor"` // 单手机版本的事件序号，迁移到 Phones
-	Conversations map[string]*Conversation `json:"conversations"`
-	Operations    map[string]*Operation    `json:"operations"`
-	AI            AIConfig                 `json:"ai_config"`
-	AIRules       []AIRule                 `json:"ai_matches"`
-	AIJobs        map[string]*AIJob        `json:"ai_jobs"`
-	ForwardRules  []ForwardRule            `json:"forward_rules"`
+	AccountAI       map[string]AccountAIConfig `json:"account_ai,omitempty"`
+	AccountNames    map[string]string          `json:"account_names"`     // 微信号为键，昵称仅用于展示
+	NewMessagesOnly bool                       `json:"new_messages_only"` // 默认关闭，兼容已有历史读取行为
+	Phones          []*PhoneConfig             `json:"phones"`
+	Phone           PhoneConfig                `json:"config"` // 单手机版本的手机连接，启动时迁移到 Phones
+	Cursor          int64                      `json:"cursor"` // 单手机版本的事件序号，迁移到 Phones
+	Conversations   map[string]*Conversation   `json:"conversations"`
+	Operations      map[string]*Operation      `json:"operations"`
+	AI              AIConfig                   `json:"ai_config"`
+	AIRules         []AIRule                   `json:"ai_matches"`
+	AIJobs          map[string]*AIJob          `json:"ai_jobs"`
+	ForwardRules    []ForwardRule              `json:"forward_rules"`
+	Discovery       DiscoverySettings          `json:"discovery"`
 }
 
 type App struct {
@@ -58,12 +62,25 @@ type App struct {
 	listeners map[chan struct{}]bool // 网页 SSE 连接
 
 	// 以下只在内存中
-	phones      map[string]*phoneRuntime // 手机编号 → 连接状态、上报的状态、事件循环
-	running     bool                     // 服务已启动：新添加的手机立即启动事件循环和 worker
-	lastError   string                   // 最近一次需要提示的错误（例如本地数据保存失败）
-	allowRemote bool                     // 允许非回环来源地址（容器内运行时使用）
-	aiCursor    map[string]int64         // 会话 → AI 已检查到的消息序号
-	aiLastRun   map[string]time.Time     // 会话 → 上次自动生成时间
+	phones            map[string]*phoneRuntime   // 手机编号 → 连接状态、上报的状态、事件循环
+	discovered        map[string]discoveredPhone // 当前局域网发现的设备，按地址存放，不写入数据库
+	discoveryWake     chan struct{}
+	discoveryPort     int
+	discoveryError    string
+	discoveryProgress discoveryProgress
+	discoveryNonces   map[string]time.Time
+	linkFingerprint   string
+	linkPort          int
+	linkError         string
+	pairings          map[string]*phonePairing
+	links             map[string]*phoneLink
+	linkAttempts      map[string]time.Time
+	linkSlots         chan struct{}
+	running           bool                 // 服务已启动：新添加的手机立即启动事件循环和 worker
+	lastError         string               // 最近一次需要提示的错误（例如本地数据保存失败）
+	allowRemote       bool                 // 允许非回环来源地址（容器内运行时使用）
+	aiCursor          map[string]int64     // 会话 → AI 已检查到的消息序号
+	aiLastRun         map[string]time.Time // 会话 → 上次自动生成时间
 	// 转发（forward.go）
 	forwardCursor map[string]int64         // 会话 → 转发已检查到的消息序号
 	forwardSeen   map[string]time.Time     // 规则 + 原文 → 上次转发时间，用于去重
@@ -95,19 +112,28 @@ func newApp(path string) (*App, error) {
 		return nil, err
 	}
 	a := &App{
-		path:      path,
-		store:     db,
-		ctx:       context.Background(),
-		client:    &http.Client{Timeout: 35 * time.Second, Transport: &http.Transport{Proxy: nil}},
-		listeners: map[chan struct{}]bool{},
-		phones:    map[string]*phoneRuntime{},
-		aiCursor:  map[string]int64{},
-		aiLastRun: map[string]time.Time{},
+		path:            path,
+		store:           db,
+		ctx:             context.Background(),
+		client:          &http.Client{Timeout: 35 * time.Second, Transport: &http.Transport{Proxy: nil}},
+		listeners:       map[chan struct{}]bool{},
+		phones:          map[string]*phoneRuntime{},
+		discovered:      map[string]discoveredPhone{},
+		discoveryWake:   make(chan struct{}, 1),
+		discoveryPort:   defaultDiscoveryPort,
+		discoveryNonces: map[string]time.Time{},
+		pairings:        map[string]*phonePairing{},
+		links:           map[string]*phoneLink{},
+		linkAttempts:    map[string]time.Time{},
+		linkSlots:       make(chan struct{}, 32),
+		aiCursor:        map[string]int64{},
+		aiLastRun:       map[string]time.Time{},
 
 		forwardCursor: map[string]int64{},
 		forwardSeen:   map[string]time.Time{},
 		forwardStatus: map[string]forwardStatus{},
 		state: State{
+			Discovery:     defaultDiscoverySettings(),
 			Conversations: map[string]*Conversation{},
 			Operations:    map[string]*Operation{},
 			AIJobs:        map[string]*AIJob{},
@@ -125,6 +151,9 @@ func newApp(path string) (*App, error) {
 
 // normalizeLocked 整理旧版本数据，并把上次服务退出时未完成的 AI 生成标记为失败。
 func (a *App) normalizeLocked() {
+	if a.state.Discovery.IntervalSeconds == 0 {
+		a.state.Discovery = defaultDiscoverySettings()
+	}
 	if a.state.Conversations == nil {
 		a.state.Conversations = map[string]*Conversation{}
 	}
@@ -149,6 +178,7 @@ func (a *App) normalizeLocked() {
 		}
 	}
 	a.removeUnsupportedChatsLocked()
+	a.recoverLiveBaselinesLocked()
 	// 草稿模式已移除，旧数据中的草稿视为关闭。
 	for i := range a.state.AIRules {
 		if a.state.AIRules[i].Mode == "draft" {
@@ -254,15 +284,28 @@ func (a *App) commitLocked() error {
 	return err
 }
 
-// notifyLocked 通知所有网页重新拉取数据。
+// notifyLocked 通知所有网页重新拉取数据（每个 SSE 连接一个通道）。
 func (a *App) notifyLocked() {
-	// 每个 SSE 连接一个容量为 1 的通道；已有未处理的通知时跳过，避免阻塞
 	for ch := range a.listeners {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
+		wake(ch)
 	}
+}
+
+// wake 不阻塞地发出一次通知：通道（容量 1）里已有未处理的通知时跳过。
+func wake(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// newest 按创建时间从新到旧排列，只保留前 limit 个。没有元素时返回空切片（接口返回 []，不是 null）。
+func newest[T any](items []T, created func(T) string, limit int) []T {
+	if items == nil {
+		items = []T{}
+	}
+	sort.Slice(items, func(i, j int) bool { return created(items[i]) > created(items[j]) })
+	return items[:min(limit, len(items))]
 }
 
 // pruneLocked 只保留最近的已结束任务和 AI 记录，防止数据文件无限增长。
@@ -342,14 +385,15 @@ func pause(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+const dbPath = ".state/wechat.db"
+const legacy = ".state/state.json"
+
 // main 加载配置、加锁防止重复启动，然后启动后台循环和网页服务。
 func main() {
 	config, err := loadServerConfig("config.json")
 	if err != nil {
 		log.Fatal(err)
 	}
-	const dbPath = ".state/wechat.db"
-	const legacy = ".state/state.json"
 
 	// 数据目录只允许当前用户访问
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
@@ -381,6 +425,13 @@ func main() {
 	defer cancel()
 	a.ctx = ctx
 	a.allowRemote = config.AllowRemote
+	a.discoveryPort = config.DiscoveryPort
+	if config.LinkListen != "" {
+		if err = a.startPhoneListener(ctx, config.LinkListen); err != nil {
+			a.linkError = err.Error()
+			log.Printf("手机主动连接服务启动失败：%v", err)
+		}
+	}
 	// 后台循环：每台手机一个拉取事件的循环和一个执行读写任务的 worker（添加手机时随时启动），以及 AI 自动回复和转发
 	a.mu.Lock()
 	a.running = true
@@ -388,6 +439,9 @@ func main() {
 	a.mu.Unlock()
 	go a.aiLoop(ctx)
 	go a.forwardLoop(ctx)
+	if a.discoveryPort != 0 {
+		go a.discoveryLoop(ctx)
+	}
 
 	// 网页服务；退出时最多等 5 秒让进行中的请求完成
 	server := &http.Server{Addr: config.Listen, Handler: a.handler(), ReadHeaderTimeout: 5 * time.Second}

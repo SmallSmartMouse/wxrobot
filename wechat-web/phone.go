@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -19,21 +21,24 @@ import (
 // Operation 是一次读取或发送任务。ID 由网页生成，同时作为手机任务的 Idempotency-Key，
 // 因此服务重启后重新提交也不会让手机重复执行。
 type Operation struct {
-	ID             string `json:"id"`
-	ConversationID string `json:"conversation_id"`
-	Kind           string `json:"kind"` // read | send
-	Text           string `json:"text,omitempty"`
-	ImageHash      string `json:"image_hash,omitempty"`
-	Limit          int    `json:"limit,omitempty"`
-	Auto           bool   `json:"auto,omitempty"`         // 自动发起的读取
-	Reason         string `json:"reason,omitempty"`       // 自动读取原因：notification | schedule | originals | deep
-	ForwardRule    string `json:"forward_rule,omitempty"` // 转发任务：规则编号
-	ForwardFrom    string `json:"forward_from,omitempty"` // 转发任务：源会话编号
-	Status         string `json:"status"`                 // queued | running | succeeded | failed | unknown
-	Error          string `json:"error,omitempty"`
-	PhoneTaskID    string `json:"phone_task_id,omitempty"`
-	PhoneID        string `json:"phone_id,omitempty"` // 执行这个任务的手机：开始执行时确定，服务重启后仍向同一台手机查询
-	Created        string `json:"created"`
+	RequestedPhoneID string `json:"requested_phone_id,omitempty"`
+	Account          string `json:"account,omitempty"`
+	NewMessagesOnly  bool   `json:"new_messages_only,omitempty"` // 实际提交给手机的读取模式
+	ID               string `json:"id"`
+	ConversationID   string `json:"conversation_id"`
+	Kind             string `json:"kind"` // read | send
+	Text             string `json:"text,omitempty"`
+	ImageHash        string `json:"image_hash,omitempty"`
+	Limit            int    `json:"limit,omitempty"`
+	Auto             bool   `json:"auto,omitempty"`         // 自动发起的读取
+	Reason           string `json:"reason,omitempty"`       // 自动读取原因：notification | schedule | originals | deep
+	ForwardRule      string `json:"forward_rule,omitempty"` // 转发任务：规则编号
+	ForwardFrom      string `json:"forward_from,omitempty"` // 转发任务：源会话编号
+	Status           string `json:"status"`                 // queued | running | succeeded | failed | unknown
+	Error            string `json:"error,omitempty"`
+	PhoneTaskID      string `json:"phone_task_id,omitempty"`
+	PhoneID          string `json:"phone_id,omitempty"` // 执行这个任务的手机：开始执行时确定，服务重启后仍向同一台手机查询
+	Created          string `json:"created"`
 	// 手机上报的执行记录：耗时、步骤，以及降级（操作完成了但用了不太可靠的办法，例如标题改用 OCR 核对）。
 	DurationMS int64         `json:"duration_ms,omitempty"`
 	Steps      []TaskStep    `json:"steps,omitempty"`
@@ -52,6 +57,11 @@ type TaskWarning struct {
 	Message string `json:"message"`
 }
 
+// recentOperationsLocked 最近的 limit 个任务，新的在前。
+func (a *App) recentOperationsLocked(limit int) []*Operation {
+	return newest(slices.Collect(maps.Values(a.state.Operations)), func(op *Operation) string { return op.Created }, limit)
+}
+
 // active 表示任务还没结束（排队中或执行中）。
 func (op *Operation) active() bool { return op.Status == "queued" || op.Status == "running" }
 
@@ -60,12 +70,14 @@ func (op *Operation) active() bool { return op.Status == "queued" || op.Status =
 //   - unread_chat：首页出现新的未读会话
 //   - visible_snapshot：当前打开的聊天内容有变化
 type PhoneEvent struct {
-	Seq      int64           `json:"seq"`
-	Kind     string          `json:"kind"`
-	Account  string          `json:"account"` // 事件发生时手机登录的微信号（旧版手机桥没有）
-	Chat     string          `json:"chat"`
-	Text     string          `json:"text"`
-	Snapshot json.RawMessage `json:"snapshot"`
+	Seq         int64           `json:"seq"`
+	UnreadCount int             `json:"unread_count"`
+	ReceivedAt  string          `json:"received_at"`
+	Kind        string          `json:"kind"`
+	Account     string          `json:"account"` // 事件发生时手机登录的微信号（旧版手机桥没有）
+	Chat        string          `json:"chat"`
+	Text        string          `json:"text"`
+	Snapshot    json.RawMessage `json:"snapshot"`
 }
 
 // phoneError 表示手机返回了 HTTP 错误（请求已送达，但被拒绝）。
@@ -80,6 +92,16 @@ func (e *phoneError) Error() string { return e.Message }
 // phoneRequest 调用手机桥接口：body 不为空时以 JSON 发送，key 不为空时作为 Idempotency-Key，
 // 成功时把响应解析到 out。网络不通返回普通错误；手机返回 HTTP 错误时返回 *phoneError。
 func (a *App) phoneRequest(ctx context.Context, cfg PhoneConfig, method, path string, body any, key string, out any) error {
+	if cfg.Transport == "reverse" {
+		response, err := a.reverseRequest(ctx, cfg, method, path, body, key)
+		if err != nil {
+			return err
+		}
+		if out != nil && json.Unmarshal(response.Body, out) != nil {
+			return errors.New("手机返回的数据格式无效")
+		}
+		return nil
+	}
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -239,10 +261,21 @@ func (a *App) ingestLocked(p *PhoneConfig, e PhoneEvent) {
 	c := a.conversationLocked(account, e.Chat)
 	switch e.Kind {
 	case "notification":
+		c.LiveSignal = true
+		c.LiveSignalAt = e.ReceivedAt
+		if e.Text != "" {
+			c.LiveNotices = append(c.LiveNotices, e.Text)
+			c.LiveNotices = c.LiveNotices[max(0, len(c.LiveNotices)-20):]
+		}
 		c.Preview = e.Text
 		c.Updated = now()
 		c.NeedsRead = true
 	case "unread_chat":
+		c.LiveSignal = true
+		c.LiveSignalAt = e.ReceivedAt
+		if e.UnreadCount > 0 {
+			c.LiveUnread = max(c.LiveUnread, e.UnreadCount)
+		}
 		c.NeedsRead = true
 	case "visible_snapshot":
 		a.mergeLocked(c, e.Snapshot, false)
@@ -285,10 +318,7 @@ func (a *App) worker(ctx context.Context, phoneID string) {
 // wakeWorker 唤醒所有手机的 worker 立即检查任务；已有未处理的唤醒时不重复发送。调用前须持有锁。
 func (a *App) wakeWorker() {
 	for _, rt := range a.phones {
-		select {
-		case rt.wake <- struct{}{}:
-		default:
-		}
+		wake(rt.wake)
 	}
 }
 
@@ -316,6 +346,9 @@ func (a *App) nextOperation(phoneID string) string {
 		return ""
 	}
 	next.PhoneID = phoneID
+	if c := a.state.Conversations[next.ConversationID]; c != nil && next.Account == "" {
+		next.Account = c.Account
+	}
 	return next.ID
 }
 
@@ -351,13 +384,16 @@ func (a *App) scheduleAutoRead(phoneID string) bool {
 		if !p.owns(c) {
 			continue
 		}
+		if retryAt, err := time.Parse(time.RFC3339Nano, c.ReadRetryAt); err == nil && time.Now().Before(retryAt) {
+			continue
+		}
 		last, _ := time.Parse(time.RFC3339Nano, c.LastRead)
 		reason := ""
 		if c.NeedsRead && time.Since(last) >= triggerReadGap {
 			reason = "notification"
 		} else if c.ReadEvery > 0 && time.Since(last) >= time.Duration(c.ReadEvery)*time.Second {
 			reason = "schedule"
-		} else if c.OriginalsDue && time.Since(last) >= originalsReadGap {
+		} else if !a.state.NewMessagesOnly && c.OriginalsDue && time.Since(last) >= originalsReadGap {
 			reason = "originals"
 		}
 		better := pick == nil ||
@@ -373,11 +409,24 @@ func (a *App) scheduleAutoRead(phoneID string) bool {
 	// 有已记录的文字作停止点时直接按 100 条读：手机读到它们就停，新消息少时不会多翻页；
 	// 新消息多时一次读完，不必先读 30 条接不上、再从头读 100 条。
 	limit := shallowRead
-	if len(autoReadUntil(pick)) > 0 {
+	if !a.state.NewMessagesOnly && len(autoReadUntil(pick)) > 0 {
 		limit = deepRead
 	}
 	a.queueReadLocked(pick, limit, pickReason)
 	return true
+}
+
+const (
+	readRetryBase = 30 * time.Second // 自动读取失败后第一次重读的等待时间，之后每次加倍
+	readRetryMax  = 10 * time.Minute
+)
+
+// retryReadLocked 安排稍后重读：自动读取失败，或有新消息提示却没读到内容。
+// 连续失败时等待时间加倍（30 秒到 10 分钟），手机脚本过旧这类不会自己恢复的错误不会每 30 秒失败一次。
+func (a *App) retryReadLocked(c *Conversation) {
+	c.ReadFailures++
+	c.NeedsRead = true
+	c.ReadRetryAt = stamp(time.Now().Add(min(readRetryBase<<min(c.ReadFailures-1, 6), readRetryMax)))
 }
 
 // queueReadLocked 为会话建立一个自动读取任务，清除“需要读取”标记并记下读取时间，然后唤醒 worker。
@@ -402,38 +451,19 @@ func (a *App) runOperation(ctx context.Context, phoneID, id string) {
 		a.mu.Unlock()
 		return
 	}
+	if op.PhoneTaskID == "" && (!p.owns(c) || (op.Account != "" && op.Account != c.Account)) {
+		a.finishLocked(op, "failed", nil, "设备当前微信号不匹配，任务未执行")
+		a.mu.Unlock()
+		return
+	}
 	cfg := *p
 	op.PhoneID = phoneID
 	kind, taskID := op.Kind, op.PhoneTaskID
-	// 组装手机任务参数：聊天名称、群聊标记、预期的微信号（手机核对，不一致时拒绝执行），再按读取 / 发图 / 发文字补充
-	body := map[string]any{"chat": c.Title}
-	if c.Account != "" {
-		body["account"] = c.Account
-	}
-	if c.Kind == "group" {
-		body["chat_type"] = "group"
-	}
-	switch {
-	case kind == "read":
-		body["limit"] = op.Limit
-		body["return_list"] = op.Auto // 自动读取后回到首页，便于继续发现其他未读会话
-		if op.Auto {
-			if c.wantsOriginals() {
-				body["originals"] = 2
-			}
-			body["until"] = autoReadUntil(c)
-		}
-	// 发图片：把本地保存的图片以 Base64 发给手机
-	case op.ImageHash != "":
-		data, err := a.readImage(op.ImageHash)
-		if err != nil {
-			a.finishLocked(op, "failed", nil, "图片文件不存在")
-			a.mu.Unlock()
-			return
-		}
-		body["image_base64"] = data
-	default:
-		body["text"] = op.Text
+	body, err := a.taskBodyLocked(op, c, phoneID)
+	if err != nil {
+		a.finishLocked(op, "failed", nil, err.Error())
+		a.mu.Unlock()
+		return
 	}
 	// 先标记为执行中并保存，服务中途退出后能识别出这是未完成的任务
 	op.Status = "running"
@@ -500,6 +530,66 @@ func (a *App) runOperation(ctx context.Context, phoneID, id string) {
 	a.finish(id, task.Status, task.Result, "")
 }
 
+// taskBodyLocked 组装提交给手机的任务参数：聊天名称、群聊标记、预期的微信号（手机核对，不一致时拒绝执行），
+// 再按读取 / 发图 / 发文字补充。返回错误时任务不能执行，不会提交给手机。
+func (a *App) taskBodyLocked(op *Operation, c *Conversation, phoneID string) (map[string]any, error) {
+	body := map[string]any{"chat": c.Title}
+	if c.Account != "" {
+		body["account"] = c.Account
+	}
+	if c.Kind == "group" {
+		body["chat_type"] = "group"
+	}
+	switch {
+	case op.Kind == "read":
+		// 读取模式在第一次提交时确定，服务重启后续查时沿用
+		if op.PhoneTaskID == "" {
+			op.NewMessagesOnly = a.state.NewMessagesOnly
+			if op.NewMessagesOnly && !a.phoneSupportsLiveReadLocked(phoneID) {
+				return nil, errors.New("手机脚本不支持仅新增模式，请更新 bridge.js 和 wechat.js")
+			}
+		}
+		body["identify_kind"] = c.Kind == "unknown" || c.Kind == ""
+		body["read_history"] = !op.NewMessagesOnly
+		body["limit"] = op.Limit
+		body["return_list"] = op.Auto // 自动读取后回到首页，便于继续发现其他未读会话
+		if op.Auto {
+			if c.wantsOriginals() && (!op.NewMessagesOnly || len(c.LiveAnchor) > 0) {
+				body["originals"] = 2
+			}
+			body["until"] = autoReadUntil(c)
+			if op.NewMessagesOnly {
+				// 仅新增模式只为翻回上次读到的位置：停在最后 1 条文字即可衔接，
+				// 要求 3 条会多翻回 2 条旧文字，在手机的翻页上限内能接住的新消息更少
+				body["until"] = lastTexts(c.LiveAnchor, 1)
+			}
+		}
+	// 发图片：把本地保存的图片以 Base64 发给手机
+	case op.ImageHash != "":
+		data, err := a.readImage(op.ImageHash)
+		if err != nil {
+			return nil, errors.New("图片文件不存在")
+		}
+		body["image_base64"] = data
+	default:
+		body["text"] = op.Text
+	}
+	return body, nil
+}
+
+// phoneSupportsLiveReadLocked 手机脚本是否支持“只读新增、不向上翻页”的读取（旧版手机桥不支持）。
+func (a *App) phoneSupportsLiveReadLocked(phoneID string) bool {
+	var capability struct {
+		Info struct {
+			ReadHistoryControl bool `json:"read_history_control"`
+		} `json:"info"`
+	}
+	if rt := a.phones[phoneID]; rt != nil {
+		_ = json.Unmarshal(rt.device, &capability)
+	}
+	return capability.Info.ReadHistoryControl
+}
+
 // downloadOriginals 下载读取结果中手机保存的原图文件（手机发送后即删除），
 // 把 original_file 换成本地的 original_hash。
 func (a *App) downloadOriginals(ctx context.Context, cfg PhoneConfig, result json.RawMessage) json.RawMessage {
@@ -536,6 +626,9 @@ func (a *App) downloadOriginals(ctx context.Context, cfg PhoneConfig, result jso
 
 // phoneDownload 从手机下载文件（原图），最多 40 MB。
 func (a *App) phoneDownload(ctx context.Context, cfg PhoneConfig, path string) ([]byte, error) {
+	if cfg.Transport == "reverse" {
+		return a.reverseDownload(ctx, cfg, path)
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", cfg.URL+path, nil)
 	if err != nil {
 		return nil, err
@@ -577,6 +670,44 @@ func lastTexts(messages []Message, n int) []string {
 		}
 	}
 	return texts
+}
+
+// mergeReadLocked 把读取成功的结果并入会话，并按结果安排后续读取（加深读取、补取原图、稍后重读）。
+// stopReason 是手机停止翻页的原因。
+func (a *App) mergeReadLocked(op *Operation, c *Conversation, result json.RawMessage, stopReason string) {
+	if !op.NewMessagesOnly && a.state.NewMessagesOnly {
+		// 历史任务完成时开关已关闭：只合并能衔接的部分，再补读底部当前屏。
+		a.mergeSnapshotLocked(c, result, false, false, true)
+		c.NeedsRead = true
+		op.Warnings = append(op.Warnings, TaskWarning{Code: "READ_MODE_CHANGED", Message: "读取模式已改变，已保留可衔接消息并安排当前屏补读"})
+		return
+	}
+	c.ReadRetryAt = ""
+	if op.NewMessagesOnly {
+		a.mergeSnapshotLocked(c, result, false, true, true)
+		// 没读到内容、需要稍后再读时 mergeSnapshotLocked 会重新安排；否则这次读取有效，退避从头计算
+		if c.ReadRetryAt == "" {
+			c.ReadFailures = 0
+		}
+		if c.ReadWarning != "" {
+			op.Warnings = append(op.Warnings, TaskWarning{Code: "LIVE_READ_GAP", Message: c.ReadWarning})
+		}
+		return
+	}
+	c.ReadFailures = 0
+	// 历史模式的读取已读到最新位置，之前的新消息提示都处理过了：清掉，免得切换到仅新增模式后被当作新的未读
+	c.LiveSignal, c.LiveUnread, c.LiveNotices = false, 0, nil
+	// 自动读取的 30 条接不上已有记录，说明期间新消息较多：先加深到 100 条再读，仍接不上才整批追加并标记缺口。
+	// 手机不是因为读满条数而停止时（翻页上限、两屏比对不上、遇到无法识别的一屏等），加深读取会在同样的地方停下，不再重读。
+	stoppedEarly := stopReason != "" && stopReason != "limit_reached"
+	deepEnough := !op.Auto || op.Limit >= deepRead || stoppedEarly
+	pendingBefore := c.firstPendingOriginal()
+	// 接不上时 mergeLocked 返回 false；deepEnough 为 true 时它已整批追加并标记缺口，不再加深读取。
+	if aligned := a.mergeLocked(c, result, deepEnough); !aligned && !deepEnough {
+		a.queueReadLocked(c, deepRead, "deep")
+	} else if aligned && c.wantsOriginals() && c.firstPendingOriginal() >= 0 && c.firstPendingOriginal() != pendingBefore {
+		c.OriginalsDue = true // 还有图片没取原图，且这次有进展：过一会儿接着读
+	}
 }
 
 // finish 加锁后调用 finishLocked。
@@ -626,6 +757,10 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 	// 按结果分别处理：失败记下原因；读取合并消息；发送合并发送后的屏幕快照
 	switch {
 	case status != "succeeded":
+		// 自动读取失败时稍后重读；手动读取失败由用户自己决定是否重试
+		if op.Kind == "read" && op.Auto && c != nil {
+			a.retryReadLocked(c)
+		}
 		if op.Error == "" {
 			op.Error = r.Message
 		}
@@ -633,17 +768,7 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 			op.Error = r.Code
 		}
 	case op.Kind == "read":
-		// 自动读取的 30 条接不上已有记录，说明期间新消息较多：先加深到 100 条再读，仍接不上才整批追加并标记缺口。
-		// 手机不是因为读满条数而停止时（翻页上限、两屏比对不上、遇到无法识别的一屏等），加深读取会在同样的地方停下，不再重读。
-		stoppedEarly := r.StopReason != "" && r.StopReason != "limit_reached"
-		deepEnough := !op.Auto || op.Limit >= deepRead || stoppedEarly
-		pendingBefore := c.firstPendingOriginal()
-		// 接不上时 mergeLocked 返回 false；deepEnough 为 true 时它已整批追加并标记缺口，不再加深读取。
-		if aligned := a.mergeLocked(c, result, deepEnough); !aligned && !deepEnough {
-			a.queueReadLocked(c, deepRead, "deep")
-		} else if aligned && c.wantsOriginals() && c.firstPendingOriginal() >= 0 && c.firstPendingOriginal() != pendingBefore {
-			c.OriginalsDue = true // 还有图片没取原图，且这次有进展：过一会儿接着读
-		}
+		a.mergeReadLocked(op, c, result, r.StopReason)
 	default:
 		// 发送后的屏幕快照接不上（发送前有没读到的消息）或补读失败时，再安排一次读取。
 		if r.SyncError != "" || len(r.Snapshot) == 0 || !a.mergeLocked(c, r.Snapshot, false) {

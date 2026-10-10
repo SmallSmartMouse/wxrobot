@@ -2,6 +2,7 @@
   "device_id": "c949c417",
   "phone_api_token": "REPLACE_WITH_PHONE_API_TOKEN_AT_LEAST_32_CHARS",
   "phone_api_port": 8766,
+  "discovery_port": 39000,
   "wechat_version": "8.0.78",
   "profile": {
     "title_id": "android:id/text1",

@@ -1,7 +1,6 @@
-"use strict";
 // 执行诊断页：数据来自 /api/debug。文本都用 textContent 展示，手机或模型返回的内容不会作为 HTML 执行。
+import { $, el, storage, hostOf } from "./common.js";
 
-const $ = (id) => document.getElementById(id);
 const STATUS = { queued: "排队", running: "执行中", succeeded: "成功", failed: "失败", unknown: "结果未知" };
 const REASONS = { notification: "通知触发", schedule: "定时", originals: "补取原图", deep: "加深读取" };
 const READY_REASONS = {
@@ -17,14 +16,6 @@ const READY_REASONS = {
 let data = null;
 let filter = "issues";
 const opened = new Set(location.hash ? [location.hash.slice(1)] : []); // 展开的任务
-
-// el 创建元素，文字用 textContent 设置。
-function el(tag, text, className) {
-    const node = document.createElement(tag);
-    if (text !== undefined && text !== null) node.textContent = text;
-    if (className) node.className = className;
-    return node;
-}
 
 // time 格式化时间：今天只显示时分秒，其他日期带月日。
 function time(value) {
@@ -67,7 +58,7 @@ function renderCards() {
     const lines = phones.map((p) => {
         const device = p.device || {};
         const info = device.info || {};
-        const name = p.phone_url.replace(/^https?:\/\//, "") + (p.account ? "（" + p.account + "）" : "");
+        const name = hostOf(p.phone_url) + (p.account ? "（" + p.account + "）" : "");
         if (!device.info) return [name + "：" + (p.error || p.connection), "bad"];
         if (!device.online) return [name + "：微信桥离线，超过 45 秒没有心跳", "bad"];
         if (!info.ready) return [name + "：未就绪，" + (info.reasons || []).map((r) => READY_REASONS[r] || r).join("、"), "warn"];
@@ -101,7 +92,7 @@ function renderCards() {
 function phoneEvents() {
     const multiple = (data.phones || []).length > 1;
     return (data.phones || [])
-        .flatMap((p) => (p.device?.diagnostics || []).map((e) => ({ ...e, phone: multiple ? p.account || p.phone_url.replace(/^https?:\/\//, "") : "" })))
+        .flatMap((p) => (p.device?.diagnostics || []).map((e) => ({ ...e, phone: multiple ? p.account || hostOf(p.phone_url) : "" })))
         .sort((a, b) => (a.last_at < b.last_at ? -1 : 1));
 }
 
@@ -268,9 +259,7 @@ async function refresh() {
         $("log-note").textContent = data.log_error || "最后 64 KB";
         $("status").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
         // 看过诊断页后，消息台的诊断红点清零。
-        try {
-            localStorage.setItem("diag-seen-at", String(Date.now()));
-        } catch (_) {}
+        storage.set("diag-seen-at", Date.now());
     } catch (error) {
         $("status").textContent = error.message;
     } finally {

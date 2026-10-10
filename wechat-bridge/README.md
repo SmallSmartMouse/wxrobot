@@ -5,6 +5,7 @@ AutoJs6 脚本，在手机上同时提供 HTTP 接口并操作微信。电脑用
 | 文件 | 作用 |
 | --- | --- |
 | `bridge.js` | 主脚本：HTTP 接口、任务执行、消息监测；启动时先停止正在运行的旧实例 |
+| `connection.js` | 局域网 UDP 发现（回复电脑的发现请求）、WSS 主动连接、手机验证码与授权保存 |
 | `wechat.js` | 微信界面操作：打开聊天、读取消息、发送文字和图片 |
 | `deploy-phone.sh` | 电脑端部署入口 |
 | `config.example.json` | 首次部署的配置模板 |
@@ -55,14 +56,14 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 | `--no-restart` | 只更新文件 |
 | `--dry-run` | 只检查，不修改手机 |
 
-脚本上传 2 个运行文件并核对 SHA-256，保留手机上的配置，然后运行 `bridge.js`（它会先停止旧实例、等锁释放）并通过 ADB 端口转发确认就绪。不要在发送过程中部署。
+脚本上传 3 个运行文件并核对 SHA-256，保留手机上的配置，然后运行 `bridge.js`（它会先停止旧实例、等锁释放）并通过 ADB 端口转发确认就绪。不要在发送过程中部署。
 
 ### VSCode 调试
 
 1. 安装插件 AutoJs6 VSCode Extension（`003.autojs6-vscode-ext`），用 VSCode 单独打开 `wechat-bridge` 目录（插件把第一个工作区目录当作项目）。
 2. 在本目录执行 `npm install`，安装 AutoJs6 声明文件，获得 `auto`、`files`、`engines` 等全局对象的补全。
 3. 手机 AutoJs6 开启“服务端模式”或“客户端模式”，在 VSCode 命令面板执行“AutoJs6: 建立设备连接”。
-4. “运行项目”（`Alt+F6`）把 `bridge.js`、`wechat.js` 发送到 AutoJs6 的缓存目录并运行，日志显示在 VSCode 的输出面板。新实例会先停止手机上正在运行的微信桥。
+4. “运行项目”（`Alt+F6`）把 `bridge.js`、`wechat.js`、`connection.js` 发送到 AutoJs6 的缓存目录并运行，日志显示在 VSCode 的输出面板。新实例会先停止手机上正在运行的微信桥。
 
 注意：
 
@@ -72,7 +73,13 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 
 ## 配置
 
-`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准；可选 `image_id`、`sticker_id`、`sticker_desc`、`sender_id`、`account_id`）、`chat_aliases`（名称不一致时的别名）。
+`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`discovery_port`（默认 `39000`，`0` 关闭）、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准；可选 `image_id`、`sticker_id`、`sticker_desc`、`sender_id`、`account_id`）、`chat_aliases`（名称不一致时的别名）。
+
+手机桥默认监听 `39000/udp`。收到电脑 v2 广播或单播发现请求后，主动向报文来源电脑建立 WSS 连接，固定电脑证书指纹。首次弹出 6 位验证码：在网页输入此码，并在手机点击“允许这台电脑”，两端均确认后才授权。验证码有效 3 分钟，网页最多尝试 5 次，配对框显示期间暂停微信界面自动操作；无需扫码或复制 Token。未授权的电脑被拒绝或配对超时后，再次弹框的间隔从 1 分钟起每次加倍，最长 30 分钟。
+
+授权凭证和电脑上次的地址保存在 `/sdcard/wechat-bridge/trusted-computers.json`，以后按这个地址自动验证并重连，电脑关闭自动搜索也能连上（电脑换了 IP 时需要它的发现广播才能找到）。一台手机只信任一台电脑：与新电脑配对并连上后，旧电脑的授权自动删除，旧电脑需要重新配对才能再用。已授权电脑连不上时从 5 秒起加倍重试，最长 5 分钟一次，日志只记第一次中断；它换了 IP 或重新上线（收到它的广播）时马上重连。电脑撤销授权后需要重新配对。跨网段搜索由电脑端配置私有 IPv4 范围，网络必须允许电脑向手机发 UDP、手机向电脑接入端口发 TCP。电脑默认接入端口为 `8788`，可配置。
+
+旧版 v1 发现仍可回复用原有 Token 签名的设备信息，原 HTTP 接口保留。未配置 `device_id` 时生成 UUID 并保存到 `/sdcard/wechat-bridge/device-id`。UDP 监听失败不会影响 HTTP 服务，错误记录在 `bridge.log`。
 
 ## 接口
 
@@ -92,7 +99,7 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 
 - `wechat.js` 在每次操作中记录步骤和降级（`steps`、`warnings`），`bridge.js` 把它们附在任务结果的 `diagnostics` 里。
 - `bridge.js` 保留最近 50 条异常和降级事件，`GET /v1/device` 的 `diagnostics` 字段返回，电脑的诊断页展示。
-- 截图授权申请失败（例如锁屏时重启）不会让脚本退出：状态报告 `CAPTURE_PERMISSION_REQUIRED`，解锁后每分钟自动重试，并自动点系统弹窗的“立即开始”。
+- 截图授权申请失败（例如锁屏时重启）不会让脚本退出：状态报告 `CAPTURE_PERMISSION_REQUIRED`，解锁后每分钟自动重试。申请前先打开 AutoJs6，并自动点系统弹窗的“立即开始”；若系统阻止后台打开应用，请手动打开 AutoJs6，必要时允许其后台弹出界面。
   申请授权要打开 AutoJs6 的界面：MIUI 等系统需要给 AutoJs6 开启“后台弹出界面”权限，否则 AutoJs6 不在前台时申请会超时（`Start activity to request screen capture timeout`），自动重试也不会成功。没开这个权限时，用 `deploy-phone.sh` 重新部署即可（它会先把 AutoJs6 切到前台）。
 
 ## 排查
@@ -101,3 +108,15 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 - **聊天不匹配**：检查完整名称、别名、群人数后缀。
 - **发送结果未知**：先看手机，不要直接重发。
 - 手机上的 `bridge.log` 记录任务开始、结束和错误码，不含消息正文。
+
+### 最近历史消息开关
+
+网页「手机连接」中的「读取最近历史消息」默认开启，允许读取最近消息并向上翻页。关闭后对所有手机和会话生效：读取聊天底部当前一屏，消息和原图均不回翻，也不自动加深读取。已有会话沿用已读边界；新会话根据未读数量或通知定位增量，无新消息提示时首次读取才建立基准。当前屏无法衔接时保留内容并标记缺口，不回翻补漏；不确定批次不触发自动回复或转发。设置和基准保存在电脑端，重启后保留，已有记录不删除。切换从下一次读取生效，执行中的结果保留可衔接增量并按需补读当前屏。旧手机桥不支持此模式时会提示更新脚本。
+
+账号识别同时读取“我”页面的微信名，并以 `info.account.nickname` 上报。微信 8.0.78 默认昵称控件为 `com.tencent.mm:id/kbb`，其他版本可通过 `profile.nickname_id` 校准。昵称只用于展示，任务中的 `account` 仍必须是微信号。
+
+读取任务携带 `identify_kind: true` 时，读完消息后打开「聊天信息」，根据微信的 `SingleChatInfoUI`（个人）或 `ChatroomInfoUI`（群聊）页面标识返回 `chat_type`，随后返回聊天。未知页面保持 `unknown`，识别失败不丢弃已读消息。电脑只对待分类会话请求识别；手机不会在后台监测中跳转详情页。
+
+### 连接后自动准备微信
+
+电脑授权连接成功后，手机端会安排在空闲时打开微信并重新识别微信号，已有任务执行期间不插入界面操作。指定 Activity 启动未成功时，会使用系统应用启动入口重试。锁屏、后台弹出界面权限或系统权限弹窗仍可能阻止启动；这些原因会显示在 Web 消息台、设备详情和诊断页。处理后可点击“打开微信并重新识别”。此行为需要一起更新 `bridge.js`、`connection.js` 和 `wechat.js`，然后重启手机端服务。

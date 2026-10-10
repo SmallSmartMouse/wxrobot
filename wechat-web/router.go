@@ -23,11 +23,20 @@ func (a *App) handler() http.Handler {
 
 	api := r.Group("/api")
 	api.GET("/state", a.getState)
+	api.POST("/reading", a.setReadingSettings)
+	api.POST("/system-settings", a.setSystemSettings)
 	api.GET("/debug", a.getDebug)
 	api.GET("/stream", a.stream)
 	api.POST("/phones", a.addPhone)
+	api.POST("/phones/discover", a.discoverPhones)
+	api.POST("/phones/pair", a.pairPhone)
+	api.GET("/discovery", a.getDiscoverySettings)
+	api.POST("/discovery", a.setDiscoverySettings)
+	api.POST("/pairings/:id/verify", a.verifyPhonePairing)
+	api.POST("/pairings/:id/cancel", a.cancelPhonePairing)
 	api.POST("/phones/:id", a.updatePhone)
 	api.POST("/phones/:id/delete", a.deletePhone)
+	api.POST("/phones/:id/name", a.renamePhone)
 	api.POST("/phones/:id/refresh-account", a.refreshPhoneAccount)
 
 	api.POST("/conversations", a.createConversation)
@@ -43,9 +52,13 @@ func (a *App) handler() http.Handler {
 
 	api.GET("/ai/config", a.getAIConfig)
 	api.POST("/ai/config", a.setAIConfig)
+	api.GET("/ai/accounts/:account", a.getAccountAI)
+	api.POST("/ai/accounts/:account", a.setAccountAI)
 
 	api.GET("/forward", a.getForward)
 	api.POST("/forward", a.setForward)
+	api.POST("/forward/rule", a.saveForwardRule)
+	api.POST("/forward/:id/delete", a.deleteForwardRule)
 
 	api.POST("/media", a.uploadMedia)
 	api.GET("/media/:hash", a.getMedia)
@@ -137,26 +150,41 @@ func (a *App) getState(c *gin.Context) {
 	for _, conv := range a.state.Conversations {
 		summary := *conv
 		summary.Messages = nil
+		summary.LiveAnchor = nil
+		summary.LiveNotices = nil
 		conversations = append(conversations, summary)
 	}
 	sort.Slice(conversations, func(i, j int) bool { return conversations[i].Updated > conversations[j].Updated })
 
-	// 任务按创建时间倒序，只取最近 50 个
-	operations := make([]*Operation, 0, len(a.state.Operations))
-	for _, op := range a.state.Operations {
-		summary := *op
-		summary.Steps = nil // 步骤明细只在诊断页显示
-		operations = append(operations, &summary)
+	// 最近 50 个任务，新的在前；步骤明细只在诊断页显示
+	operations := a.recentOperationsLocked(50)
+	listed := map[string]bool{}
+	for _, op := range operations {
+		listed[op.ID] = true
 	}
-	sort.Slice(operations, func(i, j int) bool { return operations[i].Created > operations[j].Created })
-	operations = operations[:min(len(operations), 50)]
+	for _, op := range a.state.Operations {
+		if op.active() && !listed[op.ID] {
+			operations = append(operations, op)
+		}
+	}
+	for i, op := range operations {
+		summary := *op
+		summary.Steps = nil
+		operations[i] = &summary
+	}
 
 	c.JSON(200, gin.H{
-		"conversations": conversations,
-		"operations":    operations,
-		"phones":        a.phoneViewsLocked(),
-		"accounts":      a.accountsLocked(),
-		"error":         a.lastError,
+		"read_history":      !a.state.NewMessagesOnly,
+		"conversations":     conversations,
+		"operations":        operations,
+		"phones":            a.phoneViewsLocked(),
+		"discovered_phones": a.discoveryViewsLocked(),
+		"discovery_enabled": a.discoveryEnabledLocked(),
+		"discovery_error":   a.discoveryError,
+		"discovery":         a.discoverySettingsViewLocked(),
+		"pairings":          a.pairingViewsLocked(),
+		"accounts":          a.accountsLocked(),
+		"error":             a.lastError,
 	})
 }
 
@@ -336,6 +364,7 @@ func (a *App) createOperation(kind string) gin.HandlerFunc {
 // addOperation 校验参数并建立 kind（read 或 send）任务，交给 worker 执行。
 func (a *App) addOperation(c *gin.Context, kind string) {
 	var body struct {
+		PhoneID   string `json:"phone_id"`
 		Text      string `json:"text"`
 		ImageHash string `json:"image_hash"`
 		Limit     int    `json:"limit"`
@@ -373,20 +402,22 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 	if conv == nil {
 		return
 	}
-	op := &Operation{ID: key, ConversationID: conv.ID, Kind: kind, Text: body.Text, ImageHash: body.ImageHash, Limit: body.Limit, Status: "queued", Created: now()}
+	op := &Operation{RequestedPhoneID: body.PhoneID, Account: conv.Account, ID: key, ConversationID: conv.ID, Kind: kind, Text: body.Text, ImageHash: body.ImageHash, Limit: body.Limit, Status: "queued", Created: now()}
 	// 同一请求编号已经提交过：内容相同就返回原任务（网页重试不会重复发送），不同则拒绝
 	if old := a.state.Operations[key]; old != nil {
-		if old.ConversationID != op.ConversationID || old.Kind != op.Kind || old.Text != op.Text || old.ImageHash != op.ImageHash || old.Limit != op.Limit {
+		if old.ConversationID != op.ConversationID || old.Kind != op.Kind || old.Text != op.Text || old.ImageHash != op.ImageHash || old.Limit != op.Limit || old.RequestedPhoneID != op.RequestedPhoneID {
 			fail(c, 409, "请求编号已用于不同内容")
 			return
 		}
 		c.JSON(202, old)
 		return
 	}
-	if a.phoneForLocked(conv) == nil {
-		fail(c, 409, "这个会话的账号当前没有连接的手机")
+	device := a.selectDeviceLocked(conv, body.PhoneID)
+	if device == nil {
+		fail(c, 409, "所选设备不可用或微信号不匹配，请检查连接")
 		return
 	}
+	op.PhoneID = device.ID
 	// 保存成功后才唤醒 worker 执行
 	a.state.Operations[key] = op
 	if err := a.commitLocked(); err != nil {
@@ -456,9 +487,14 @@ func (a *App) setAIConfig(c *gin.Context) {
 	if cfg.Key == "" {
 		cfg.Key = a.state.AI.Key // 留空表示保留原密钥
 	}
-	a.state.AI = cfg
-	a.state.AIRules = body.Rules
-	a.saved(c, gin.H{"ok": true})
+	oldConfig, oldRules := a.state.AI, a.state.AIRules
+	a.state.AI, a.state.AIRules = cfg, body.Rules
+	if err := a.commitLocked(); err != nil {
+		a.state.AI, a.state.AIRules = oldConfig, oldRules
+		fail(c, 500, "保存失败")
+		return
+	}
+	c.JSON(200, gin.H{"ok": true})
 }
 
 // setConversationAI 设置单个会话的回复方式；mode 为 inherit 时改回跟随名称规则。

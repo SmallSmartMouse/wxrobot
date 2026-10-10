@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>微信消息台</title>
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/workspace.css">
 </head>
 <body>
 <div class="app">
@@ -14,18 +15,18 @@
       <span class="system-icon" aria-hidden="true">☰</span><span class="system-label">系统</span>
     </button>
     <nav class="system-nav">
-      <a id="diag-link" class="system-item" href="/debug.html" title="执行诊断">
-        <span class="system-icon" aria-hidden="true">诊</span><span class="system-label">执行诊断</span>
+      <a id="diag-link" class="system-item" href="/debug.html" title="诊断">
+        <span class="system-icon" aria-hidden="true">诊</span><span class="system-label">诊断</span>
         <span id="diag-badge" class="alert-badge" hidden></span>
       </a>
-      <button id="settings" class="system-item" title="手机连接">
-        <span class="system-icon" aria-hidden="true">⚙</span><span class="system-label">手机连接</span>
+      <button id="settings" class="system-item" title="设备">
+        <span class="system-icon" aria-hidden="true">⚙</span><span class="system-label">设备</span>
       </button>
-      <button id="ai-settings" class="system-item" title="全局 AI">
-        <span class="system-icon" aria-hidden="true">AI</span><span class="system-label">全局 AI</span>
+      <button id="ai-settings" class="system-item" title="AI 回复">
+        <span class="system-icon" aria-hidden="true">AI</span><span class="system-label">AI 回复</span>
       </button>
-      <button id="forward-settings" class="system-item" title="消息转发">
-        <span class="system-icon" aria-hidden="true">转</span><span class="system-label">消息转发</span>
+      <button id="forward-settings" class="system-item" title="转发">
+        <span class="system-icon" aria-hidden="true">转</span><span class="system-label">转发</span>
       </button>
     </nav>
   </aside>
@@ -48,6 +49,7 @@
       <div class="search-box"><span>⌕</span><input id="search" placeholder="搜索联系人或群聊" autocomplete="off"></div>
       <button id="new-chat" class="icon-button" title="新建会话">＋</button>
     </div>
+    <div id="list-account" class="list-account"></div>
     <nav class="filters">
       <button class="selected" data-filter="all">全部</button>
       <button data-filter="person">联系人</button>
@@ -72,6 +74,7 @@
         <div class="chat-title">
           <h1 id="chat-title"></h1>
           <div id="chat-note" class="chat-note"></div>
+          <details id="read-gap-note" class="read-gap-note" hidden><summary id="read-gap-summary">读取有提示</summary><p id="read-gap-detail" role="status"></p></details>
         </div>
         <div class="read-control">
           <button id="read" class="text-button" title="从手机读取最近的消息">↻ 读取</button>
@@ -102,10 +105,40 @@
 <!-- 手机连接：可以连接多台手机，每台手机登录一个微信账号 -->
 <dialog id="settings-dialog">
   <div class="dialog-heading"><h2>手机连接</h2><button type="button" class="icon-button close-dialog">×</button></div>
-  <p class="muted">每台手机运行一个微信桥，登录一个微信账号。手机与电脑在同一网络；手机识别出微信号后，会话按账号分开保存。</p>
+  <p class="muted">自动寻找手机。首次在这里输入手机显示的验证码，并在手机确认授权；以后会自动重连。</p>
+  <section class="reading-settings" aria-labelledby="reading-title">
+    <label class="reading-toggle" for="read-history"><span><strong id="reading-title">读取最近历史消息</strong></span><input id="read-history" type="checkbox" role="switch" aria-describedby="reading-hint"></label>
+    <p id="reading-hint" class="muted"></p>
+    <div id="reading-status" role="status" aria-live="polite"></div>
+  </section>
+  <details id="discovery-settings" class="discovery-settings">
+    <summary>搜索范围与频率 <span id="discovery-summary" class="muted"></span></summary>
+    <form id="discovery-form">
+      <label class="discovery-toggle"><input id="discovery-enabled" type="checkbox"> 定时自动搜索</label>
+      <label class="discovery-toggle"><input id="discovery-local" type="checkbox"> 搜索电脑所在的本地网络</label>
+      <label class="field">搜索间隔<select id="discovery-interval"><option value="10">10 秒</option><option value="30">30 秒（推荐）</option><option value="60">1 分钟</option><option value="120">2 分钟</option><option value="300">5 分钟</option></select></label>
+      <h3>跨网段搜索</h3>
+      <p class="muted">添加手机所在的网段。电脑会向范围内的地址发送 UDP 发现请求，需要网络允许两端互通。</p>
+      <div class="network-add">
+        <input id="network-address" aria-label="网段地址" placeholder="例如 172.25.145.0" autocomplete="off" spellcheck="false">
+        <select id="network-prefix" aria-label="网段大小"><option value="24">/24 · 256 个地址</option><option value="23">/23 · 512 个地址</option><option value="22">/22 · 1,024 个地址</option><option value="32">/32 · 单个地址</option></select>
+        <button type="button" id="network-add" class="secondary">添加</button>
+      </div>
+      <div id="network-list" class="network-list"></div>
+      <div class="network-budget"><span id="network-count">0 / 4,096 个地址</span><span class="muted">每个网段最多 1,024 · 最多 8 个网段</span></div>
+      <progress id="network-budget" max="4096" value="0" aria-label="搜索范围用量"></progress>
+      <div id="discovery-form-error" class="form-error" role="alert"></div>
+      <div class="dialog-actions"><button id="discovery-save" class="primary" type="submit">保存搜索设置</button></div>
+    </form>
+  </details>
+  <div class="dialog-heading"><h3>附近的手机</h3><button type="button" id="phone-discover" class="secondary">重新搜索</button></div>
+  <p id="discovery-status" class="muted" role="status"></p>
+  <div id="phone-pairings" class="pairing-list" aria-live="polite"></div>
+  <div id="discovered-phones" class="phone-list"></div>
   <div id="phone-list" class="phone-list"></div>
+  <details id="manual-phone" class="manual-phone"><summary>旧版手机 / 手动连接</summary>
   <form id="settings-form" class="phone-form">
-    <h3 id="phone-form-title">添加手机</h3>
+    <h3 id="phone-form-title">手动添加手机</h3>
     <label class="field">手机 IP 或地址
       <input id="phone-url" placeholder="192.168.0.186 或 http://192.168.0.186:8766" required>
     </label>
@@ -115,9 +148,10 @@
     <div id="settings-error" class="form-error"></div>
     <div class="dialog-actions">
       <button type="button" id="phone-cancel-edit" class="secondary" hidden>取消修改</button>
-      <button type="submit" class="primary">保存</button>
+      <button type="submit" id="phone-save" class="primary">保存</button>
     </div>
   </form>
+  </details>
 </dialog>
 
 <dialog id="new-dialog">
@@ -139,41 +173,10 @@
 </dialog>
 
 <!-- 全局 AI 设置：模型 + 名称规则 -->
-<dialog id="ai-dialog">
-  <form id="ai-form">
-    <div class="dialog-heading"><h2>全局 AI 设置</h2><button type="button" class="icon-button close-dialog">×</button></div>
-    <p class="muted">兼容 OpenAI Chat Completions 的接口。开启回复的会话会把最近 20 条消息发给该服务。</p>
-    <label class="field">接口地址<input id="ai-url" placeholder="https://你的服务地址/v1" required></label>
-    <label class="field">模型名称<input id="ai-model" required></label>
-    <label class="field">API 密钥<input id="ai-key" type="password" autocomplete="new-password"></label>
-    <label class="field">角色提示词<textarea id="ai-prompt" rows="3"></textarea></label>
-    <label class="field"><span><input id="ai-vision" type="checkbox"> 把聊天图片缩略图发给模型</span></label>
-    <h3>按名称匹配的回复规则</h3>
-    <p class="muted">从上到下第一条匹配的生效，会话单独设置优先。通配符 * 匹配任意字符、? 匹配单个字符；正则使用 Go RE2 语法。</p>
-    <div id="ai-rules"></div>
-    <button type="button" id="ai-rule-add" class="text-button">添加规则</button>
-    <div id="ai-error" class="form-error"></div>
-    <div class="dialog-actions">
-      <button type="button" class="secondary close-dialog">取消</button>
-      <button type="submit" class="primary">保存</button>
-    </div>
-  </form>
-</dialog>
+<section id="ai-dialog" hidden></section>
 
 <!-- 消息转发：源会话的来信按过滤条件转发到其他群或联系人 -->
-<dialog id="forward-dialog">
-  <form id="forward-form">
-    <div class="dialog-heading"><h2>消息转发</h2><button type="button" class="icon-button close-dialog">×</button></div>
-    <p class="muted">源会话收到新来信后，满足过滤条件的由目标会话账号的手机逐条发出。只转发保存之后读到的来信，自己发的、表情包和系统提示不转发。<br>源群需要能收到通知，或在会话设置里开启定时读取，否则读不到新消息。</p>
-    <div id="forward-rules"></div>
-    <button type="button" id="forward-add" class="text-button">＋ 添加规则</button>
-    <div id="forward-error" class="form-error"></div>
-    <div class="dialog-actions">
-      <button type="button" class="secondary close-dialog">取消</button>
-      <button type="submit" class="primary">保存</button>
-    </div>
-  </form>
-</dialog>
+<section id="forward-dialog" hidden></section>
 
 <!-- 当前会话的设置：类型、自动读取、图片、AI 回复 -->
 <dialog id="chat-settings-dialog">
@@ -233,6 +236,6 @@
 </dialog>
 
 <div id="toast" class="toast" hidden></div>
-<script src="/app.js" defer></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>

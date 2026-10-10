@@ -1,4 +1,6 @@
 {
   "listen": "127.0.0.1:8787",
-  "allow_remote": false
+  "allow_remote": false,
+  "discovery_port": 39000,
+  "phone_link_listen": "0.0.0.0:8788"
 }

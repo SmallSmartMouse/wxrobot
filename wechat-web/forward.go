@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,11 +29,12 @@ const (
 
 // ForwardRule 是一条转发规则。过滤条件都为空时，源会话的所有来信（文字；开启图片时含图片）都转发。
 type ForwardRule struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Enabled bool     `json:"enabled"`
-	Sources []string `json:"sources"` // 源会话编号
-	Targets []string `json:"targets"` // 目标会话编号：群聊或联系人
+	TargetPhones map[string]string `json:"target_phones,omitempty"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Enabled      bool              `json:"enabled"`
+	Sources      []string          `json:"sources"` // 源会话编号
+	Targets      []string          `json:"targets"` // 目标会话编号：群聊或联系人
 	// 过滤：发送人名单只对群聊有意义；关键词和正则只检查文字，图片只按发送人过滤
 	Senders []string `json:"senders,omitempty"` // 只转发这些人发的（完整群昵称），空为不限
 	Include []string `json:"include,omitempty"` // 包含任意一个才转发，空为不限
@@ -104,6 +106,11 @@ func (r *ForwardRule) validate(conversations map[string]*Conversation) error {
 			return errors.New("请先在会话设置里设置转发目标的类型（联系人或群聊）：" + c.Title)
 		}
 	}
+	for target := range r.TargetPhones {
+		if !slices.Contains(r.Targets, target) {
+			return errors.New("设备策略必须属于已选择的目标会话")
+		}
+	}
 	r.Senders, r.Include, r.Exclude = splitList(r.Senders), splitList(r.Include), splitList(r.Exclude)
 	if len(r.Senders) > 100 || len(r.Include) > 100 || len(r.Exclude) > 100 {
 		return errors.New("发送人和关键词各最多 100 个")
@@ -124,7 +131,7 @@ func (r *ForwardRule) validate(conversations map[string]*Conversation) error {
 
 // accepts 判断消息是否满足规则的过滤条件（只看内容，不看方向和类型）。
 func (r *ForwardRule) accepts(m Message) bool {
-	if len(r.Senders) > 0 && !contains(r.Senders, m.Sender) {
+	if len(r.Senders) > 0 && !slices.Contains(r.Senders, m.Sender) {
 		return false
 	}
 	if m.Kind == "image" {
@@ -151,15 +158,6 @@ func (r *ForwardRule) format(c *Conversation, m Message) string {
 		text = string(runes[:2000])
 	}
 	return text
-}
-
-func contains(list []string, s string) bool {
-	for _, item := range list {
-		if item == s {
-			return true
-		}
-	}
-	return false
 }
 
 func containsAny(text string, words []string) bool {
@@ -272,13 +270,13 @@ func (a *App) forwardMessageLocked(r *ForwardRule, c *Conversation, m Message) b
 		if strings.TrimSpace(op.Text) == "" {
 			return false
 		}
-		// 去重：同一规则里相同的原文在设定时间内只转发一次
-		if r.DedupMinutes > 0 {
-			key := r.ID + "\x00" + m.Text
-			if at, ok := a.forwardSeen[key]; ok && time.Since(at) < time.Duration(r.DedupMinutes)*time.Minute {
-				return false
-			}
-			a.forwardSeen[key] = time.Now()
+	}
+	// 去重：同一规则里相同的原文在设定时间内只转发一次（图片每次截图字节不同，不去重）
+	dedupKey := ""
+	if m.Kind != "image" && r.DedupMinutes > 0 {
+		dedupKey = r.ID + "\x00" + m.Text
+		if at, ok := a.forwardSeen[dedupKey]; ok && time.Since(at) < time.Duration(r.DedupMinutes)*time.Minute {
+			return false
 		}
 	}
 	created := false
@@ -293,10 +291,23 @@ func (a *App) forwardMessageLocked(r *ForwardRule, c *Conversation, m Message) b
 			a.forwardProblemLocked(r, "「"+target.Title+"」排队中的转发过多，新消息未转发")
 		default:
 			next := op
+			next.PhoneID, next.Account = a.phoneForLocked(target).ID, target.Account
+			if requested := r.TargetPhones[targetID]; requested != "" {
+				p := a.selectDeviceLocked(target, requested)
+				if p == nil {
+					a.forwardProblemLocked(r, "指定设备不可用，未转发")
+					continue
+				}
+				next.PhoneID, next.RequestedPhoneID, next.Account = p.ID, p.ID, target.Account
+			}
 			next.ID, next.ConversationID, next.Status, next.Created = "fwd-"+randomID(), targetID, "queued", a.forwardTimeLocked()
 			a.state.Operations[next.ID] = &next
 			created = true
 		}
+	}
+	// 至少交给一个目标才算转发过；都没能转发（手机未连接、排队过多）时，之后相同的内容仍可以转发
+	if created && dedupKey != "" {
+		a.forwardSeen[dedupKey] = time.Now()
 	}
 	return created
 }
