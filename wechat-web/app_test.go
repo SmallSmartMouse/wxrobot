@@ -875,21 +875,26 @@ func TestClearHistoryOnlyLocalAndNoReimport(t *testing.T) {
 	a.mergeLocked(c, json.RawMessage(`{"messages":[{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+shared+`"}]}`), true)
 	own, _ := a.mediaPath(c.Messages[1].ImageHash)
 	common, _ := a.mediaPath(other.Messages[0].ImageHash)
-	// 有任务在执行时不能删
-	a.state.Operations["r"] = &Operation{ID: "r", ConversationID: c.ID, Kind: "read", Status: "running", Created: now()}
+	// 有读取正在执行时也可以删
+	a.state.Operations["r"] = &Operation{ID: "r", ConversationID: c.ID, Kind: "read", Limit: 100, Status: "running", Created: now()}
 	if err := a.commitLocked(); err != nil {
 		t.Fatal(err)
 	}
 	a.mu.Unlock()
-	if w := call(a, "POST", "/api/conversations/"+c.ID+"/clear", `{}`, ""); w.Code != 409 {
-		t.Fatalf("busy conversation should not be cleared: %d", w.Code)
-	}
-	a.mu.Lock()
-	a.state.Operations["r"].Status = "succeeded"
-	a.mu.Unlock()
 	if w := call(a, "POST", "/api/conversations/"+c.ID+"/clear", `{}`, ""); w.Code != 200 {
 		t.Fatalf("clear failed: %d %s", w.Code, w.Body)
 	}
+	// 删除前开始的那次读取现在才回来：屏幕上的旧消息不再导入，只追加删除之后的新消息
+	a.mu.Lock()
+	late := `{"messages":[{"text":"a","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming"},{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming"},{"text":"新","direction":"incoming"}],"stop_reason":"limit_reached"}`
+	a.finishLocked(a.state.Operations["r"], "succeeded", json.RawMessage(late), "")
+	if texts(c) != "新" || c.Unread != 1 {
+		t.Fatalf("in-flight read must not bring back cleared messages: %s unread=%d", texts(c), c.Unread)
+	}
+	// 再删一次，后面按删空的状态继续检查
+	a.clearHistoryLocked(c)
+	_ = a.commitLocked()
+	a.mu.Unlock()
 	if _, err := os.Stat(own); !os.IsNotExist(err) {
 		t.Fatal("image used only by the cleared messages should be removed")
 	}
@@ -907,10 +912,10 @@ func TestClearHistoryOnlyLocalAndNoReimport(t *testing.T) {
 	// 之后读到的屏幕里还有旧消息：只追加衔接点之后的新消息
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if strings.Join(autoReadUntil(got), ",") != "a,b" {
+	if strings.Join(autoReadUntil(got), ",") != "a,b,新" {
 		t.Fatalf("anchor should provide stop texts: %v", autoReadUntil(got))
 	}
-	screen := `{"messages":[{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming"},{"text":"c","direction":"incoming"}]}`
+	screen := `{"messages":[{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming"},{"text":"新","direction":"incoming"},{"text":"c","direction":"incoming"}]}`
 	if !b.mergeLocked(got, json.RawMessage(screen), false) {
 		t.Fatal("screen should align with the anchor")
 	}

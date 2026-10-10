@@ -240,16 +240,12 @@ func (a *App) getConversation(c *gin.Context) {
 }
 
 // clearConversation 删除会话在本地的聊天记录，只删电脑上的，手机上的微信不受影响。
-// 会话有读写任务在执行时拒绝，避免读到的消息在删除之后才并入。
+// 有读写任务在执行时也可以删：任务结果回来时和删除时留下的衔接点比对，屏幕上的旧消息不会再导入。
 func (a *App) clearConversation(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	conv := a.conversation(c)
 	if conv == nil {
-		return
-	}
-	if a.busyLocked(conv.ID) {
-		fail(c, 409, "这个会话有读写任务在执行，请完成后再删除")
 		return
 	}
 	a.clearHistoryLocked(conv)

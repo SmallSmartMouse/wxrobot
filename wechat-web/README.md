@@ -116,7 +116,7 @@ docker run -d --name wxrobot-web -p 127.0.0.1:8787:8787 -v wxrobot-data:/data gh
 | `POST /api/conversations/{id}/read` | 读取，需 `Idempotency-Key` |
 | `POST /api/conversations/{id}/send` | 发送 `text` 或 `image_hash`，需 `Idempotency-Key` |
 | `POST /api/conversations/{id}/ai` | 会话回复方式，`mode: inherit` 表示跟随名称规则 |
-| `POST /api/conversations/{id}/clear` | 删除电脑上的聊天记录和只被它们用到的图片（手机微信不受影响）；有读写任务执行中时返回 409 |
+| `POST /api/conversations/{id}/clear` | 删除电脑上的聊天记录和只被它们用到的图片（手机微信不受影响）；有读写任务执行中也可以删，任务结果按删除时留下的衔接点合并，旧消息不会再导入 |
 | `GET/POST /api/ai/config` | 全局 AI 设置和名称规则 |
 | `POST /api/media` | 上传 PNG/JPEG（Base64） |
 | `GET /api/media/{hash}` | 读取图片 |
