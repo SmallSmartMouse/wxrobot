@@ -247,6 +247,27 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   text-align: center;
 }
 
+/* 账号切换：每个微信号的会话分开显示 */
+.account-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px 8px;
+  color: #788f80;
+  font-size: 11px;
+}
+
+.account-switch select {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid #dceae0;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 12px;
+}
+
 .connection-card {
   display: flex;
   align-items: center;
@@ -621,6 +642,28 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   font-size: 12px;
 }
 
+.avatar.photo {
+  object-fit: cover;
+}
+
+.system-note {
+  max-width: 80%;
+  margin: 0 auto 16px;
+  color: #9aa49c;
+  font-size: 11px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.message-sender {
+  margin: 0 0 3px 2px;
+  overflow: hidden;
+  color: #7d8a85;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .message-content {
   min-width: 60px;
   max-width: 72%;
@@ -649,6 +692,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   margin-top: 6px;
   color: #77838b;
   font-size: 11px;
+}
+
+.bubble.sticker {
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+
+.bubble.sticker .chat-image {
+  max-width: 140px;
+  max-height: 140px;
 }
 
 .chat-image {
@@ -870,6 +925,118 @@ dialog h3 {
   color: var(--error-ink);
   font-size: 12px;
   line-height: 1.6;
+}
+
+.danger-zone {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid #f0d6d3;
+  border-radius: 10px;
+  background: var(--error-bg);
+}
+
+.danger-zone strong {
+  color: var(--error-ink);
+  font-size: 13px;
+}
+
+.danger {
+  flex: none;
+  padding: 8px 16px;
+  border: 1px solid var(--error-ink);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--error-ink);
+  font-size: 12px;
+}
+
+.danger:hover {
+  background: var(--error-ink);
+  color: #fff;
+}
+
+.danger:disabled {
+  opacity: 0.5;
+}
+
+/* 手机连接对话框：手机列表 + 添加 / 修改表单 */
+#settings-dialog {
+  width: 560px;
+}
+
+.phone-list {
+  margin-top: 14px;
+}
+
+.phone-list .empty-list {
+  padding: 16px 12px;
+}
+
+.phone-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 4px;
+  border-bottom: 1px solid #edf2ee;
+}
+
+.phone-copy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  margin-left: 4px;
+}
+
+.phone-copy strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 窄屏：按钮换到地址下面一行，靠右 */
+@media (max-width: 560px) {
+  .phone-row {
+    flex-wrap: wrap;
+  }
+
+  .phone-copy {
+    flex-basis: calc(100% - 24px);
+  }
+
+  .phone-row .text-button:first-of-type {
+    margin-left: auto;
+  }
+}
+
+.phone-copy small {
+  overflow: hidden;
+  color: #7d8a85;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.danger-text {
+  color: var(--error-ink);
+}
+
+.danger-text:hover {
+  background: var(--error-bg);
+}
+
+.phone-form {
+  margin-top: 16px;
+  padding-top: 4px;
+}
+
+.phone-form h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
 }
 
 .dialog-actions {

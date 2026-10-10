@@ -24,12 +24,16 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
   GET  /v1/events      ◄── 事件队列 ◄── 监测：首页未读 / 当前聊天变化  ◄──┘
 ```
 
-- **同一时刻最多一个排队任务**，界面操作完全串行。手机长时间未就绪时，排队超过 60 秒的任务标记失败（未执行，可安全重试）。
+- **同一时刻最多一个排队任务**，界面操作完全串行。手机长时间未就绪时，排队超过 60 秒的任务标记失败（未执行，可安全重试）；排队时间从前一个任务结束时算起。
+- 读取时最多向上翻 20 页；读完为取原图回头找图片时最多翻 8 页。判断能否继续向上翻之前先刷新列表控件（无障碍缓存的旧信息曾让刚进入的聊天误报“已到最早”）。
 - **任务和事件只在内存中。** 脚本重启后电脑查询不到原任务，发送会被电脑标记为“结果未知”，不会重发。
 - **发送只点击一次。** 点击前核对聊天标题、输入内容；点击后出错一律报告 `unknown`。
 - 打开聊天的顺序：已在目标聊天 → 首页最近会话 → 全局搜索；结果不唯一就停止。
 - **确认聊天对象**：当前微信（8.0.78）的聊天页不向无障碍服务提供标题控件，所以不在进入后识别标题，而是在进入前确认：首页会话列表或搜索结果中名称完全一致且唯一的那一项，点击它进入。进入后记下屏幕上的消息，点发送前和读取前后确认当前屏幕仍能和它接上（新消息把旧的挤上去也算接上），接不上说明被切到了别的聊天，立即停止（`CHAT_CHANGED`）。如果微信提供了标题控件，则优先用标题精确核对。
 - 后台监测同样只把“和最近操作的聊天接得上”的屏幕记为该聊天的快照；手机上手动打开的其他聊天不会被记错地方。
+- **消息内容**：文字（`message_id`）、图片（描述“图片”或 `image_id`）、表情包（描述匹配 `sticker_desc` 或 `sticker_id`）。每条消息按同一高度的头像判断方向，发送人名称取头像描述“xxx头像”（配置了 `sender_id` 时优先取群昵称控件）。读取时每个发送人截一次头像。有头像却没认出内容的消息记一条降级 `UNRECOGNIZED_MESSAGES`，附带附近控件的描述，用来校准。
+- **账号核对**：任务带 `account`（电脑预期的微信号）时，执行前核对，不一致报 `ACCOUNT_MISMATCH`、还没识别出报 `ACCOUNT_UNKNOWN`，都不执行；发送前识别结果超过 5 分钟先重新识别。任务结果和事件都带 `account`（当时登录的微信号）。识别成功后空闲时每 30 分钟重新识别一次。
+- **当前账号**：启动后空闲时先识别一次：回到首页（底部“微信、通讯录、发现、我”四个标签）→ 点“我” → 读 `account_id`（默认 `com.tencent.mm:id/ouv`）的“微信号：xxx”，控件编号失效时在“我”页面上半部分按同样格式匹配 → 回到“微信”标签。只在“我”页面读取（四个标签中唯一顶部没有搜索按钮的页面），不截图。失败时账号清空并记诊断，每分钟重试；结果在 `/v1/device` 的 `info.account`，`bridge.log` 记录流程、结果和耗时。
 
 ## 部署
 
@@ -68,7 +72,7 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 
 ## 配置
 
-`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准）、`chat_aliases`（名称不一致时的别名）。
+`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准；可选 `image_id`、`sticker_id`、`sticker_desc`、`sender_id`、`account_id`）、`chat_aliases`（名称不一致时的别名）。
 
 ## 接口
 
@@ -77,10 +81,11 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 | 方法和路径 | 作用 |
 | --- | --- |
 | `GET /health` | 存活检查 |
-| `GET /v1/device` | `online`（主循环 45 秒内有心跳）和 `info.ready`、`info.reasons` |
-| `POST /v1/messages/read` | `{chat, chat_type, limit, return_list}`，需要 `Idempotency-Key` |
-| `POST /v1/messages/send` | `{chat, chat_type, text}` 或 `{chat, chat_type, image_base64}`，需要 `Idempotency-Key` |
+| `GET /v1/device` | `online`（主循环 45 秒内有心跳，或正在执行未超时的任务）、`busy`（正在执行任务）和 `info.ready`、`info.reasons`、`info.account` |
+| `POST /v1/messages/read` | `{chat, chat_type, account, limit, return_list}`，需要 `Idempotency-Key` |
+| `POST /v1/messages/send` | `{chat, chat_type, account, text}` 或 `{chat, chat_type, account, image_base64}`，需要 `Idempotency-Key` |
 | `GET /v1/tasks/{id}` | 任务状态和结果；最近 50 个任务 |
+| `POST /v1/account/refresh` | 下次空闲时重新识别当前微信号（切换账号后调用） |
 | `GET /v1/events?after=&limit=&wait=` | 长轮询消息事件：`notification`、`unread_chat`、`visible_snapshot` |
 
 ## 诊断

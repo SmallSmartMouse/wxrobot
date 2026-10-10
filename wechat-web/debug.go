@@ -48,16 +48,24 @@ func (a *App) getDebug(c *gin.Context) {
 		}
 	}
 	// 日志里如果出现 Token 或密钥，替换掉再返回
-	for _, secret := range []string{a.state.Phone.Token, a.state.AI.Key} {
+	secrets := []string{a.state.AI.Key}
+	for _, p := range a.state.Phones {
+		secrets = append(secrets, p.Token)
+	}
+	for _, secret := range secrets {
 		if secret != "" {
 			logText = strings.ReplaceAll(logText, secret, "[已隐藏凭证]")
 		}
 	}
-	// 会话编号 → 名称，诊断页用来显示是哪个会话
+	// 会话编号 → 名称，诊断页用来显示是哪个会话；有多个账号时名称后面注明账号
 	titles := map[string]string{}
+	multiple := len(a.accountsLocked()) > 1
 	for id, conv := range a.state.Conversations {
 		titles[id] = conv.Title
+		if multiple && conv.Account != "" {
+			titles[id] += "（" + conv.Account + "）"
+		}
 	}
-	c.JSON(200, gin.H{"connection": a.connection, "error": a.lastError, "device": a.device, "conversations": titles,
+	c.JSON(200, gin.H{"phones": a.phoneViewsLocked(), "error": a.lastError, "conversations": titles,
 		"operations": operations, "ai_jobs": jobs, "log": logText, "log_error": logError})
 }

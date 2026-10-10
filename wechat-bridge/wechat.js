@@ -8,10 +8,20 @@ var DEFAULT_PROFILE = {
     title_id: "android:id/text1",
     contact_id: "com.tencent.mm:id/kbq",
     search_contact_id: "com.tencent.mm:id/odf",
-    avatar_id: "com.tencent.mm:id/bk1"
+    avatar_id: "com.tencent.mm:id/bk1",
+    account_id: "com.tencent.mm:id/ouv", // “我”页面的“微信号：xxx”
+    // 表情包消息的控件描述（正则）；也可以用 sticker_id 指定控件编号。
+    // 群成员昵称默认取头像控件的描述“xxx头像”；微信显示群昵称时可以用 sender_id 指定昵称控件编号，优先使用。
+    sticker_desc: "^\\[?(动画表情|表情|自定义表情)\\]?$"
 };
-var MAX_THUMBNAILS = 3; // 每次读取最多截取的图片缩略图数量
+var MAX_THUMBNAILS = 8; // 每次读取最多截取的图片、表情缩略图数量（整屏只截一次，裁剪很快）
+var AVATAR_DESC = /^(.+?)\s*的?头像$/; // 聊天页头像的描述：“张三头像”
+var WECHAT_ID = /^微信号\s*[:：]\s*([A-Za-z0-9_-]+)\s*$/; // “我”页面显示的微信号，不是内部的 wxid
+var HOME_TABS = ["微信", "通讯录", "发现", "我"];
+// 不处理的会话：公众号（旧版微信叫“订阅号消息”）是文章推送的汇总入口，不是聊天；“微信”是微信自己的系统通知。
+var IGNORED_CHATS = ["公众号", "订阅号消息", "微信"];
 var MAX_PAGES = 20; // 一次读取最多向上翻页次数
+var MAX_ORIGINAL_PAGES = 8; // 读完后为取原图回头找图片时最多向上翻页次数（电脑只要最近 10 条消息里的原图）
 // 向上翻页：手指滑过消息列表高度的 80%，用时 500 毫秒。
 // Mi Note 3（微信 8.0.78）实测：内容实际移动约 64% 屏（1006/1571 像素），没有惯性，350 毫秒内已停稳；
 // 相邻两屏保留约三分之一屏的重叠，足够比对。原来的半屏滑动实际只移动约 37% 屏。
@@ -25,7 +35,7 @@ var READ_STOP_WARNINGS = {
     unverified_overlap: "向上翻页时相邻两屏没能比对上，读取提前停止，更早的消息可能没读到",
     page_cap: "翻到 " + MAX_PAGES + " 页上限仍没读到已有记录，中间的消息可能没读到",
     scroll_failed: "消息列表滑动失败，读取提前停止",
-    empty_screen: "向上翻到的一屏没有能识别的消息（链接卡片、表情等），无法和已读部分比对，读取提前停止"
+    empty_screen: "向上翻到的一屏没有能识别的消息（链接卡片、语音等），无法和已读部分比对，读取提前停止"
 };
 
 module.exports = function (config, workDir) {
@@ -380,6 +390,94 @@ module.exports = function (config, workDir) {
         fail("HOME_NOT_FOUND", "无法返回微信消息列表，请手动打开微信首页");
     }
 
+    // ---------- 当前账号 ----------
+    // 在“我”页面读取用户可见的“微信号”（不是内部的 wxid），用于区分登录的账号。不截图、不 OCR。
+
+    // homeTabs 首页底部“微信、通讯录、发现、我”四个标签都可见时返回 {标签名: 控件}，否则返回 null。
+    function homeTabs() {
+        var tabs = {};
+        for (var i = 0; i < HOME_TABS.length; i++) {
+            var node = all(text(HOME_TABS[i])).filter(function (n) {
+                return n.bounds().top > device.height * 0.8;
+            })[0];
+            if (!node) return null;
+            tabs[HOME_TABS[i]] = node;
+        }
+        return tabs;
+    }
+
+    // backToTabs 在聊天页等有返回的页面时逐次返回，直到出现首页标签；每次返回后短间隔轮询等页面切换。
+    // 刚启动微信时其他应用（例如刚部署完的 AutoJs6）可能短暂抢回前台：微信不在前台时重新启动一次。
+    function backToTabs() {
+        var relaunched = false;
+        for (var i = 0; i < 6; i++) {
+            check();
+            if (!inWechat() && !relaunched) {
+                relaunched = true;
+                step("重新启动微信", "前台是 " + foregroundPackage());
+                launchWechat();
+            }
+            if (!inWechat()) fail("WRONG_APP", "返回首页期间微信失去前台，已停止操作");
+            var tabs = homeTabs();
+            if (tabs) return tabs;
+            back();
+            waitFor(homeTabs, 800);
+        }
+        fail("HOME_NOT_FOUND", "无法返回微信首页（没有找到底部的微信、通讯录、发现、我）");
+    }
+
+    // wechatIdOf 从控件的文字或描述中提取微信号，不符合格式返回 null。
+    function wechatIdOf(node) {
+        var m = WECHAT_ID.exec(String(node.text() || "")) || WECHAT_ID.exec(String(node.desc() || ""));
+        return m ? m[1] : null;
+    }
+
+    // accountOnMePage 在“我”页面读取微信号，不在“我”页面或读不到返回 null。
+    // “我”是四个标签中唯一顶部没有搜索按钮的页面；聊天列表里的“微信号：xxx”不会被误认为当前账号。
+    function accountOnMePage() {
+        if (!homeTabs() || one(desc("搜索"))) return null;
+        // 优先按控件编号读取
+        var byId = one(id(profile.account_id));
+        var found = byId && wechatIdOf(byId);
+        if (found) return { wechat_id: found, source: "控件编号" };
+        // 控件编号随微信版本失效时：在“我”页面上半部分找文字或描述符合格式的控件
+        var nodes = all(textMatches(WECHAT_ID)).concat(all(descMatches(WECHAT_ID)));
+        for (var i = 0; i < nodes.length; i++) {
+            found = nodes[i].bounds().top < device.height * 0.5 && wechatIdOf(nodes[i]);
+            if (found) return { wechat_id: found, source: "文字匹配" };
+        }
+        return null;
+    }
+
+    // identifyAccount 识别当前登录账号：回到首页 → 点“我” → 读微信号 → 回到“微信”标签。
+    // 识别失败时报错，不沿用之前的结果。
+    function identifyAccount() {
+        check();
+        // 1. 当前窗口必须是微信，否则启动微信
+        var root = auto.rootInActiveWindow;
+        if (!root || String(root.getPackageName()) !== PKG) {
+            step("启动微信", "当前窗口不是微信");
+            launchWechat();
+        }
+        // 2. 回到首页，点“我”，等页面切换完成并读出微信号
+        tap(backToTabs()["我"]);
+        step("打开“我”页面");
+        var found = waitFor(accountOnMePage, 3000);
+        try {
+            if (!found) fail("ACCOUNT_NOT_FOUND", "“我”页面没有找到“微信号：xxx”，可能需要校准 profile.account_id");
+            step("读取微信号", found.wechat_id + "（" + found.source + "）");
+            return found;
+        } finally {
+            // 3. 无论成功与否都回到“微信”标签
+            var tabs = homeTabs();
+            if (tabs) {
+                tap(tabs["微信"]);
+                waitFor(homeControls, 1500);
+                step("回到“微信”标签");
+            }
+        }
+    }
+
     // 用微信全局搜索打开聊天：搜索结果必须稳定且唯一。
     function searchChat(name, group, searchButton) {
         var query = searchQuery(name);
@@ -459,18 +557,65 @@ module.exports = function (config, workDir) {
 
     // ---------- 读取消息 ----------
 
-    // 文字消息的方向：看同一高度附近的头像在左侧还是右侧。
-    function direction(bounds, avatars) {
+    // 头像控件：位置和发送人名称。名称优先取群昵称控件（配置了 sender_id 时），否则取头像描述“xxx头像”。
+    function avatarsOnScreen() {
+        var labels = profile.sender_id
+            ? all(id(profile.sender_id)).filter(function (n) {
+                  return n.text();
+              })
+            : [];
+        return all(id(profile.avatar_id)).map(function (n) {
+            var b = n.bounds(),
+                named = AVATAR_DESC.exec(String(n.desc() || "")),
+                sender = named ? named[1] : "";
+            // 群昵称显示在头像旁边、与头像顶部基本齐平
+            labels.forEach(function (l) {
+                var lb = l.bounds();
+                if (Math.abs(lb.top - b.top) < 60 && side(b) === side(lb)) sender = String(l.text());
+            });
+            return { bounds: b, sender: sender, used: false };
+        });
+    }
+
+    // nearestAvatar 同一高度附近（80 像素内）的头像，没有返回 null。
+    function nearestAvatar(bounds, avatars) {
         var best = 80,
-            result = "unknown";
+            result = null;
         avatars.forEach(function (a) {
-            var distance = Math.abs(a.top - bounds.top);
+            var distance = Math.abs(a.bounds.top - bounds.top);
             if (distance < best) {
                 best = distance;
-                result = a.centerX() < device.width / 2 ? "incoming" : "outgoing";
+                result = a;
             }
         });
         return result;
+    }
+
+    // side 控件在屏幕左半边为收到的消息，右半边为发出的消息。
+    function side(bounds) {
+        return bounds.centerX() < device.width / 2 ? "incoming" : "outgoing";
+    }
+
+    // systemNotice 没有头像的文字是否为系统提示（“你的账号被限制与对方聊天”“xx撤回了一条消息”等）：
+    // 微信 8.0.78 的系统提示直接挂在消息列表下两层，普通消息外面还有一层带头像的行容器。
+    function systemNotice(node) {
+        for (var p = node.parent(), i = 0; p && i < 3; i++, p = p.parent()) {
+            if (String(p.id()) === profile.list_id) return true;
+        }
+        return false;
+    }
+
+    // withSender 记下消息旁边的头像：发送人名称和头像位置（用于截取头像）。
+    // 文字消息没有头像时方向记为 unknown；图片、表情的方向看自身位置，只采用同一侧的头像。
+    function withSender(item, bounds, avatars, byAvatar) {
+        var who = nearestAvatar(bounds, avatars);
+        if (who && !byAvatar && side(who.bounds) !== item.direction) who = null;
+        if (byAvatar) item.direction = who ? side(who.bounds) : "unknown";
+        if (!who) return item;
+        who.used = true;
+        if (who.sender) item.sender = who.sender;
+        item.avatar_bounds = who.bounds;
+        return item;
     }
 
     // 消息列表里的图片：微信 8.0.78 的图片消息是描述为“图片”、可点击的容器（里面才是 ImageView）。
@@ -485,53 +630,72 @@ module.exports = function (config, workDir) {
         );
     }
 
-    // 从整屏截图中裁剪缩略图（JPEG Base64）。
-    function attachThumbnail(item, shot, b) {
+    // 表情包消息（自定义表情、动画表情）。可以用 profile.sticker_id 指定控件编号，否则按描述 profile.sticker_desc 匹配。
+    function stickerNodes(area) {
+        var nodes = profile.sticker_id ? all(id(profile.sticker_id)) : all(descMatches(new RegExp(profile.sticker_desc)));
+        return unique(
+            nodes.filter(function (n) {
+                var b = n.bounds();
+                return b.bottom > area.top && b.top < area.bottom && b.width() > 0 && b.height() > 0;
+            })
+        );
+    }
+
+    // clipJPEG 从整屏截图中裁剪一块，返回 JPEG Base64；失败或过大返回 null。
+    function clipJPEG(shot, b, quality) {
         var crop = null;
         try {
             crop = images.clip(shot, b.left, b.top, b.width(), b.height());
-            // 缩略图尺寸受限于手机屏幕上的显示大小，压缩质量尽量高；要清晰原图请开启“取原图”。
-            var data = String(images.toBase64(crop, "jpg", 85));
-            if (data.length > 500000) item.image_error = "缩略图超过大小限制";
-            else item.thumbnail = data;
+            var data = String(images.toBase64(crop, "jpg", quality));
+            return data.length > 500000 ? null : data;
         } catch (_) {
-            item.image_error = "缩略图获取失败";
+            return null;
         } finally {
             if (crop) crop.recycle();
         }
     }
 
+    // 从整屏截图中裁剪缩略图（JPEG Base64）。
+    function attachThumbnail(item, shot, b) {
+        // 缩略图尺寸受限于手机屏幕上的显示大小，压缩质量尽量高；清晰的图片靠“取原图”。
+        var data = clipJPEG(shot, b, 92);
+        if (data) item.thumbnail = data;
+        else item.image_error = "缩略图获取失败";
+    }
+
     // 读取当前屏幕上的消息，从上到下排序。
-    // budget 为 null 时不截图；否则最多截取 budget.images 张缩略图（会递减）。
+    // budget 为 null 时不截图；否则最多截取 budget.images 张缩略图（会递减），
+    // 并为 budget.avatars 中还没有的发送人截取一次头像。
     function visibleMessages(budget) {
         var list = messageList();
         if (!list) fail("MESSAGE_LIST_MISSING", "消息列表不可用");
         var area = list.bounds(),
             result = [];
-        // 先取所有头像位置，用来判断每条文字消息是收到的还是发出的
-        var avatars = all(id(profile.avatar_id)).map(function (n) {
-            return n.bounds();
-        });
+        // 先取所有头像：位置用来判断每条消息是收到的还是发出的，描述是发送人名称
+        var avatars = avatarsOnScreen();
         // 文字消息：有文字且与消息列表区域有交集的气泡
         unique(all(id(profile.message_id))).forEach(function (n) {
             var b = n.bounds();
             if (!n.text() || b.bottom <= area.top || b.top >= area.bottom) return;
-            result.push({ text: String(n.text()), direction: direction(b, avatars), top: b.top, left: b.left });
+            var item = withSender({ text: String(n.text()), top: b.top, left: b.left }, b, avatars, true);
+            if (item.direction === "unknown" && systemNotice(n)) item.kind = "system";
+            result.push(item);
+        });
+        // 图片和表情：方向看控件在屏幕左半边还是右半边
+        var media = [];
+        imageNodes(area).forEach(function (n) {
+            media.push({ node: n, text: "[图片]", kind: "image" });
+        });
+        stickerNodes(area).forEach(function (n) {
+            media.push({ node: n, text: "[表情]", kind: "sticker" });
         });
         var shot = null;
         try {
-            // 图片消息：方向看图片在屏幕左半边还是右半边；需要时截取缩略图（整屏只截一次）
-            imageNodes(area).forEach(function (n) {
-                var b = n.bounds();
-                var item = {
-                    text: "[图片]",
-                    kind: "image",
-                    direction: b.centerX() < device.width / 2 ? "incoming" : "outgoing",
-                    top: b.top,
-                    left: b.left,
-                    bounds: [b.left, Math.max(b.top, area.top), b.right, Math.min(b.bottom, area.bottom)] // 可见部分，用于点开大图
-                };
-                // 被屏幕边缘截断的图片只记录位置，不截缩略图（翻页时会在完整显示的那一屏补上）。
+            media.forEach(function (m) {
+                var b = m.node.bounds();
+                var item = withSender({ text: m.text, kind: m.kind, direction: side(b), top: b.top, left: b.left }, b, avatars, false);
+                if (m.kind === "image") item.bounds = [b.left, Math.max(b.top, area.top), b.right, Math.min(b.bottom, area.bottom)]; // 可见部分，用于点开大图
+                // 被屏幕边缘截断的只记录位置，不截缩略图（翻页时会在完整显示的那一屏补上）。
                 var clipped = b.top <= area.top || b.bottom >= area.bottom;
                 if (!budget || clipped) {
                     // 不截图
@@ -543,6 +707,21 @@ module.exports = function (config, workDir) {
                 }
                 result.push(item);
             });
+            // 头像：每个发送人每次读取截一次（完整显示在列表区域内的才截）
+            if (budget) {
+                result.forEach(function (item) {
+                    var b = item.avatar_bounds;
+                    if (!item.sender || budget.avatars[item.sender] || !b || b.top <= area.top || b.bottom >= area.bottom) return;
+                    if (!shot) shot = capture();
+                    var data = clipJPEG(shot, b, 90);
+                    if (data) item.avatar = data;
+                    budget.avatars[item.sender] = true;
+                });
+                // 有头像却没有识别出内容的消息（语音、链接卡片、没认出的表情等），记下数量和控件描述供校准
+                avatars.forEach(function (a) {
+                    if (!a.used && a.bounds.top > area.top && a.bounds.bottom < area.bottom) budget.unrecognized.push(a.bounds);
+                });
+            }
         } finally {
             if (shot) shot.recycle();
         }
@@ -556,15 +735,41 @@ module.exports = function (config, workDir) {
     function withoutPosition(messages) {
         return messages.map(function (m) {
             var copy = {};
-            for (var key in m) if (key !== "top" && key !== "left" && key !== "bounds") copy[key] = m[key];
+            for (var key in m) if (key !== "top" && key !== "left" && key !== "bounds" && key !== "avatar_bounds") copy[key] = m[key];
             return copy;
         });
     }
 
-    // 被屏幕边缘截断的消息看不到头像，方向会是 unknown，此时只比较文字和类型。
+    // 被屏幕边缘截断的消息看不到头像，方向会是 unknown、发送人为空，此时只比较文字和类型。
     function sameMessage(a, b) {
         var sameDirection = a.direction === b.direction || a.direction === "unknown" || b.direction === "unknown";
-        return a.text === b.text && a.kind === b.kind && sameDirection;
+        var sameSender = !a.sender || !b.sender || a.sender === b.sender;
+        return a.text === b.text && a.kind === b.kind && sameDirection && sameSender;
+    }
+
+    // 图片和表情的文字是固定的“[图片]”“[表情]”，系统提示常常重复出现，都不能用来定位。
+    // 电脑端选停止点（lastTexts）时跳过同样的类型，两边必须一致。
+    function isMedia(m) {
+        return m.kind === "image" || m.kind === "sticker" || m.kind === "system";
+    }
+
+    // newBudget 一次读取的截图额度：缩略图张数、已截过头像的发送人、没识别出内容的消息位置。
+    function newBudget() {
+        return { images: MAX_THUMBNAILS, avatars: {}, unrecognized: [] };
+    }
+
+    // unrecognizedSample 没识别出内容的消息附近的控件描述（最多 3 种，每种最多 20 字），供校准控件编号。
+    function unrecognizedSample(spots) {
+        var seen = [];
+        all(descMatches(/.+/)).forEach(function (n) {
+            var b = n.bounds(),
+                d = String(n.desc()).slice(0, 20);
+            if (seen.length >= 3 || seen.indexOf(d) >= 0 || AVATAR_DESC.test(d)) return;
+            for (var i = 0; i < spots.length; i++) {
+                if (b.top >= spots[i].top - 10 && b.top < spots[i].top + 300) return seen.push(d);
+            }
+        });
+        return seen;
     }
 
     // older 的末尾与 newer 的开头重叠多少条。
@@ -598,6 +803,10 @@ module.exports = function (config, workDir) {
         while (true) {
             var list = messageList();
             if (!list) return false;
+            // 无障碍服务缓存的控件信息可能是旧的（实测进入聊天后操作列表里暂时没有“向后滚动”），先刷新
+            try {
+                list.refresh();
+            } catch (_) {}
             var actions = list.getActionList();
             for (var i = 0; i < actions.size(); i++) if (actions.get(i).getId() === ACTION_SCROLL_BACKWARD) return true;
             if (clock() >= until) return false;
@@ -628,13 +837,13 @@ module.exports = function (config, workDir) {
         }
     }
 
-    // 在 messages 的文字消息（跳过图片）中找最后一次连续出现的 texts，返回其后第一条消息的位置；找不到返回 -1。
+    // 在 messages 的文字消息（跳过图片、表情和系统提示）中找最后一次连续出现的 texts，返回其后第一条消息的位置；找不到返回 -1。
     function afterTexts(messages, texts) {
         if (!texts.length) return -1;
-        // 只在文字消息中找（图片的文字都是“[图片]”，无法区分）
+        // 只在文字消息中找（图片、表情的文字是固定的，无法区分）
         var positions = [];
         messages.forEach(function (m, i) {
-            if (m.kind !== "image") positions.push(i);
+            if (!isMedia(m)) positions.push(i);
         });
         // 从后往前找，返回最后一次出现的位置
         for (var i = positions.length - texts.length; i >= 0; i--) {
@@ -658,7 +867,7 @@ module.exports = function (config, workDir) {
         // 滑到底部是自己的操作，和滑动前的屏幕接不上是正常的（例如进入时停在较早的未读位置）。
         // 改用底部这一屏作为读完后核对的基准：读完滑回底部后，两屏应当接得上。
         entered.screen = visibleMessages(null);
-        var budget = { images: MAX_THUMBNAILS };
+        var budget = newBudget();
         var messages = visibleMessages(budget),
             pages = 0,
             stopReason = "limit_reached";
@@ -694,10 +903,12 @@ module.exports = function (config, workDir) {
                     stopReason = "unverified_overlap";
                     break;
                 }
-                // 重叠部分在上一屏可能被截断（看不到头像、图片没截全），用这一屏补上方向和缩略图。
+                // 重叠部分在上一屏可能被截断（看不到头像、图片没截全），用这一屏补上方向、发送人和缩略图。
                 for (var k = 0; k < shared; k++) {
                     var seen = older[older.length - shared + k];
                     if (messages[k].direction === "unknown") messages[k].direction = seen.direction;
+                    if (!messages[k].sender && seen.sender) messages[k].sender = seen.sender;
+                    if (!messages[k].avatar && seen.avatar) messages[k].avatar = seen.avatar;
                     if (!messages[k].thumbnail && seen.thumbnail) {
                         messages[k].thumbnail = seen.thumbnail;
                         delete messages[k].image_error;
@@ -717,6 +928,10 @@ module.exports = function (config, workDir) {
             return m.image_error === "缩略图获取失败" || m.image_error === "缩略图超过大小限制";
         }).length;
         if (thumbFailed) warn("THUMBNAIL_FAILED", thumbFailed + " 张图片没能截取缩略图");
+        if (budget.unrecognized.length) {
+            var sample = unrecognizedSample(budget.unrecognized);
+            warn("UNRECOGNIZED_MESSAGES", "有 " + budget.unrecognized.length + " 处消息没能识别内容（语音、链接卡片等）" + (sample.length ? "，附近控件描述：" + sample.join("、") : ""));
+        }
         // 需要取原图时，只处理 until 之后的新图片
         if (options.originals > 0) fetchOriginals(messages, Math.max(0, afterTexts(messages, until)), options.originals, options.tag);
         // 读完再核对一次，确保读取期间没有被切到别的聊天
@@ -878,7 +1093,7 @@ module.exports = function (config, workDir) {
                 }
                 // 还有没处理的：向上翻一页，用新旧两屏的重叠更新对应关系
                 targets = remaining;
-                if (!targets.length || pages >= MAX_PAGES || !canScrollUp(1000) || !pageUp()) break;
+                if (!targets.length || pages >= MAX_ORIGINAL_PAGES || !canScrollUp(1000) || !pageUp()) break;
                 pages++;
                 var older = visibleMessages(null),
                     shared = overlap(older, screen);
@@ -902,7 +1117,7 @@ module.exports = function (config, workDir) {
     // 当前屏幕的消息快照；withImages 为 true 时附带图片缩略图。
     function snapshot(withImages) {
         return {
-            messages: withoutPosition(visibleMessages(withImages ? { images: MAX_THUMBNAILS } : null)),
+            messages: withoutPosition(visibleMessages(withImages ? newBudget() : null)),
             captured_at: new Date().toISOString()
         };
     }
@@ -1099,7 +1314,7 @@ module.exports = function (config, workDir) {
         all(id(profile.contact_id)).forEach(function (n) {
             var b = n.bounds(),
                 label = String(n.text() || "");
-            if (!label || b.left < 0 || b.right > device.width) return;
+            if (!label || b.left < 0 || b.right > device.width || ignoredChat(label)) return;
             var row = n; // 向上找到整行：高度不超过屏幕四分之一的最外层
             for (var i = 0; i < 6 && row.parent() && row.parent().bounds().height() <= device.height / 4; i++)
                 row = row.parent();
@@ -1108,6 +1323,11 @@ module.exports = function (config, workDir) {
             if (info.unread) result[chatName(label)] = info.signature;
         });
         return result;
+    }
+
+    // ignoredChat 是否为不处理的会话（公众号、微信系统通知）。
+    function ignoredChat(name) {
+        return IGNORED_CHATS.indexOf(String(name)) >= 0;
     }
 
     // ---------- 就绪状态 ----------
@@ -1160,10 +1380,12 @@ module.exports = function (config, workDir) {
             return clicked;
         },
         status: status,
+        ignoredChat: ignoredChat,
         stillInChat: stillInChat,
         currentChat: currentChat,
         openChat: openChat,
         returnToList: returnToList,
+        identifyAccount: identifyAccount,
         readMessages: readMessages,
         diagnostics: diagnostics,
         // 截图授权是否失效（失效后由 bridge.js 重新申请，成功后调用 captureRestored）

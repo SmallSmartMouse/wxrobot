@@ -15,7 +15,6 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -38,8 +37,9 @@ const (
 )
 
 type State struct {
-	Phone         PhoneConfig              `json:"config"`
-	Cursor        int64                    `json:"cursor"` // 已处理的手机事件序号
+	Phones        []*PhoneConfig           `json:"phones"`
+	Phone         PhoneConfig              `json:"config"` // 单手机版本的手机连接，启动时迁移到 Phones
+	Cursor        int64                    `json:"cursor"` // 单手机版本的事件序号，迁移到 Phones
 	Conversations map[string]*Conversation `json:"conversations"`
 	Operations    map[string]*Operation    `json:"operations"`
 	AI            AIConfig                 `json:"ai_config"`
@@ -54,16 +54,15 @@ type App struct {
 	store     *store
 	ctx       context.Context
 	client    *http.Client
-	wake      chan struct{}          // 有新任务时唤醒 worker
 	listeners map[chan struct{}]bool // 网页 SSE 连接
 
 	// 以下只在内存中
-	connection  string               // 手机连接状态文字
-	lastError   string               // 最近一次需要提示的错误
-	allowRemote bool                 // 允许非回环来源地址（容器内运行时使用）
-	device      json.RawMessage      // 手机最近一次上报的状态
-	aiCursor    map[string]int64     // 会话 → AI 已检查到的消息序号
-	aiLastRun   map[string]time.Time // 会话 → 上次自动生成时间
+	phones      map[string]*phoneRuntime // 手机编号 → 连接状态、上报的状态、事件循环
+	running     bool                     // 服务已启动：新添加的手机立即启动事件循环和 worker
+	lastError   string                   // 最近一次需要提示的错误（例如本地数据保存失败）
+	allowRemote bool                     // 允许非回环来源地址（容器内运行时使用）
+	aiCursor    map[string]int64         // 会话 → AI 已检查到的消息序号
+	aiLastRun   map[string]time.Time     // 会话 → 上次自动生成时间
 }
 
 // now 返回当前 UTC 时间的 RFC3339 字符串（带纳秒，按字符串比较即可排序）。
@@ -86,15 +85,14 @@ func newApp(path string) (*App, error) {
 		return nil, err
 	}
 	a := &App{
-		path:       path,
-		store:      db,
-		ctx:        context.Background(),
-		client:     &http.Client{Timeout: 35 * time.Second, Transport: &http.Transport{Proxy: nil}},
-		wake:       make(chan struct{}, 1),
-		listeners:  map[chan struct{}]bool{},
-		connection: "未配置",
-		aiCursor:   map[string]int64{},
-		aiLastRun:  map[string]time.Time{},
+		path:      path,
+		store:     db,
+		ctx:       context.Background(),
+		client:    &http.Client{Timeout: 35 * time.Second, Transport: &http.Transport{Proxy: nil}},
+		listeners: map[chan struct{}]bool{},
+		phones:    map[string]*phoneRuntime{},
+		aiCursor:  map[string]int64{},
+		aiLastRun: map[string]time.Time{},
 		state: State{
 			Conversations: map[string]*Conversation{},
 			Operations:    map[string]*Operation{},
@@ -107,6 +105,7 @@ func newApp(path string) (*App, error) {
 	}
 	// 整理旧数据后写回，确保数据库与内存一致
 	a.normalizeLocked()
+	a.syncPhonesLocked()
 	return a, a.saveLocked()
 }
 
@@ -121,10 +120,21 @@ func (a *App) normalizeLocked() {
 	if a.state.AIJobs == nil {
 		a.state.AIJobs = map[string]*AIJob{}
 	}
-	// 删除旧版本的非正文记录，补上列表预览
-	for _, c := range a.state.Conversations {
-		c.migrate()
+	// 单手机版本的连接迁移为第一台手机；旧会话等它第一次上报微信号时归到那个账号
+	if len(a.state.Phones) == 0 && a.state.Phone.URL != "" {
+		p := a.state.Phone
+		p.ID, p.Cursor, p.Legacy = randomID()[:12], a.state.Cursor, true
+		a.state.Phones = []*PhoneConfig{&p}
 	}
+	a.state.Phone, a.state.Cursor = PhoneConfig{}, 0
+	// 删除旧版本的非正文记录，补上列表预览
+	for id, c := range a.state.Conversations {
+		c.migrate()
+		for _, seq := range c.markLegacyNotices() {
+			a.markMessage(id, seq)
+		}
+	}
+	a.removeUnsupportedChatsLocked()
 	// 草稿模式已移除，旧数据中的草稿视为关闭。
 	for i := range a.state.AIRules {
 		if a.state.AIRules[i].Mode == "draft" {
@@ -135,6 +145,82 @@ func (a *App) normalizeLocked() {
 	for _, j := range a.state.AIJobs {
 		if j.Status == "running" {
 			j.Status, j.Error = "failed", "服务重启中断，未自动重试"
+		}
+	}
+}
+
+// removeUnsupportedChatsLocked 删除旧版本建立的不支持的会话：公众号，以及把微信系统通知（标题“微信”）
+// 当成会话建立的空会话（只删没有消息、没有手动设置过类型的）。有进行中任务的先不删，下次启动再删。
+func (a *App) removeUnsupportedChatsLocked() {
+	for id, c := range a.state.Conversations {
+		junk := c.Title == wechatSystemTitle && len(c.Messages) == 0 && c.Kind == "unknown"
+		if (unsupportedChats[c.Title] || junk) && !a.busyLocked(id) {
+			a.deleteConversationLocked(id)
+		}
+	}
+}
+
+// busyLocked 会话是否有排队或执行中的任务。
+func (a *App) busyLocked(conversationID string) bool {
+	for _, op := range a.state.Operations {
+		if op.ConversationID == conversationID && op.active() {
+			return true
+		}
+	}
+	return false
+}
+
+// deleteConversationLocked 删除会话和它的全部消息，以及不再被引用的图片。
+func (a *App) deleteConversationLocked(id string) {
+	c := a.state.Conversations[id]
+	if c == nil {
+		return
+	}
+	delete(a.state.Conversations, id)
+	a.store.cleared[id] = true
+	a.removeUnusedMediaLocked(c.Messages, c.Members)
+}
+
+// clearHistoryLocked 清空会话在本地的聊天记录（手机上的微信不受影响），并删除不再被引用的图片。
+func (a *App) clearHistoryLocked(c *Conversation) {
+	removed := c.clearHistory()
+	a.store.cleared[c.ID] = true
+	a.aiCursor[c.ID] = c.LastSeq // 删掉的消息不再触发 AI 回复
+	a.removeUnusedMediaLocked(removed, nil)
+}
+
+// removeUnusedMediaLocked 删除 messages 和 members 引用、但其他地方都不再引用的图片文件
+// （消息的缩略图和原图、群成员头像、待发送的图片、任务步骤截图）。
+func (a *App) removeUnusedMediaLocked(messages []Message, members map[string]string) {
+	candidates := map[string]bool{}
+	for _, m := range messages {
+		candidates[m.ImageHash], candidates[m.OriginalHash] = true, true
+	}
+	for _, hash := range members {
+		candidates[hash] = true
+	}
+	delete(candidates, "")
+	if len(candidates) == 0 {
+		return
+	}
+	for _, c := range a.state.Conversations {
+		for _, m := range c.Messages {
+			delete(candidates, m.ImageHash)
+			delete(candidates, m.OriginalHash)
+		}
+		for _, hash := range c.Members {
+			delete(candidates, hash)
+		}
+	}
+	for _, op := range a.state.Operations {
+		delete(candidates, op.ImageHash)
+		for _, s := range op.Steps {
+			delete(candidates, s.Image)
+		}
+	}
+	for hash := range candidates {
+		if path, ok := a.mediaPath(hash); ok {
+			_ = os.Remove(path)
 		}
 	}
 }
@@ -210,16 +296,21 @@ func (a *App) removeStepImagesLocked(removed []*Operation) {
 	}
 }
 
-// conversationLocked 按名称查找会话，不存在时新建。
-func (a *App) conversationLocked(title string) *Conversation {
-	// 会话编号由名称的哈希得出，同名会话总是同一个编号
-	h := sha256.Sum256([]byte(title))
-	id := hex.EncodeToString(h[:12])
-	c := a.state.Conversations[id]
-	if c == nil {
-		c = &Conversation{ID: id, Title: title, Kind: "unknown", Updated: now(), Messages: []Message{}}
-		a.state.Conversations[id] = c
+// conversationLocked 按账号和名称查找会话，不存在时新建。不同账号的同名会话是不同的会话。
+func (a *App) conversationLocked(account, title string) *Conversation {
+	for _, c := range a.state.Conversations {
+		if c.Account == account && c.Title == title {
+			return c
+		}
 	}
+	// 会话编号由账号和名称的哈希得出；单手机版本的会话编号只由名称得出，迁移后保持不变
+	key := title
+	if account != "" {
+		key = account + "\x00" + title
+	}
+	h := sha256.Sum256([]byte(key))
+	c := &Conversation{ID: hex.EncodeToString(h[:12]), Account: account, Title: title, Kind: "unknown", Updated: now(), Messages: []Message{}}
+	a.state.Conversations[c.ID] = c
 	return c
 }
 
@@ -272,9 +363,11 @@ func main() {
 	defer cancel()
 	a.ctx = ctx
 	a.allowRemote = config.AllowRemote
-	// 三个后台循环：拉取手机事件、执行读写任务、AI 自动回复
-	go a.eventLoop(ctx)
-	go a.worker(ctx)
+	// 后台循环：每台手机一个拉取事件的循环和一个执行读写任务的 worker（添加手机时随时启动），以及 AI 自动回复
+	a.mu.Lock()
+	a.running = true
+	a.syncPhonesLocked()
+	a.mu.Unlock()
 	go a.aiLoop(ctx)
 
 	// 网页服务；退出时最多等 5 秒让进行中的请求完成

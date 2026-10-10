@@ -32,6 +32,10 @@
       <span class="logo">聊</span>
       <strong>微信消息台</strong>
     </header>
+    <label class="account-switch" title="切换微信账号：每个账号的会话和聊天记录分开保存">
+      <span>账号</span>
+      <select id="account-select" aria-label="切换微信账号"></select>
+    </label>
     <button id="connection-card" class="connection-card" title="手机连接">
       <span id="status-dot" class="dot"></span>
       <strong id="connection">连接中</strong>
@@ -92,10 +96,13 @@
   </main>
 </div>
 
+<!-- 手机连接：可以连接多台手机，每台手机登录一个微信账号 -->
 <dialog id="settings-dialog">
-  <form id="settings-form">
-    <div class="dialog-heading"><h2>连接你的手机</h2><button type="button" class="icon-button close-dialog">×</button></div>
-    <p class="muted">手机与电脑在同一网络，并保持手机上的微信桥运行。</p>
+  <div class="dialog-heading"><h2>手机连接</h2><button type="button" class="icon-button close-dialog">×</button></div>
+  <p class="muted">每台手机运行一个微信桥，登录一个微信账号。手机与电脑在同一网络；手机识别出微信号后，会话按账号分开保存。</p>
+  <div id="phone-list" class="phone-list"></div>
+  <form id="settings-form" class="phone-form">
+    <h3 id="phone-form-title">添加手机</h3>
     <label class="field">手机 IP 或地址
       <input id="phone-url" placeholder="192.168.0.186 或 http://192.168.0.186:8766" required>
     </label>
@@ -104,8 +111,8 @@
     </label>
     <div id="settings-error" class="form-error"></div>
     <div class="dialog-actions">
-      <button type="button" class="secondary close-dialog">取消</button>
-      <button type="submit" class="primary">保存连接</button>
+      <button type="button" id="phone-cancel-edit" class="secondary" hidden>取消修改</button>
+      <button type="submit" class="primary">保存</button>
     </div>
   </form>
 </dialog>
@@ -113,6 +120,7 @@
 <dialog id="new-dialog">
   <form id="new-form">
     <div class="dialog-heading"><h2>添加一个会话</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <p id="new-account" class="muted"></p>
     <label class="field">微信完整昵称 / 群名称
       <input id="new-title" placeholder="手机中显示的完整名称" maxlength="128" required>
     </label>
@@ -191,6 +199,13 @@
       </div>
       <p class="muted">只处理保存之后的新来信，发送同样等待手机确认。</p>
     </fieldset>
+    <div class="danger-zone">
+      <div>
+        <strong>删除聊天记录</strong>
+        <p class="muted">只删除电脑上保存的消息和图片，手机微信里的聊天不受影响；之后收到的新消息照常记录。</p>
+      </div>
+      <button type="button" id="clear-history" class="danger">删除</button>
+    </div>
     <div id="chat-settings-error" class="form-error"></div>
     <div class="dialog-actions">
       <button type="button" class="secondary close-dialog">取消</button>

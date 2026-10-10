@@ -79,6 +79,8 @@ var eventLog = [];
 var lastSeq = Date.now(); // 事件序号从启动时间开始，脚本重启后仍然递增
 var deviceInfo = { ready: false, reasons: ["STARTING"] };
 var heartbeat = 0; // 主线程最近一次循环的时间
+var taskStarted = 0; // 正在执行的任务开始的时间，没有任务时为 0
+var lastTaskEnded = 0; // 上一个任务结束的时间：排队超时从手机空闲下来时算起
 
 // withLock 在共享锁内执行 fn 并返回其结果。
 function withLock(fn) {
@@ -191,7 +193,10 @@ function validatePayload(operation, data) {
         httpError(400, "BAD_CHAT", "需要明确聊天名称");
     if (data.chat_type !== undefined && data.chat_type !== "person" && data.chat_type !== "group")
         httpError(400, "BAD_CHAT_TYPE", "会话类型必须为 person 或 group");
-    var payload = { chat: chat.trim(), group: data.chat_type === "group" };
+    if (data.account !== undefined && (typeof data.account !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(data.account)))
+        httpError(400, "BAD_ACCOUNT", "account 必须是微信号");
+    // account：电脑预期手机登录的微信号，执行前核对
+    var payload = { chat: chat.trim(), group: data.chat_type === "group", account: data.account || "" };
     // 读取：条数、读完是否回到首页、读到哪几条已知消息停止、最多取几张原图
     if (operation === "read") {
         var limit = data.limit === undefined ? 20 : data.limit;
@@ -241,7 +246,7 @@ function createTask(operation, data, key) {
             return taskView(existing);
         }
         // 主循环 45 秒没有心跳或手机未就绪时，不接新任务
-        if (Date.now() - heartbeat > 45000 || !deviceInfo.ready)
+        if (!alive() || !deviceInfo.ready)
             httpError(409, "DEVICE_NOT_READY", "手机未就绪：" + (deviceInfo.reasons || []).join(", "));
         // 同一时刻只允许一个排队任务（电脑端本来就是逐个提交）
         if (pendingTask) httpError(429, "BUSY", "手机已有排队任务");
@@ -298,13 +303,20 @@ function finishTask(task, status, result) {
     log("任务 " + task.id + " " + task.operation + " " + status + " " + detail);
 }
 
+// alive 主线程是否在工作：最近 45 秒内有心跳，或者正在执行一个没超时的任务（任务期间主循环不转，不更新心跳）。
+function alive() {
+    var now = Date.now();
+    return now - heartbeat < 45000 || (taskStarted > 0 && now - taskStarted < TASK_TIMEOUT_MS + 15000);
+}
+
 // 取出下一个可执行的任务；手机长时间未就绪时让排队任务失败（未执行，可安全重试）。
+// 排队时间从手机空闲下来时算起：前一个任务执行得久不算未就绪。
 function takeTask() {
     var expired = null;
     var task = withLock(function () {
         var next = pendingTask;
         if (!next) return null;
-        if (Date.now() - next.created > QUEUE_TIMEOUT_MS) {
+        if (Date.now() - Math.max(next.created, lastTaskEnded) > QUEUE_TIMEOUT_MS) {
             pendingTask = null;
             expired = next;
             return null;
@@ -312,6 +324,7 @@ function takeTask() {
         if (!deviceInfo.ready) return null;
         pendingTask = null;
         next.status = "running";
+        taskStarted = Date.now();
         return next;
     });
     if (expired) finishTask(expired, "failed", { code: "TASK_EXPIRED", message: "手机长时间未就绪，任务未执行" });
@@ -338,6 +351,7 @@ function runTask(task) {
     ui.begin(TASK_TIMEOUT_MS);
     try {
         // 先打开目标聊天（核对标题），再按任务类型读取或发送
+        if (p.account) verifyAccount(p.account, task.operation === "send");
         ui.openChat(p.chat, p.group);
         if (task.operation === "read") {
             // 读取完成后，自动读取会回到首页，方便继续发现其他未读会话
@@ -364,6 +378,7 @@ function runTask(task) {
         result = { code: e.code || "UI_ERROR", message: String(e.message || e) };
     }
     // 执行步骤和降级随结果上报，诊断页可以看到每一步。
+    result.account = currentAccountId(); // 执行时登录的微信号，电脑再核对一次
     result.diagnostics = ui.diagnostics();
     // 降级和失败同时记入诊断事件，诊断页可以集中查看
     var context = { task_id: task.id, operation: task.operation, chat: p.chat };
@@ -375,12 +390,112 @@ function runTask(task) {
     finishTask(task, status, result);
 }
 
+// ---------- 当前账号 ----------
+// 启动后先识别当前登录的微信号（在“我”页面读取），电脑按微信号区分各账号的聊天记录。
+// 识别失败时报告错误、不沿用之前的账号，空闲时每分钟重试；成功后空闲时每 30 分钟重新识别一次，发现手机上换了账号。
+// 电脑提交任务时带上预期的微信号，不一致时拒绝执行；发送前识别结果超过 5 分钟的先重新识别，避免用错账号发消息。
+// POST /v1/account/refresh 要求下次空闲时重新识别。
+var ACCOUNT_RECHECK_MS = 30 * 60 * 1000;
+var ACCOUNT_FRESH_MS = 5 * 60 * 1000;
+var account = { wechat_id: "", error: null };
+var accountCheckedAt = 0, // 最近一次识别成功的时间
+    accountWanted = true,
+    lastAccountTry = 0;
+
+// currentAccountId 当前识别出的微信号，没有为空字符串。
+function currentAccountId() {
+    return withLock(function () {
+        return account.wechat_id;
+    });
+}
+
+// accountDue 空闲时是否需要（重新）识别账号。
+function accountDue() {
+    return withLock(function () {
+        var now = Date.now();
+        return accountWanted ? now - lastAccountTry > 60000 : now - accountCheckedAt > ACCOUNT_RECHECK_MS;
+    });
+}
+
+// requestAccountRefresh 要求下次空闲时重新识别账号。
+function requestAccountRefresh() {
+    withLock(function () {
+        accountWanted = true;
+        lastAccountTry = 0;
+    });
+    return { ok: true };
+}
+
+// readAccount 在当前操作中识别账号并记下结果（调用前须 ui.begin），返回微信号；失败时清空账号并抛出异常。
+function readAccount() {
+    withLock(function () {
+        lastAccountTry = Date.now();
+    });
+    var found;
+    try {
+        found = ui.identifyAccount();
+    } catch (e) {
+        var error = { code: e.code || "UI_ERROR", message: String(e.message || e) };
+        withLock(function () {
+            account = { wechat_id: "", error: error }; // 不沿用上一次的结果
+            accountWanted = true;
+        });
+        addDiagnostic("error", error.code, "识别当前微信账号失败：" + error.message, { source: "account" });
+        throw e;
+    }
+    var before = currentAccountId();
+    if (before && before !== found.wechat_id) log("当前账号变为 " + found.wechat_id + "（之前 " + before + "）");
+    withLock(function () {
+        account = { wechat_id: found.wechat_id, identified_at: new Date().toISOString(), error: null };
+        accountCheckedAt = Date.now();
+        accountWanted = false;
+    });
+    return found.wechat_id;
+}
+
+// identifyAccount 空闲时识别当前账号；日志只记操作流程、结果和耗时。
+function identifyAccount() {
+    ui.begin(15000);
+    var id = "";
+    try {
+        id = readAccount();
+    } catch (_) {}
+    var d = ui.diagnostics();
+    log(
+        "识别账号 " + (id ? "微信号 " + id : "失败") + "，耗时 " + d.duration_ms + " 毫秒：" +
+            d.steps
+                .map(function (s) {
+                    return s.step + (s.detail ? "（" + s.detail + "）" : "") + " " + s.ms + "ms";
+                })
+                .join(" → ")
+    );
+}
+
+// taskError 返回带错误代码的异常（任务失败，未执行）。
+function taskError(code, message) {
+    var e = new Error(message);
+    e.code = code;
+    return e;
+}
+
+// verifyAccount 任务开始前核对手机登录的就是电脑预期的账号；fresh 为 true（发送）时识别结果太旧就先重新识别。
+function verifyAccount(expected, fresh) {
+    var current = withLock(function () {
+        return { id: account.wechat_id, age: Date.now() - accountCheckedAt };
+    });
+    if (fresh && (!current.id || current.age > ACCOUNT_FRESH_MS)) current.id = readAccount();
+    if (!current.id) throw taskError("ACCOUNT_UNKNOWN", "手机还没识别出当前登录的微信号，任务未执行");
+    if (current.id !== expected)
+        throw taskError("ACCOUNT_MISMATCH", "手机当前登录的微信号是 " + current.id + "，不是 " + expected + "，任务未执行");
+}
+
 // ---------- 消息事件 ----------
 
 // pushEvent 追加一条消息事件并分配递增序号；最多保留 300 条，超出时丢掉最早的。
 function pushEvent(event) {
     withLock(function () {
         event.seq = ++lastSeq;
+        event.account = account.wechat_id; // 事件发生时登录的微信号，电脑据此归到对应账号
         event.received_at = new Date().toISOString();
         eventLog.push(event);
         if (eventLog.length > MAX_EVENTS) eventLog.shift();
@@ -428,12 +543,13 @@ function watchNotifications() {
     );
     if (listeners.indexOf("org.autojs.autojs6") < 0) return false;
     events.observeNotification();
-    // 只处理微信的通知：标题是会话名称，正文是消息预览
+    // 只处理微信的通知：标题是会话名称，正文是消息预览。
+    // 跳过公众号和标题为“微信”的系统通知（“你有1条消息未发送”等），它们不是聊天。
     events.onNotification(function (n) {
         if (String(n.getPackageName()) !== "com.tencent.mm") return;
         var chat = String(n.getTitle() || ""),
             body = String(n.getText() || "");
-        if (chat && body) pushEvent({ kind: "notification", chat: chat, text: body });
+        if (chat && body && !ui.ignoredChat(chat)) pushEvent({ kind: "notification", chat: chat, text: body });
     });
     notificationsWatched = true;
     return true;
@@ -548,9 +664,10 @@ function route(req) {
     if (req.method === "GET" && req.path === "/health") return [200, { ok: true, device_id: config.device_id }];
     if (!tokenMatches(req.headers.authorization)) httpError(401, "UNAUTHORIZED", "需要有效 Bearer Token");
     if (req.method === "GET" && req.path === "/v1/device")
-        return [200, { online: Date.now() - heartbeat < 45000, info: deviceInfo, diagnostics: recentDiagnostics() }];
+        return [200, { online: alive(), busy: taskStarted > 0, info: deviceInfo, diagnostics: recentDiagnostics() }];
     if (req.method === "GET" && req.path === "/v1/events") return [200, waitEvents(req.query)];
     if (req.method === "GET" && req.path.indexOf("/v1/tasks/") === 0) return [200, getTask(req.path.slice(10))];
+    if (req.method === "POST" && req.path === "/v1/account/refresh") return [202, requestAccountRefresh()];
     var file = /^\/v1\/files\/([A-Za-z0-9._-]+)$/.exec(req.path);
     if (req.method === "GET" && file) return [200, null, ui.originalsDir + file[1]];
     var create = /^\/v1\/messages\/(read|send)$/.exec(req.path);
@@ -720,12 +837,24 @@ while (true) {
             info = ui.status(captureReady);
         }
         info.notification_access = watchNotifications();
+        info.account = withLock(function () {
+            return account;
+        });
         deviceInfo = info;
         heartbeat = Date.now();
         // 保持屏幕常亮，界面操作和截图都需要亮屏
         device.keepScreenOn(30 * 60 * 1000);
         var task = takeTask();
-        if (task) runTask(task);
+        if (task) {
+            try {
+                runTask(task);
+            } finally {
+                withLock(function () {
+                    taskStarted = 0;
+                    lastTaskEnded = Date.now();
+                });
+            }
+        } else if (info.ready && accountDue()) identifyAccount();
         else if (info.ready) monitor();
     } catch (e) {
         addDiagnostic("error", e.code || "LOOP_ERROR", "监测或主循环异常：" + String(e.message || e), { source: "monitor" });

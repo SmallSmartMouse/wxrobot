@@ -128,6 +128,7 @@ h2 {
 .card span {
   color: var(--muted);
   font-size: 12px;
+  white-space: pre-line; /* 多台手机时每台一行 */
 }
 
 .card.good {

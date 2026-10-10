@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	id              TEXT    NOT NULL,
 	text            TEXT    NOT NULL,
 	direction       TEXT    NOT NULL,
+	sender          TEXT    NOT NULL DEFAULT '',
 	kind            TEXT    NOT NULL DEFAULT '',
 	image_hash      TEXT    NOT NULL DEFAULT '',
 	image_error     TEXT    NOT NULL DEFAULT '',
@@ -43,12 +44,18 @@ CREATE TABLE IF NOT EXISTS messages (
 	PRIMARY KEY (conversation_id, seq)
 );`
 
-const messageColumns = "conversation_id, seq, id, text, direction, kind, image_hash, image_error, original_hash, original_error, original_tries, original_note, time, gap"
+const messageColumns = "conversation_id, seq, id, text, direction, sender, kind, image_hash, image_error, original_hash, original_error, original_tries, original_note, time, gap"
+
+// addedColumns 是建表之后新增的列：旧数据库里没有时补上。
+var addedColumns = []struct{ table, column, definition string }{
+	{"messages", "sender", "TEXT NOT NULL DEFAULT ''"},
+}
 
 type store struct {
 	db      *sql.DB
 	written map[string]string         // "表:编号" → 上次写入的 JSON
 	dirty   map[string]map[int64]bool // 会话编号 → 需要写入的消息序号
+	cleared map[string]bool           // 会话编号 → 需要删除已保存的全部消息（删除聊天记录或删除会话）
 }
 
 // openStore 打开数据库文件并建表（已存在则跳过）。
@@ -64,7 +71,18 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, fmt.Errorf("数据库初始化失败：%w", err)
 	}
-	return &store{db: db, written: map[string]string{}, dirty: map[string]map[int64]bool{}}, nil
+	for _, c := range addedColumns {
+		var exists int
+		err = db.QueryRow("SELECT count(*) FROM pragma_table_info(?) WHERE name = ?", c.table, c.column).Scan(&exists)
+		if err == nil && exists == 0 {
+			_, err = db.Exec("ALTER TABLE " + c.table + " ADD COLUMN " + c.column + " " + c.definition)
+		}
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("数据库升级失败：%w", err)
+		}
+	}
+	return &store{db: db, written: map[string]string{}, dirty: map[string]map[int64]bool{}, cleared: map[string]bool{}}, nil
 }
 
 // markMessage 标记消息需要写入（新增或修改）。
@@ -77,13 +95,21 @@ func (a *App) markMessage(conversationID string, seq int64) {
 
 // settings 表中的配置项。
 func (a *App) settingsLocked() map[string]any {
-	return map[string]any{"phone": &a.state.Phone, "cursor": &a.state.Cursor, "ai": &a.state.AI, "ai_rules": &a.state.AIRules}
+	return map[string]any{"phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules}
+}
+
+// legacySettingsLocked 单手机版本的配置项：只读取，迁移后不再写入（保存时从数据库删除）。
+func (a *App) legacySettingsLocked() map[string]any {
+	return map[string]any{"phone": &a.state.Phone, "cursor": &a.state.Cursor}
 }
 
 // loadLocked 从数据库读入全部数据，返回数据库是否为空。
 func (a *App) loadLocked() (empty bool, err error) {
 	// 配置项名 → 内存中对应字段的指针，读出的 JSON 直接解析进去
 	settings := a.settingsLocked()
+	for id, target := range a.legacySettingsLocked() {
+		settings[id] = target
+	}
 	rowsRead := 0
 	// readJSON 逐行读取 (id, data) 表，交给 each 解析，并记下读到的内容，后续保存时用于判断是否变化
 	readJSON := func(table string, each func(id, data string) error) error {
@@ -145,7 +171,7 @@ func (a *App) loadLocked() (empty bool, err error) {
 	for rows.Next() {
 		var conversationID string
 		var m Message
-		err := rows.Scan(&conversationID, &m.Seq, &m.ID, &m.Text, &m.Direction, &m.Kind, &m.ImageHash, &m.ImageError,
+		err := rows.Scan(&conversationID, &m.Seq, &m.ID, &m.Text, &m.Direction, &m.Sender, &m.Kind, &m.ImageHash, &m.ImageError,
 			&m.OriginalHash, &m.OriginalError, &m.OriginalTries, &m.OriginalNote, &m.Time, &m.Gap)
 		if err != nil {
 			return false, err
@@ -219,6 +245,12 @@ func (a *App) saveLocked() error {
 			removed = append(removed, key)
 		}
 	}
+	// 删除过聊天记录的会话：先删掉已保存的全部消息，之后新增的消息在下面照常写入
+	for conversationID := range a.store.cleared {
+		if _, err = tx.Exec("DELETE FROM messages WHERE conversation_id = ?", conversationID); err != nil {
+			return err
+		}
+	}
 	// 消息只写被标记过的行（新增的消息、补上图片的消息）
 	for conversationID, seqs := range a.store.dirty {
 		c := a.state.Conversations[conversationID]
@@ -232,8 +264,8 @@ func (a *App) saveLocked() error {
 				continue
 			}
 			m := c.Messages[i]
-			_, err = tx.Exec("INSERT OR REPLACE INTO messages("+messageColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-				conversationID, m.Seq, m.ID, m.Text, m.Direction, m.Kind, m.ImageHash, m.ImageError,
+			_, err = tx.Exec("INSERT OR REPLACE INTO messages("+messageColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+				conversationID, m.Seq, m.ID, m.Text, m.Direction, m.Sender, m.Kind, m.ImageHash, m.ImageError,
 				m.OriginalHash, m.OriginalError, m.OriginalTries, m.OriginalNote, m.Time, m.Gap)
 			if err != nil {
 				return err
@@ -251,6 +283,7 @@ func (a *App) saveLocked() error {
 		delete(a.store.written, key)
 	}
 	a.store.dirty = map[string]map[int64]bool{}
+	a.store.cleared = map[string]bool{}
 	return nil
 }
 

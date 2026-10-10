@@ -10,10 +10,33 @@ let state = null; // GET /api/state
 let active = null; // 当前会话 ID
 let conversation = null; // 当前会话详情
 let filter = "all";
+let selectedAccount = null; // 当前查看的微信号；"" 表示还没归属账号的旧会话
+try {
+    selectedAccount = localStorage.getItem("account");
+} catch (_) {}
 let busy = false; // 正在提交读写任务
 const knownStatus = new Map(); // 任务 ID → 上次看到的状态，用于结束时提示
 const dismissed = new Set(); // 已点掉的失败或降级提示（任务 ID）
 const READ_EVERY = { 60: "每 1 分钟", 300: "每 5 分钟", 900: "每 15 分钟", 1800: "每 30 分钟", 3600: "每 1 小时" };
+// 微信自带的小黄脸表情在无障碍文字里是“[得意]”这样的编码，显示时换成相近的 emoji；不认识的编码原样显示。
+const WECHAT_EMOJI = {
+    微笑: "🙂", 撇嘴: "😟", 色: "😍", 发呆: "😳", 得意: "😎", 流泪: "😢", 害羞: "😊", 闭嘴: "🤐", 睡: "😴", 大哭: "😭",
+    尴尬: "😅", 发怒: "😡", 调皮: "😜", 呲牙: "😁", 惊讶: "😲", 难过: "🙁", 囧: "😳", 抓狂: "😫", 吐: "🤮", 偷笑: "🤭",
+    愉快: "😊", 白眼: "🙄", 傲慢: "😤", 困: "😪", 惊恐: "😱", 憨笑: "😄", 悠闲: "😌", 咒骂: "🤬", 疑问: "🤔", 嘘: "🤫",
+    晕: "😵", 衰: "😩", 骷髅: "💀", 敲打: "🔨", 再见: "👋", 擦汗: "😓", 鼓掌: "👏", 坏笑: "😏", 鄙视: "😒", 委屈: "🥺",
+    快哭了: "🥺", 阴险: "😈", 亲亲: "😘", 可怜: "🥺", 笑脸: "😄", 生病: "😷", 脸红: "😳", 破涕为笑: "😂", 恐惧: "😨", 失望: "😞",
+    无语: "😑", 嘿哈: "🤗", 捂脸: "🤦", 奸笑: "😏", 机智: "🤓", 皱眉: "😣", 耶: "✌️", 吃瓜: "🍉", 加油: "💪", 汗: "😓",
+    天啊: "😱", Emm: "🤔", 社会社会: "🤙", 旺柴: "🐶", 好的: "👌", 打脸: "🤕", 哇: "😮", 翻白眼: "🙄", 让我看看: "👀", 叹气: "😮‍💨",
+    苦涩: "😖", 裂开: "💔", 嘴唇: "💋", 爱心: "❤️", 心: "❤️", 心碎: "💔", 拥抱: "🤗", 强: "👍", 弱: "👎", 握手: "🤝",
+    胜利: "✌️", 抱拳: "🙏", 拳头: "👊", OK: "👌", 合十: "🙏", 啤酒: "🍺", 咖啡: "☕", 蛋糕: "🎂", 玫瑰: "🌹", 凋谢: "🥀",
+    菜刀: "🔪", 炸弹: "💣", 便便: "💩", 月亮: "🌙", 太阳: "☀️", 庆祝: "🎉", 礼物: "🎁", 红包: "🧧", 福: "🧧", 烟花: "🎆",
+    爆竹: "🧨", 猪头: "🐷", 跳跳: "💃", 发抖: "🥶", 转圈: "💫"
+};
+
+// emojify 把文字中的微信表情编码换成 emoji（只用于显示，保存的文字不变）。
+function emojify(text) {
+    return String(text).replace(/\[([^\[\]]{1,6})\]/g, (code, name) => WECHAT_EMOJI[name] || code);
+}
 
 // ---------- 工具 ----------
 
@@ -118,6 +141,7 @@ async function refresh() {
         // 先取总览，再取当前会话详情；等待期间切换了会话就丢弃旧会话的详情
         const id = active;
         state = await api("state");
+        pickAccount();
         const detail = id ? await api("conversations/" + id) : null;
         if (id === active) conversation = detail;
         toastFinishedOperations();
@@ -151,25 +175,96 @@ function toastFinishedOperations() {
 
 // ---------- 渲染 ----------
 
-// render 重绘连接状态、会话列表和当前聊天。
+// render 重绘账号、连接状态、会话列表和当前聊天。
 function render() {
+    renderAccounts();
     renderStatus();
     renderList();
     renderChat();
+    if ($("settings-dialog").open) renderPhones();
 }
 
-// renderStatus 显示手机连接状态、地址和未就绪原因，并更新诊断入口红点。
+// ---------- 账号 ----------
+
+// accountList 网页上可选的账号：服务端列出的微信号；还有没归属账号的旧会话时，加一项“未归属账号”。
+function accountList() {
+    const list = [...state.accounts];
+    if (state.conversations.some((c) => !c.account)) list.push({ wechat_id: "", connection: "等待手机识别微信号" });
+    return list;
+}
+
+// pickAccount 选中的账号不存在时，改选第一个在线的账号，没有就选第一个。
+function pickAccount() {
+    const list = accountList();
+    if (list.some((a) => a.wechat_id === selectedAccount)) return;
+    selectedAccount = (list.find((a) => a.connection === "在线") || list[0])?.wechat_id ?? null;
+}
+
+// phoneOf 负责某个账号的手机：登录着这个微信号的手机（在线的优先）；"" 对应还没识别出微信号的手机。
+function phoneOf(account) {
+    if (account === null) return null;
+    const phones = state.phones.filter((p) => (p.account || "") === account);
+    return phones.find((p) => p.connection === "在线") || phones[0] || null;
+}
+
+// renderAccounts 账号切换下拉框：微信号和它的手机状态。
+function renderAccounts() {
+    const select = $("account-select");
+    const list = accountList();
+    const options = list.map((a) => {
+        const label = (a.wechat_id || "未归属账号") + (a.connection === "在线" ? "" : " · " + a.connection);
+        const option = el("option", label);
+        option.value = a.wechat_id;
+        return option;
+    });
+    if (!options.length) options.push(el("option", "还没有账号，先连接手机"));
+    // 内容没变就不重建，避免打开下拉框时被刷新打断
+    const key = JSON.stringify(list) + selectedAccount;
+    if (select.dataset.key !== key) {
+        select.dataset.key = key;
+        select.replaceChildren(...options);
+        select.value = selectedAccount ?? "";
+    }
+    select.disabled = !list.length;
+}
+
+$("account-select").onchange = () => {
+    selectedAccount = $("account-select").value;
+    try {
+        localStorage.setItem("account", selectedAccount);
+    } catch (_) {}
+    // 正在看的会话不属于新账号：关掉
+    if (conversation && (conversation.account || "") !== selectedAccount) {
+        active = conversation = null;
+        document.querySelector(".app").classList.remove("chat-open");
+    }
+    render();
+};
+
+// renderStatus 显示当前账号的手机连接状态、地址和未就绪原因，并更新诊断入口红点。
 function renderStatus() {
-    const online = state.connection === "在线";
-    const broken = /失败|离线/.test(state.connection);
-    $("connection").textContent = state.connection;
-    $("phone-address").textContent = state.phone_url ? state.phone_url.replace(/^https?:\/\//, "") : "点击设置手机 IP";
-    $("status-dot").className = "dot" + (online ? " online" : broken ? " error" : "");
-    $("connection-card").title = state.error || state.connection;
-    // 手机未就绪时把原因放进提示，方便直接看出缺什么（例如截图授权、锁屏）。
-    const reasons = state.device?.info?.reasons || [];
-    if (!online && reasons.length) $("connection-card").title += "：" + reasons.join("、");
+    const phone = phoneOf(selectedAccount);
     renderDiagBadge();
+    if (!phone) {
+        $("connection").textContent = state.phones.length ? "账号未连接" : "未连接手机";
+        $("phone-address").textContent = state.phones.length ? "没有手机登录这个账号" : "点击添加手机";
+        $("status-dot").className = "dot error";
+        $("connection-card").title = state.error || "手机连接";
+        return;
+    }
+    const online = phone.connection === "在线";
+    const broken = /失败|离线/.test(phone.connection);
+    $("connection").textContent = phone.connection;
+    // 手机识别出的当前微信号（识别失败时显示原因），附在手机地址后面
+    const account = phone.device?.info?.account;
+    const address = phone.phone_url.replace(/^https?:\/\//, "");
+    $("phone-address").textContent = address + (account?.wechat_id ? " · 微信号 " + account.wechat_id : account?.error ? " · 账号未识别" : "");
+    $("status-dot").className = "dot" + (online ? " online" : broken ? " error" : "");
+    $("connection-card").title = state.error || phone.error || phone.connection;
+    if (account?.error) $("connection-card").title += "\n账号识别失败：" + account.error.message;
+    // 手机未就绪时把原因放进提示，方便直接看出缺什么（例如截图授权、锁屏）。
+    const reasons = phone.device?.info?.reasons || [];
+    if (!online && reasons.length) $("connection-card").title += "：" + reasons.join("、");
 }
 
 // 诊断入口红点：最近 24 小时内、上次打开诊断页之后新出现的失败任务、降级任务和手机上报的异常。
@@ -181,7 +276,7 @@ function renderDiagBadge() {
     seenAt = Math.max(seenAt, Date.now() - 86400000);
     const fresh = (time) => new Date(time).getTime() > seenAt;
     const opIssues = state.operations.filter((op) => fresh(op.created) && (["failed", "unknown"].includes(op.status) || op.warnings?.length));
-    const phoneIssues = (state.device?.diagnostics || []).filter((d) => fresh(d.last_at) && !d.task_id);
+    const phoneIssues = state.phones.flatMap((p) => p.device?.diagnostics || []).filter((d) => fresh(d.last_at) && !d.task_id);
     const count = opIssues.length + phoneIssues.length;
     $("diag-badge").hidden = !count;
     $("diag-badge").textContent = count > 99 ? "99+" : String(count);
@@ -191,8 +286,10 @@ function renderDiagBadge() {
 // renderList 按搜索词和筛选条件显示会话列表。
 function renderList() {
     const search = $("search").value.toLowerCase();
+    // 只显示当前账号的会话
     const items = state.conversations.filter(
         (c) =>
+            (c.account || "") === selectedAccount &&
             c.title.toLowerCase().includes(search) &&
             (filter === "all" || (filter === "unread" ? c.unread > 0 : c.kind === filter))
     );
@@ -202,9 +299,9 @@ function renderList() {
     for (const c of items) {
         const item = el("button", undefined, "conversation-item" + (c.id === active ? " active" : ""));
         const top = el("div", undefined, "conversation-top");
-        top.append(el("strong", c.title), el("time", timeLabel(c.updated)));
+        top.append(el("strong", emojify(c.title)), el("time", timeLabel(c.updated)));
         const bottom = el("div", undefined, "conversation-bottom");
-        bottom.append(el("small", c.preview || KINDS[c.kind]));
+        bottom.append(el("small", c.preview ? emojify(c.preview) : KINDS[c.kind]));
         if (c.unread) bottom.append(el("span", c.unread > 99 ? "99+" : String(c.unread), "badge"));
         const text = el("div", undefined, "conversation-copy");
         text.append(top, bottom);
@@ -213,7 +310,8 @@ function renderList() {
         list.append(item);
     }
     if (!items.length) {
-        const empty = state.conversations.length ? "没有匹配的会话" : "还没有会话\n收到来信后自动添加，或点击 ＋ 新建";
+        const mine = state.conversations.some((c) => (c.account || "") === selectedAccount);
+        const empty = selectedAccount === null ? "还没有账号\n先在“手机连接”添加手机，等手机识别出微信号" : mine ? "没有匹配的会话" : "还没有会话\n收到来信后自动添加，或点击 ＋ 新建";
         list.append(el("div", empty, "empty-list"));
     }
 }
@@ -231,7 +329,7 @@ function renderChat() {
     const ops = operationsOfActive(); // 新的在前
     const pending = ops.find((op) => ["queued", "running"].includes(op.status));
 
-    $("chat-title").textContent = conversation.title;
+    $("chat-title").textContent = emojify(conversation.title);
     const head = avatar(conversation);
     head.id = "chat-avatar";
     $("chat-avatar").replaceWith(head);
@@ -247,11 +345,12 @@ function renderChat() {
 // 标题下的状态和设置摘要，例如：群聊 · 手机已连接 · 定时每 5 分钟 · 仅缩略图 · AI 关闭
 function renderChatNote(pending) {
     const c = conversation;
-    const connection = pending ? "手机处理中" : state.connection === "在线" ? "手机已连接" : "等待手机连接";
-    const originals = c.originals || (c.kind === "person" ? "on" : "off");
+    const online = phoneOf(c.account || "")?.connection === "在线";
+    const connection = pending ? "手机处理中" : online ? "手机已连接" : "等待手机连接";
+    const originals = c.originals || "on";
     const ai = c.ai_effective?.mode === "auto" ? "AI 自动回复" + (c.ai_effective.keyword ? "（" + c.ai_effective.keyword + "）" : "") : "AI 关闭";
     const parts = [KINDS[c.kind], connection, READ_EVERY[c.read_every_seconds] ? "定时" + READ_EVERY[c.read_every_seconds] : "不定时读取", originals === "on" ? "取原图" : "仅缩略图", ai];
-    $("chat-note").replaceChildren(...parts.map((text, i) => el("span", text, i === 1 && state.connection !== "在线" ? "warn" : "")));
+    $("chat-note").replaceChildren(...parts.map((text, i) => el("span", text, i === 1 && !online && !pending ? "warn" : "")));
 }
 
 // 消息下方的提示：进行中的任务；最近一次手动任务失败；最近一次任务的降级。失败和降级提示点 × 关闭。
@@ -340,7 +439,8 @@ function renderMessages(pendingSends) {
         const day = dayLabel(m.time);
         if (day !== lastDay) items.push({ key: "d:" + day + ":" + m.id, sig: day, build: () => el("div", day, "day-divider") });
         lastDay = day;
-        items.push({ key: "m:" + m.id, sig: JSON.stringify(m), incoming: m.direction !== "outgoing", build: () => messageNode(m) });
+        const face = conversation.members?.[m.sender] || "";
+        items.push({ key: "m:" + m.id, sig: JSON.stringify(m) + face, incoming: m.direction === "incoming", build: () => messageNode(m) });
     }
     for (const op of pendingSends) items.push({ key: "op:" + op.id, sig: op.status, build: () => pendingNode(op) });
     // 内容没变的条目复用原节点，变了才重建；同时统计新出现的来信条数
@@ -378,17 +478,24 @@ function renderMessages(pendingSends) {
 function messageNode(m) {
     const node = el("div");
     if (m.gap) node.append(el("div", "此处与之前的记录没能衔接，中间可能有遗漏或重复", "gap-note"));
-    // 有原图就直接显示原图，否则显示聊天页面的缩略图。
+    // 系统提示（例如“你的账号被限制与对方聊天”）像微信一样居中显示，没有气泡和头像
+    if (m.kind === "system") {
+        node.append(el("div", emojify(m.text), "system-note"));
+        return node;
+    }
+    // 有原图就直接显示原图，否则显示聊天页面的缩略图（表情包只有缩略图）。
     const image = m.original_hash || m.image_hash;
-    const bubble = el("div", image ? undefined : m.text, "bubble");
-    if (image) bubble.append(imageLink(image, "微信图片"));
+    const sticker = m.kind === "sticker";
+    const bubble = el("div", image ? undefined : emojify(m.text), "bubble" + (sticker && image ? " sticker" : ""));
+    if (image) bubble.append(imageLink(image, sticker ? "表情" : "微信图片"));
     if (m.image_error && !image) bubble.append(el("small", m.image_error));
     if (m.kind === "image" && !m.original_hash && m.original_error) bubble.append(el("small", "原图：" + m.original_error));
     if (m.original_note) bubble.append(el("small", m.original_note));
     const meta = [clock(m.time)];
     if (m.kind === "image") meta.push(m.original_hash ? (m.original_note ? "大图截图" : "原图") : "缩略图");
+    if (sticker) meta.push("表情");
     if (m.direction === "unknown") meta.push("方向未识别");
-    node.append(messageRow(m.direction === "outgoing", bubble, meta));
+    node.append(messageRow(m.direction === "outgoing", bubble, meta, m.sender));
     return node;
 }
 
@@ -399,15 +506,35 @@ function pendingNode(op) {
     return messageRow(true, bubble, [STATUS[op.status]]);
 }
 
-// messageRow 消息行：发出的消息靠右并显示“我”，收到的显示会话头像。
-function messageRow(outgoing, bubble, meta) {
+// messageRow 消息行：发出的消息靠右并显示“我”；收到的显示发送人头像（没截到时用会话头像），
+// 群聊里在气泡上方显示发送人名称。
+function messageRow(outgoing, bubble, meta, sender) {
     const row = el("div", undefined, "message-row" + (outgoing ? " outgoing" : ""));
     const content = el("div", undefined, "message-content");
     const metaLine = el("div", undefined, "message-meta");
     metaLine.append(...meta.map((text) => el("span", text)));
+    if (!outgoing && sender && conversation.kind === "group") content.append(el("div", sender, "message-sender"));
     content.append(bubble, metaLine);
-    row.append(outgoing ? el("span", "我", "avatar") : avatar(conversation), content);
+    row.append(outgoing ? el("span", "我", "avatar") : senderAvatar(sender), content);
     return row;
+}
+
+// senderAvatar 发送人头像：有截到的头像图片就显示图片，否则群聊显示名称第一个字，联系人显示会话头像。
+function senderAvatar(sender) {
+    const face = conversation.members?.[sender];
+    if (face) {
+        const img = el("img", undefined, "avatar photo");
+        img.src = "/api/media/" + face;
+        img.alt = sender;
+        img.title = sender;
+        return img;
+    }
+    if (sender && conversation.kind === "group") {
+        const letter = el("span", Array.from(sender)[0], "avatar");
+        letter.title = sender;
+        return letter;
+    }
+    return avatar(conversation);
 }
 
 // ---------- 会话操作 ----------
@@ -534,30 +661,110 @@ function handleForm(formId, errorId, save) {
 // openNewChat 打开“添加会话”对话框。
 function openNewChat() {
     $("new-error").textContent = "";
+    $("new-account").textContent = selectedAccount ? "添加到账号 " + selectedAccount : "请先连接手机，等手机识别出微信号后再添加会话";
     $("new-dialog").showModal();
     $("new-title").focus();
 }
 $("new-chat").onclick = openNewChat;
 $("welcome-new").onclick = openNewChat;
 handleForm("new-form", "new-error", async () => {
-    const c = await api("conversations", { title: $("new-title").value, kind: $("new-kind").value });
+    const c = await api("conversations", { account: selectedAccount || "", title: $("new-title").value, kind: $("new-kind").value });
     $("new-title").value = "";
     await selectChat(c.id);
 });
 
-// openSettings 打开“手机连接”对话框；Token 不回显，留空表示保留原值。
+// ---------- 手机连接：多台手机 ----------
+
+let editingPhone = null; // 正在修改的手机编号；null 表示添加新手机
+
+// openSettings 打开“手机连接”对话框。
 function openSettings() {
-    $("phone-url").value = state?.phone_url || "";
-    $("phone-token").value = "";
-    $("phone-token").placeholder = state?.token_set ? "已保存，留空保留原值" : "手机 config.json 中的 phone_api_token";
-    $("settings-error").textContent = "";
+    editingPhone = null;
+    renderPhones();
+    resetPhoneForm();
     $("settings-dialog").showModal();
 }
 $("settings").onclick = openSettings;
 $("connection-card").onclick = openSettings;
-handleForm("settings-form", "settings-error", () =>
-    api("config", { phone_url: $("phone-url").value, token: $("phone-token").value })
-);
+
+// resetPhoneForm 表单切换为添加或修改；Token 不回显，修改时留空表示保留原值。
+function resetPhoneForm() {
+    const phone = state.phones.find((p) => p.id === editingPhone);
+    $("phone-form-title").textContent = phone ? "修改手机 " + phone.phone_url.replace(/^https?:\/\//, "") : "添加手机";
+    $("phone-url").value = phone ? phone.phone_url : "";
+    $("phone-token").value = "";
+    $("phone-token").placeholder = phone ? "已保存，留空保留原值" : "手机 config.json 中的 phone_api_token";
+    $("phone-token").required = !phone;
+    $("phone-cancel-edit").hidden = !phone;
+    $("settings-error").textContent = "";
+}
+$("phone-cancel-edit").onclick = () => {
+    editingPhone = null;
+    resetPhoneForm();
+};
+
+// phoneAction 执行手机列表上的操作，完成后刷新；失败时显示在对话框里。
+async function phoneAction(run, done) {
+    $("settings-error").textContent = "";
+    try {
+        await run();
+        if (done) toast(done);
+        await refresh();
+    } catch (e) {
+        $("settings-error").textContent = e.message;
+    }
+}
+
+// renderPhones 手机列表：地址、登录的微信号、连接状态，以及重新识别账号、修改、删除。
+function renderPhones() {
+    const box = $("phone-list");
+    // 内容没变就不重建，避免刷新时点击落空
+    const key = JSON.stringify(state.phones.map((p) => [p.id, p.phone_url, p.account, p.connection, p.error, p.device?.info?.account, p.device?.info?.reasons]));
+    if (box.dataset.key === key) return;
+    box.dataset.key = key;
+    box.replaceChildren();
+    if (!state.phones.length) box.append(el("p", "还没有添加手机", "empty-list"));
+    for (const p of state.phones) {
+        const info = p.device?.info || {};
+        const account = p.account ? "微信号 " + p.account : info.account?.error ? "账号未识别：" + info.account.error.message : "账号识别中";
+        const status = p.connection + (p.connection !== "在线" && info.reasons?.length ? "（" + info.reasons.join("、") + "）" : "") + (p.error ? " · " + p.error : "");
+        const row = el("div", undefined, "phone-row");
+        const copy = el("div", undefined, "phone-copy");
+        copy.append(el("strong", p.phone_url.replace(/^https?:\/\//, "")), el("small", account + " · " + status));
+        const refreshAccount = el("button", "重新识别账号", "text-button");
+        refreshAccount.type = "button";
+        refreshAccount.title = "手机上切换了微信账号后使用：手机空闲时重新读取“我”页面的微信号";
+        refreshAccount.onclick = () => phoneAction(() => api("phones/" + p.id + "/refresh-account", {}), "手机会在空闲时重新识别微信号");
+        const edit = el("button", "修改", "text-button");
+        edit.type = "button";
+        edit.onclick = () => {
+            editingPhone = p.id;
+            resetPhoneForm();
+        };
+        const remove = el("button", "删除", "text-button danger-text");
+        remove.type = "button";
+        remove.onclick = () => {
+            if (!confirm("删除手机 " + p.phone_url + "？\n只删除连接，这个账号的会话和聊天记录仍保留，之后有手机登录同一个微信号时继续使用。")) return;
+            if (editingPhone === p.id) editingPhone = null;
+            phoneAction(() => api("phones/" + p.id + "/delete", {}), "已删除手机连接").then(resetPhoneForm);
+        };
+        row.append(el("span", undefined, "dot" + (p.connection === "在线" ? " online" : /失败|离线/.test(p.connection) ? " error" : "")), copy, refreshAccount, edit, remove);
+        box.append(row);
+    }
+}
+
+// 保存手机：添加或修改，保存后留在对话框里查看连接状态。
+$("settings-form").onsubmit = async (e) => {
+    e.preventDefault();
+    e.submitter.disabled = true;
+    const body = { phone_url: $("phone-url").value, token: $("phone-token").value };
+    await phoneAction(() => api(editingPhone ? "phones/" + editingPhone : "phones", body), editingPhone ? "已保存修改" : "已添加手机，等待连接");
+    if (!$("settings-error").textContent) {
+        editingPhone = null;
+        resetPhoneForm();
+    }
+    e.submitter.disabled = false;
+};
 
 // 全局 AI：模型设置 + 名称规则列表。
 const RULE_FIELDS = [
@@ -640,12 +847,29 @@ $("chat-settings").onclick = () => {
     const c = conversation;
     $("set-kind").value = c.kind;
     $("set-read-every").value = String(c.read_every_seconds || 0);
-    $("set-originals").value = c.originals || (c.kind === "person" ? "on" : "off");
+    $("set-originals").value = c.originals || "on";
     $("set-ai-mode").value = c.ai.mode || "inherit";
     $("set-ai-interval").value = c.ai.interval_seconds || c.ai_effective?.interval_seconds || 30;
     $("set-ai-keyword").value = c.ai.keyword || "";
     $("chat-settings-error").textContent = "";
     $("chat-settings-dialog").showModal();
+};
+// 删除聊天记录：只删电脑上的，确认后执行。
+$("clear-history").onclick = async () => {
+    const c = conversation;
+    const count = c.messages.length;
+    if (!confirm(`删除「${emojify(c.title)}」在电脑上的 ${count} 条聊天记录和相关图片？\n手机微信里的聊天不受影响，删除后不能恢复。`)) return;
+    $("clear-history").disabled = true;
+    try {
+        await api("conversations/" + c.id + "/clear", {});
+        $("chat-settings-dialog").close();
+        toast("已删除电脑上的聊天记录");
+        await refresh();
+    } catch (e) {
+        $("chat-settings-error").textContent = e.message;
+    } finally {
+        $("clear-history").disabled = false;
+    }
 };
 handleForm("chat-settings-form", "chat-settings-error", async () => {
     const c = conversation;
@@ -655,7 +879,7 @@ handleForm("chat-settings-form", "chat-settings-error", async () => {
     const readEvery = Number($("set-read-every").value);
     if (readEvery !== (c.read_every_seconds || 0)) await api(path + "schedule", { read_every_seconds: readEvery });
     const originals = $("set-originals").value;
-    if (originals !== (c.originals || (c.kind === "person" ? "on" : "off"))) await api(path + "originals", { originals });
+    if (originals !== (c.originals || "on")) await api(path + "originals", { originals });
     const ai = { mode: $("set-ai-mode").value, interval_seconds: Number($("set-ai-interval").value), keyword: $("set-ai-keyword").value };
     if (ai.mode !== (c.ai.mode || "inherit") || ai.interval_seconds !== c.ai.interval_seconds || ai.keyword !== (c.ai.keyword || ""))
         await api(path + "ai", ai);

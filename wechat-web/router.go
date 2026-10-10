@@ -25,7 +25,10 @@ func (a *App) handler() http.Handler {
 	api.GET("/state", a.getState)
 	api.GET("/debug", a.getDebug)
 	api.GET("/stream", a.stream)
-	api.POST("/config", a.setPhoneConfig)
+	api.POST("/phones", a.addPhone)
+	api.POST("/phones/:id", a.updatePhone)
+	api.POST("/phones/:id/delete", a.deletePhone)
+	api.POST("/phones/:id/refresh-account", a.refreshPhoneAccount)
 
 	api.POST("/conversations", a.createConversation)
 	api.GET("/conversations/:id", a.getConversation)
@@ -36,6 +39,7 @@ func (a *App) handler() http.Handler {
 	api.POST("/conversations/:id/read", a.createOperation("read"))
 	api.POST("/conversations/:id/send", a.createOperation("send"))
 	api.POST("/conversations/:id/ai", a.setConversationAI)
+	api.POST("/conversations/:id/clear", a.clearConversation)
 
 	api.GET("/ai/config", a.getAIConfig)
 	api.POST("/ai/config", a.setAIConfig)
@@ -147,11 +151,9 @@ func (a *App) getState(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"conversations": conversations,
 		"operations":    operations,
-		"connection":    a.connection,
+		"phones":        a.phoneViewsLocked(),
+		"accounts":      a.accountsLocked(),
 		"error":         a.lastError,
-		"device":        a.device,
-		"phone_url":     a.state.Phone.URL,
-		"token_set":     a.state.Phone.Token != "",
 	})
 }
 
@@ -184,42 +186,6 @@ func (a *App) stream(c *gin.Context) {
 	}
 }
 
-// setPhoneConfig 保存手机地址和 Token；有任务在执行时不允许更换。
-func (a *App) setPhoneConfig(c *gin.Context) {
-	var body struct {
-		PhoneURL string `json:"phone_url"`
-		Token    string `json:"token"`
-	}
-	if !bind(c, &body) {
-		return
-	}
-	address, err := normalizePhone(body.PhoneURL)
-	if err != nil {
-		fail(c, 400, err.Error())
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	token := strings.TrimSpace(body.Token)
-	if token == "" {
-		token = a.state.Phone.Token // 留空表示保留原 Token
-	}
-	if len(token) < 32 || strings.ContainsAny(token, "\r\n") {
-		fail(c, 400, "请输入有效的手机 Token（至少 32 字符）")
-		return
-	}
-	// 换手机前必须等任务结束，否则执行中的任务会去查询新手机
-	for _, op := range a.state.Operations {
-		if op.active() {
-			fail(c, 409, "请等待当前读写任务完成后再更换手机配置")
-			return
-		}
-	}
-	a.state.Phone = PhoneConfig{URL: address, Token: token}
-	a.connection = "连接中"
-	a.saved(c, gin.H{"ok": true})
-}
-
 // ---------- 会话 ----------
 
 // validKind 检查会话类型是否合法。
@@ -228,8 +194,9 @@ func validKind(kind string) bool { return kind == "person" || kind == "group" ||
 // createConversation 手动添加会话（名称必须与手机上显示的完整名称一致）。已存在时更新类型。
 func (a *App) createConversation(c *gin.Context) {
 	var body struct {
-		Title string `json:"title"`
-		Kind  string `json:"kind"`
+		Account string `json:"account"`
+		Title   string `json:"title"`
+		Kind    string `json:"kind"`
 	}
 	if !bind(c, &body) {
 		return
@@ -239,9 +206,22 @@ func (a *App) createConversation(c *gin.Context) {
 		fail(c, 400, "请输入完整微信昵称或群名称，并选择会话类型")
 		return
 	}
+	if unsupportedChats[title] {
+		fail(c, 400, "不支持公众号消息")
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	conv := a.conversationLocked(title)
+	// 会话必须属于一个已知的账号（有手机登录过，或已有会话）
+	known := false
+	for _, acc := range a.accountsLocked() {
+		known = known || acc.WechatID == body.Account
+	}
+	if !known {
+		fail(c, 400, "请先选择账号；没有账号时先连接手机，等手机识别出微信号")
+		return
+	}
+	conv := a.conversationLocked(body.Account, title)
 	conv.Kind = body.Kind
 	a.saved(c, conv)
 }
@@ -257,6 +237,23 @@ func (a *App) getConversation(c *gin.Context) {
 			AIEffective AISetting `json:"ai_effective"`
 		}{conv, a.aiSettingLocked(conv)})
 	}
+}
+
+// clearConversation 删除会话在本地的聊天记录，只删电脑上的，手机上的微信不受影响。
+// 会话有读写任务在执行时拒绝，避免读到的消息在删除之后才并入。
+func (a *App) clearConversation(c *gin.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	conv := a.conversation(c)
+	if conv == nil {
+		return
+	}
+	if a.busyLocked(conv.ID) {
+		fail(c, 409, "这个会话有读写任务在执行，请完成后再删除")
+		return
+	}
+	a.clearHistoryLocked(conv)
+	a.saved(c, gin.H{"ok": true})
 }
 
 // markSeen 清除会话的未读数。
@@ -387,8 +384,8 @@ func (a *App) addOperation(c *gin.Context, kind string) {
 		c.JSON(202, old)
 		return
 	}
-	if a.state.Phone.URL == "" {
-		fail(c, 409, "请先配置手机连接")
+	if a.phoneForLocked(conv) == nil {
+		fail(c, 409, "这个会话的账号当前没有连接的手机")
 		return
 	}
 	// 保存成功后才唤醒 worker 执行

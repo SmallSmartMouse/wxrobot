@@ -3,23 +3,57 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 )
 
 type Conversation struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Kind      string    `json:"kind"` // unknown | person | group
-	Unread    int       `json:"unread"`
-	Updated   string    `json:"updated"`
-	Preview   string    `json:"preview,omitempty"`
-	NeedsRead bool      `json:"dirty,omitempty"` // 收到新消息提示，等待自动读取
-	LastRead  string    `json:"last_read,omitempty"`
-	ReadEvery int       `json:"read_every_seconds,omitempty"` // 定时读取间隔，0 为关闭
-	Originals string    `json:"originals,omitempty"`          // 收到图片是否取原图：on | off；空为联系人取、群聊不取
-	AI        AISetting `json:"ai"`                           // Mode 为空表示跟随名称规则
-	LastSeq   int64     `json:"body_cursor"`
-	Messages  []Message `json:"messages"`
+	ID        string `json:"id"`
+	Account   string `json:"account,omitempty"` // 所属微信号；单手机版本的旧会话为空，等手机上报账号后补上
+	Title     string `json:"title"`
+	Kind      string `json:"kind"` // unknown | person | group
+	Unread    int    `json:"unread"`
+	Updated   string `json:"updated"`
+	Preview   string `json:"preview,omitempty"`
+	NeedsRead bool   `json:"dirty,omitempty"` // 收到新消息提示，等待自动读取
+	// 还有图片没取原图，等待补读。比新消息提示优先级低，同一会话至少间隔 originalsReadGap，避免手机被反复读取占满。
+	OriginalsDue bool      `json:"originals_due,omitempty"`
+	LastRead     string    `json:"last_read,omitempty"`
+	ReadEvery    int       `json:"read_every_seconds,omitempty"` // 定时读取间隔，0 为关闭
+	Originals    string    `json:"originals,omitempty"`          // 收到图片是否取原图：on | off；空为取
+	AI           AISetting `json:"ai"`                           // Mode 为空表示跟随名称规则
+	LastSeq      int64     `json:"body_cursor"`
+	// 发送人名称 → 头像（聊天页截取的图片哈希）。手机每次读取只为每个发送人截一次头像，所以按人保存，不放在每条消息上。
+	Members map[string]string `json:"members,omitempty"`
+	// 网页上删除聊天记录时留下的最后几条消息：不显示，只用来和之后读到的屏幕衔接，
+	// 避免手机屏幕上还在的旧消息又被当作新消息导入。
+	Anchor   []Message `json:"anchor,omitempty"`
+	Messages []Message `json:"messages"`
 }
+
+// anchorSize 删除聊天记录时留作衔接点的消息条数。
+const anchorSize = 5
+
+// withAnchor 在 messages 前面接上删除记录时留下的衔接点（返回新切片，不修改原数据）。
+func (c *Conversation) withAnchor(messages []Message) []Message {
+	return append(append([]Message{}, c.Anchor...), messages...)
+}
+
+// clearHistory 清空聊天记录，留下最后几条作为衔接点，返回被删除的消息。
+func (c *Conversation) clearHistory() []Message {
+	removed := c.Messages
+	all := c.withAnchor(removed)
+	c.Anchor = nil
+	for _, m := range all[max(0, len(all)-anchorSize):] {
+		c.Anchor = append(c.Anchor, Message{Text: m.Text, Direction: m.Direction, Sender: m.Sender, Kind: m.Kind})
+	}
+	c.Messages = []Message{}
+	c.Unread, c.Preview = 0, ""
+	c.NeedsRead, c.OriginalsDue = false, false
+	return removed
+}
+
+// unsupportedChats 不处理的会话：公众号（旧版微信叫“订阅号消息”）是文章推送的汇总入口，不是聊天。
+var unsupportedChats = map[string]bool{"公众号": true, "订阅号消息": true}
 
 // Message 是从手机界面观察到的一条消息。微信界面没有消息编号，Seq 是本地按观察顺序分配的。
 type Message struct {
@@ -27,8 +61,9 @@ type Message struct {
 	Seq        int64  `json:"seq"`
 	Text       string `json:"text"`
 	Direction  string `json:"direction"`            // incoming | outgoing | unknown
-	Kind       string `json:"kind,omitempty"`       // image 表示图片
-	ImageHash  string `json:"image_hash,omitempty"` // 聊天页面的缩略图
+	Sender     string `json:"sender,omitempty"`     // 发送人名称（来自头像描述或群昵称），没识别出来为空
+	Kind       string `json:"kind,omitempty"`       // image 图片 | sticker 表情包 | system 系统提示（没有发送人）
+	ImageHash  string `json:"image_hash,omitempty"` // 聊天页面的缩略图（表情包也是）
 	ImageError string `json:"image_error,omitempty"`
 	// 原图：手机点开大图后保存的文件。取失败会重试，最多 2 次。
 	OriginalHash  string `json:"original_hash,omitempty"`
@@ -59,14 +94,18 @@ func (c *Conversation) migrate() {
 	}
 }
 
-// wantsOriginals 表示收到的图片是否需要取原图。
+// wantsOriginals 表示收到的图片是否需要取原图（默认取；聊天页的缩略图只有屏幕上显示的大小，不清晰）。
 func (c *Conversation) wantsOriginals() bool {
-	return c.Originals == "on" || (c.Originals == "" && c.Kind == "person")
+	return c.Originals != "off"
 }
 
-// firstPendingOriginal 返回最近 30 条消息中最早一张还需要取原图的图片位置，没有返回 -1。
+// originalWindow 只为最近这么多条消息里的图片补取原图。
+// 停止点会挪到最早一张待取原图的图片之前，回看太远时手机要翻很多页（长消息的群一条就占一屏）。
+const originalWindow = 10
+
+// firstPendingOriginal 返回最近 originalWindow 条消息中最早一张还需要取原图的图片位置，没有返回 -1。
 func (c *Conversation) firstPendingOriginal() int {
-	for i := max(0, len(c.Messages)-30); i < len(c.Messages); i++ {
+	for i := max(0, len(c.Messages)-originalWindow); i < len(c.Messages); i++ {
 		m := c.Messages[i]
 		if m.Kind == "image" && m.OriginalHash == "" && m.OriginalTries < 2 {
 			return i
@@ -79,6 +118,8 @@ func (c *Conversation) firstPendingOriginal() int {
 type observedMessage struct {
 	Text          string `json:"text"`
 	Direction     string `json:"direction"`
+	Sender        string `json:"sender"`
+	Avatar        string `json:"avatar"` // 发送人头像（JPEG Base64），每次读取每个发送人只带一次
 	Kind          string `json:"kind"`
 	Thumbnail     string `json:"thumbnail"`
 	ImageError    string `json:"image_error"`
@@ -87,24 +128,67 @@ type observedMessage struct {
 	OriginalNote  string `json:"original_note"`
 }
 
-// attachImage 把这次观察到的缩略图和原图补到消息上（已有的不覆盖）。
-func (a *App) attachImage(m *Message, seen observedMessage) {
-	if m.Kind != "image" {
-		return
+// isMedia 图片和表情包：文字是固定的“[图片]”“[表情]”，内容在缩略图里。
+func isMedia(m Message) bool { return m.Kind == "image" || m.Kind == "sticker" }
+
+// unanchored 不能用来定位的消息：图片、表情的文字是固定的，系统提示常常重复出现。
+// 手机端 afterTexts 跳过同样的类型，两边必须一致。
+func unanchored(m Message) bool { return isMedia(m) || m.Kind == "system" }
+
+// legacyNotice 旧版本没有区分系统提示，把它们存成了方向未识别的文字；按常见的提示文字认出来。
+var legacyNotice = regexp.MustCompile(`^(你的账号被限制与对方聊天|.{0,40}撤回了一条消息|以上是打招呼的内容|你已添加了.{1,40}，现在可以开始聊天了|.{1,80}加入了群聊|.{1,40}修改群名为|.{1,40}拍了拍)`)
+
+// markLegacyNotices 把旧记录里的系统提示改为 system 类型，返回改过的消息序号。
+func (c *Conversation) markLegacyNotices() []int64 {
+	var changed []int64
+	for i := range c.Messages {
+		m := &c.Messages[i]
+		if m.Kind == "" && m.Direction == "unknown" && legacyNotice.MatchString(m.Text) {
+			m.Kind = "system"
+			changed = append(changed, m.Seq)
+		}
+	}
+	return changed
+}
+
+// attachObserved 把这次观察到的发送人、缩略图和原图补到消息上（已有的不覆盖），返回消息是否有变化。
+func (a *App) attachObserved(m *Message, seen observedMessage) bool {
+	before := *m
+	// 发送人：之前被屏幕边缘截断没识别出来的，这次补上
+	if m.Sender == "" {
+		m.Sender = seen.Sender
 	}
 	// 缩略图：之前没有才保存
-	if m.ImageHash == "" && seen.Thumbnail != "" {
+	if isMedia(*m) && m.ImageHash == "" && seen.Thumbnail != "" {
 		m.ImageHash, m.ImageError = a.saveThumbnail(seen.Thumbnail)
 	}
 	// 原图：已有就不动；这次取到了就记下；这次取失败就记下原因并累计次数（满 2 次不再尝试）
-	switch {
-	case m.OriginalHash != "":
-	case seen.OriginalHash != "":
-		m.OriginalHash, m.OriginalError, m.OriginalNote = seen.OriginalHash, "", seen.OriginalNote
-	case seen.OriginalError != "":
-		m.OriginalError = seen.OriginalError
-		m.OriginalTries++
+	if m.Kind == "image" {
+		switch {
+		case m.OriginalHash != "":
+		case seen.OriginalHash != "":
+			m.OriginalHash, m.OriginalError, m.OriginalNote = seen.OriginalHash, "", seen.OriginalNote
+		case seen.OriginalError != "":
+			m.OriginalError = seen.OriginalError
+			m.OriginalTries++
+		}
 	}
+	return *m != before
+}
+
+// rememberAvatar 保存发送人的头像（以最新一次截取的为准）。
+func (a *App) rememberAvatar(c *Conversation, seen observedMessage) {
+	if seen.Sender == "" || seen.Avatar == "" {
+		return
+	}
+	hash, problem := a.saveThumbnail(seen.Avatar)
+	if problem != "" {
+		return
+	}
+	if c.Members == nil {
+		c.Members = map[string]string{}
+	}
+	c.Members[seen.Sender] = hash
 }
 
 // mergeLocked 把手机读到的一屏（或多屏）消息并入会话，返回是否与已有记录衔接上。
@@ -123,21 +207,28 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 	// 把手机上报的消息转成待比对的窗口，时间统一用这次的观察时间
 	window := make([]Message, len(snapshot.Messages))
 	for i, m := range snapshot.Messages {
-		window[i] = Message{Text: m.Text, Direction: m.Direction, Kind: m.Kind, ImageError: m.ImageError, Time: snapshot.CapturedAt}
+		window[i] = Message{Text: m.Text, Direction: m.Direction, Sender: m.Sender, Kind: m.Kind, ImageError: m.ImageError, Time: snapshot.CapturedAt}
 	}
-	// 只和最近 100 条已记录消息比对
-	known := c.Messages[max(0, len(c.Messages)-100):]
+	// 只和最近 100 条已记录消息比对；记录被删除过且不足 100 条时，前面接上删除时留下的衔接点
+	recent := c.Messages[max(0, len(c.Messages)-100):]
+	known := recent
+	if len(recent) < 100 {
+		known = c.withAnchor(recent)
+	}
+	prefix := len(known) - len(recent) // known 开头这么多条是衔接点，不对应 c.Messages
 	start, base, aligned := newMessagesStart(known, window)
 	// 接不上且不允许整批追加：什么都不做，由调用方决定（例如加深读取）
 	if !aligned && !appendOnGap {
 		return false
 	}
-	// 衔接上的部分对应已有消息：补上之前没取到的缩略图和原图。
+	for _, seen := range snapshot.Messages {
+		a.rememberAvatar(c, seen)
+	}
+	// 衔接上的部分对应已有消息：补上之前没取到的发送人、缩略图和原图。
 	for i := 0; aligned && i < start; i++ {
-		if k := base + i; k >= 0 && k < len(known) {
-			m := &c.Messages[len(c.Messages)-len(known)+k]
-			if m.Kind == "image" {
-				a.attachImage(m, snapshot.Messages[i])
+		if k := base + i - prefix; k >= 0 && k < len(recent) {
+			m := &c.Messages[len(c.Messages)-len(recent)+k]
+			if a.attachObserved(m, snapshot.Messages[i]) {
 				a.markMessage(c.ID, m.Seq)
 			}
 		}
@@ -145,7 +236,7 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 	// 衔接点之后都是新消息：分配序号、计入未读、更新列表预览，并标记待写入数据库
 	for i := start; i < len(window); i++ {
 		m := window[i]
-		a.attachImage(&m, snapshot.Messages[i])
+		a.attachObserved(&m, snapshot.Messages[i])
 		c.LastSeq++
 		m.Seq = c.LastSeq
 		m.ID = fmt.Sprintf("%s:%d", c.ID, m.Seq)
@@ -155,8 +246,11 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 		}
 		c.Messages = append(c.Messages, m)
 		a.markMessage(c.ID, m.Seq)
-		c.Preview = m.Text
-		c.Updated = now()
+		// 系统提示不作为列表预览
+		if m.Kind != "system" {
+			c.Preview = m.Text
+			c.Updated = now()
+		}
 	}
 	if !aligned {
 		// 缺口批次可能包含已经回复过的消息，不触发 AI。
@@ -206,10 +300,13 @@ func occurrences(hay, needle []Message) (count, pos int) {
 	return count, pos
 }
 
-// sameMessage 比较文字和类型；方向未识别时视为相同。
+// sameMessage 比较文字、类型和发送人；方向未识别、发送人为空（被屏幕边缘截断、旧记录）时视为相同。
 // 图片只比较类型和方向：同一张图每次截图的字节可能不同。
 func sameMessage(a, b Message) bool {
 	if a.Text != b.Text || a.Kind != b.Kind {
+		return false
+	}
+	if a.Sender != "" && b.Sender != "" && a.Sender != b.Sender {
 		return false
 	}
 	return a.Direction == b.Direction || a.Direction == "unknown" || b.Direction == "unknown"

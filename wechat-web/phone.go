@@ -16,11 +16,6 @@ import (
 	"time"
 )
 
-type PhoneConfig struct {
-	URL   string `json:"phone_url"`
-	Token string `json:"token"`
-}
-
 // Operation 是一次读取或发送任务。ID 由网页生成，同时作为手机任务的 Idempotency-Key，
 // 因此服务重启后重新提交也不会让手机重复执行。
 type Operation struct {
@@ -31,10 +26,11 @@ type Operation struct {
 	ImageHash      string `json:"image_hash,omitempty"`
 	Limit          int    `json:"limit,omitempty"`
 	Auto           bool   `json:"auto,omitempty"`   // 自动发起的读取
-	Reason         string `json:"reason,omitempty"` // 自动读取原因：notification | schedule | deep
+	Reason         string `json:"reason,omitempty"` // 自动读取原因：notification | schedule | originals | deep
 	Status         string `json:"status"`           // queued | running | succeeded | failed | unknown
 	Error          string `json:"error,omitempty"`
 	PhoneTaskID    string `json:"phone_task_id,omitempty"`
+	PhoneID        string `json:"phone_id,omitempty"` // 执行这个任务的手机：开始执行时确定，服务重启后仍向同一台手机查询
 	Created        string `json:"created"`
 	// 手机上报的执行记录：耗时、步骤，以及降级（操作完成了但用了不太可靠的办法，例如标题改用 OCR 核对）。
 	DurationMS int64         `json:"duration_ms,omitempty"`
@@ -64,6 +60,7 @@ func (op *Operation) active() bool { return op.Status == "queued" || op.Status =
 type PhoneEvent struct {
 	Seq      int64           `json:"seq"`
 	Kind     string          `json:"kind"`
+	Account  string          `json:"account"` // 事件发生时手机登录的微信号（旧版手机桥没有）
 	Chat     string          `json:"chat"`
 	Text     string          `json:"text"`
 	Snapshot json.RawMessage `json:"snapshot"`
@@ -149,35 +146,23 @@ func normalizePhone(raw string) (string, error) {
 	return u.String(), nil
 }
 
-// setConnection 更新手机连接状态和手机上报的状态，并通知网页刷新（不写数据库）。
-func (a *App) setConnection(status string, device json.RawMessage, err error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.connection = status
-	if device != nil {
-		a.device = device
-	}
-	if err != nil {
-		a.lastError = err.Error()
-	} else if status == "在线" {
-		a.lastError = "" // 连接恢复后清掉之前的连接错误
-	}
-	a.notifyLocked()
-}
-
 // ---------- 事件同步 ----------
 
-// eventLoop 查询手机状态，再长轮询新事件（手机有事件时立即返回，否则最多等 20 秒）。
-func (a *App) eventLoop(ctx context.Context) {
+// eventLoop 查询一台手机的状态，再长轮询新事件（手机有事件时立即返回，否则最多等 20 秒）。手机被删除时退出。
+func (a *App) eventLoop(ctx context.Context, phoneID string) {
 	for ctx.Err() == nil {
-		// 每轮取一次当前配置和事件游标；没有配置手机时空转等待
+		// 每轮取一次当前配置和事件游标
 		a.mu.Lock()
-		cfg, cursor := a.state.Phone, a.state.Cursor
-		a.mu.Unlock()
-		if cfg.URL == "" || cfg.Token == "" {
-			pause(ctx, time.Second)
-			continue
+		p := a.phoneLocked(phoneID)
+		var cfg PhoneConfig
+		if p != nil {
+			cfg = *p
 		}
+		a.mu.Unlock()
+		if p == nil {
+			return
+		}
+		cursor := cfg.Cursor
 		var device struct {
 			Online bool `json:"online"`
 			Info   struct {
@@ -195,7 +180,7 @@ func (a *App) eventLoop(ctx context.Context) {
 			} else if !device.Info.Ready {
 				status = "手机未就绪"
 			}
-			a.setConnection(status, raw, nil)
+			a.setPhoneStatus(phoneID, status, raw, nil)
 		}
 		var batch struct {
 			Events []PhoneEvent `json:"events"`
@@ -208,37 +193,48 @@ func (a *App) eventLoop(ctx context.Context) {
 		}
 		if err != nil {
 			if ctx.Err() == nil {
-				a.setConnection("连接失败", nil, err)
+				a.setPhoneStatus(phoneID, "连接失败", nil, err)
 			}
 			pause(ctx, 3*time.Second)
 			continue
 		}
 
 		a.mu.Lock()
-		// 等待期间如果改了手机配置，这批事件来自旧手机，丢弃
-		if a.state.Phone == cfg && len(batch.Events) > 0 {
+		// 等待期间如果改了手机地址或删除了手机，这批事件来自旧手机，丢弃
+		p = a.phoneLocked(phoneID)
+		if p != nil && p.URL == cfg.URL && p.Token == cfg.Token && len(batch.Events) > 0 {
 			for _, e := range batch.Events {
-				a.ingestLocked(e)
+				a.ingestLocked(p, e)
 			}
-			a.state.Cursor = batch.Cursor
+			p.Cursor = batch.Cursor
 			_ = a.commitLocked()
 			a.wakeWorker() // 通知类事件需要尽快读取
-		} else if batch.Latest < cursor {
+		} else if p != nil && batch.Latest < cursor {
 			// 手机事件序号比本地游标还小，说明换了手机或手机时钟回拨，从头同步。
-			a.state.Cursor = 0
+			p.Cursor = 0
 			_ = a.commitLocked()
 		}
 		a.mu.Unlock()
 	}
 }
 
-// ingestLocked 处理一条手机事件：通知和未读提示只标记会话需要读取（通知文字作为列表预览），
-// 当前聊天的屏幕快照直接并入正文。
-func (a *App) ingestLocked(e PhoneEvent) {
-	if strings.TrimSpace(e.Chat) == "" {
+// wechatSystemTitle 微信自己的系统通知（“你有1条消息未发送”等）的标题，不是会话名称。
+const wechatSystemTitle = "微信"
+
+// ingestLocked 处理手机 p 的一条事件：通知和未读提示只标记会话需要读取（通知文字作为列表预览），
+// 当前聊天的屏幕快照直接并入正文。会话归到事件发生时手机登录的账号；手机还没识别出账号时丢弃，之后的读取会补上。
+func (a *App) ingestLocked(p *PhoneConfig, e PhoneEvent) {
+	if strings.TrimSpace(e.Chat) == "" || unsupportedChats[e.Chat] || (e.Kind == "notification" && e.Chat == wechatSystemTitle) {
 		return
 	}
-	c := a.conversationLocked(e.Chat)
+	account := e.Account
+	if account == "" {
+		account = p.Account // 旧版手机桥的事件不带账号
+	}
+	if account == "" {
+		return
+	}
+	c := a.conversationLocked(account, e.Chat)
 	switch e.Kind {
 	case "notification":
 		c.Preview = e.Text
@@ -249,91 +245,121 @@ func (a *App) ingestLocked(e PhoneEvent) {
 	case "visible_snapshot":
 		a.mergeLocked(c, e.Snapshot, false)
 		if c.wantsOriginals() && c.firstPendingOriginal() >= 0 {
-			c.NeedsRead = true // 监测不点开图片，由读取任务去取原图
+			c.OriginalsDue = true // 监测不点开图片，由读取任务去取原图
 		}
 	}
 }
 
 // ---------- 读写任务 ----------
 
-// worker 串行执行任务：同一时刻只有一个任务在操作手机。没有任务时安排自动读取。
+// worker 串行执行一台手机的任务：同一时刻这台手机上只有一个任务。没有任务时安排自动读取。手机被删除时退出。
 // 状态为 running 的任务是上次服务退出时未完成的，会接着查询结果而不是重新执行。
-func (a *App) worker(ctx context.Context) {
+func (a *App) worker(ctx context.Context, phoneID string) {
 	for ctx.Err() == nil {
 		// 有待执行的任务先执行，执行完马上看下一个
-		if id := a.nextOperation(); id != "" {
-			a.runOperation(ctx, id)
+		if id := a.nextOperation(phoneID); id != "" {
+			a.runOperation(ctx, phoneID, id)
 			continue
 		}
 		// 没有任务时，看是否有会话需要自动读取
-		if a.scheduleAutoRead() {
+		if a.scheduleAutoRead(phoneID) {
 			continue
+		}
+		a.mu.Lock()
+		rt := a.phones[phoneID]
+		a.mu.Unlock()
+		if rt == nil {
+			return
 		}
 		// 都没有就等：有新任务时被唤醒，否则每秒检查一次（定时读取靠这个触发）
 		select {
 		case <-ctx.Done():
-		case <-a.wake:
+		case <-rt.wake:
 		case <-time.After(time.Second):
 		}
 	}
 }
 
-// wakeWorker 唤醒 worker 立即检查任务；已有未处理的唤醒时不重复发送。
+// wakeWorker 唤醒所有手机的 worker 立即检查任务；已有未处理的唤醒时不重复发送。调用前须持有锁。
 func (a *App) wakeWorker() {
-	select {
-	case a.wake <- struct{}{}:
-	default:
+	for _, rt := range a.phones {
+		select {
+		case rt.wake <- struct{}{}:
+		default:
+		}
 	}
 }
 
-// nextOperation 返回最早创建的未结束任务编号，没有返回空字符串。
-func (a *App) nextOperation() string {
+// nextOperation 返回这台手机要执行的最早的未结束任务编号，没有返回空字符串：
+// 已交给这台手机的任务，或者会话由这台手机负责、还没交给任何手机的任务。选中的任务即归这台手机。
+func (a *App) nextOperation(phoneID string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.failOrphansLocked()
+	p := a.phoneLocked(phoneID)
+	if p == nil {
+		return ""
+	}
 	var next *Operation
 	for _, op := range a.state.Operations {
-		if op.active() && (next == nil || op.Created < next.Created) {
+		if !op.active() || (next != nil && op.Created >= next.Created) {
+			continue
+		}
+		c := a.state.Conversations[op.ConversationID]
+		if op.PhoneID == phoneID || (op.PhoneID == "" && c != nil && p.owns(c)) {
 			next = op
 		}
 	}
 	if next == nil {
 		return ""
 	}
+	next.PhoneID = phoneID
 	return next.ID
 }
 
 const (
-	triggerReadGap = 5 * time.Second // 收到提示后，同一会话两次读取的最短间隔
-	shallowRead    = 30              // 没有已记录的文字可作停止点时，自动读取的条数
-	deepRead       = 100             // 有停止点时自动读取的条数（读到已记录的消息就停）；也是接不上时加深读取的条数
+	triggerReadGap   = 5 * time.Second  // 收到提示后，同一会话两次读取的最短间隔
+	originalsReadGap = 60 * time.Second // 只为补取原图时，同一会话两次读取的最短间隔
+	shallowRead      = 30               // 没有已记录的文字可作停止点时，自动读取的条数
+	deepRead         = 100              // 有停止点时自动读取的条数（读到已记录的消息就停）；也是接不上时加深读取的条数
 )
+
+// readPriority 自动读取原因的优先级，数字小的先读。
+var readPriority = map[string]int{"notification": 0, "schedule": 1, "originals": 2}
 
 // scheduleAutoRead 选出一个需要读取的会话并建立读取任务，返回是否建立了任务。
 //   - 收到通知或未读提示：距上次读取满 5 秒即读（优先）
 //   - 开启了定时读取：距上次读取满设定间隔
+//   - 还有图片没取原图：距上次读取满 1 分钟
 //
 // 同类会话中先读最久没读的。
-func (a *App) scheduleAutoRead() bool {
+func (a *App) scheduleAutoRead(phoneID string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// 手机不在线时不安排，免得产生一堆失败的读取
-	if a.connection != "在线" {
+	// 手机不在线时不安排，免得产生一堆失败的读取；只安排这台手机负责的会话
+	p := a.phoneLocked(phoneID)
+	if p == nil || !a.onlineLocked(phoneID) {
 		return false
 	}
 	var pick *Conversation
 	var pickReason string
 	var pickLast time.Time
-	// 逐个会话判断是否需要读取，并按“通知优先、其次最久没读”挑出一个
+	// 逐个会话判断是否需要读取，按原因的优先级、其次最久没读挑出一个
 	for _, c := range a.state.Conversations {
+		if !p.owns(c) {
+			continue
+		}
 		last, _ := time.Parse(time.RFC3339Nano, c.LastRead)
 		reason := ""
 		if c.NeedsRead && time.Since(last) >= triggerReadGap {
 			reason = "notification"
 		} else if c.ReadEvery > 0 && time.Since(last) >= time.Duration(c.ReadEvery)*time.Second {
 			reason = "schedule"
+		} else if c.OriginalsDue && time.Since(last) >= originalsReadGap {
+			reason = "originals"
 		}
 		better := pick == nil ||
-			(reason == "notification" && pickReason == "schedule") ||
+			readPriority[reason] < readPriority[pickReason] ||
 			(reason == pickReason && last.Before(pickLast))
 		if reason != "" && better {
 			pick, pickReason, pickLast = c, reason, last
@@ -354,7 +380,7 @@ func (a *App) scheduleAutoRead() bool {
 
 // queueReadLocked 为会话建立一个自动读取任务，清除“需要读取”标记并记下读取时间，然后唤醒 worker。
 func (a *App) queueReadLocked(c *Conversation, limit int, reason string) {
-	c.NeedsRead = false
+	c.NeedsRead, c.OriginalsDue = false, false
 	c.LastRead = now()
 	op := &Operation{ID: "auto-" + randomID(), ConversationID: c.ID, Kind: "read", Limit: limit, Auto: true, Reason: reason, Status: "queued", Created: now()}
 	a.state.Operations[op.ID] = op
@@ -364,14 +390,24 @@ func (a *App) queueReadLocked(c *Conversation, limit int, reason string) {
 
 // runOperation 执行一个任务：组装请求提交给手机，再每秒查询一次直到完成，最后记录结果。
 // 任务编号同时作为 Idempotency-Key，重复提交不会让手机重复执行。
-func (a *App) runOperation(ctx context.Context, id string) {
+func (a *App) runOperation(ctx context.Context, phoneID, id string) {
 	a.mu.Lock()
 	op := a.state.Operations[id]
 	c := a.state.Conversations[op.ConversationID]
-	cfg := a.state.Phone
+	p := a.phoneLocked(phoneID)
+	if p == nil || c == nil {
+		a.finishLocked(op, "failed", nil, "手机或会话已删除，任务未执行")
+		a.mu.Unlock()
+		return
+	}
+	cfg := *p
+	op.PhoneID = phoneID
 	kind, taskID := op.Kind, op.PhoneTaskID
-	// 组装手机任务参数：聊天名称、群聊标记，再按读取 / 发图 / 发文字补充
+	// 组装手机任务参数：聊天名称、群聊标记、预期的微信号（手机核对，不一致时拒绝执行），再按读取 / 发图 / 发文字补充
 	body := map[string]any{"chat": c.Title}
+	if c.Account != "" {
+		body["account"] = c.Account
+	}
 	if c.Kind == "group" {
 		body["chat_type"] = "group"
 	}
@@ -527,14 +563,14 @@ func autoReadUntil(c *Conversation) []string {
 			known = c.Messages[:i]
 		}
 	}
-	return lastTexts(known, 3)
+	return lastTexts(c.withAnchor(known), 3)
 }
 
-// lastTexts 返回最后 n 条文字消息（跳过图片，图片的文字都是“[图片]”，无法区分）。
+// lastTexts 返回最后 n 条文字消息（跳过图片、表情和系统提示，它们无法区分位置）。
 func lastTexts(messages []Message, n int) []string {
 	texts := []string{}
 	for i := len(messages) - 1; i >= 0 && len(texts) < n; i-- {
-		if messages[i].Kind != "image" {
+		if !unanchored(messages[i]) {
 			texts = append([]string{messages[i].Text}, texts...)
 		}
 	}
@@ -555,6 +591,7 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 	var r struct {
 		Code        string          `json:"code"`
 		Message     string          `json:"message"`
+		Account     string          `json:"account"`     // 执行时手机登录的微信号
 		StopReason  string          `json:"stop_reason"` // 读取停止的原因
 		Snapshot    json.RawMessage `json:"snapshot"`    // 发送后补读的当前屏幕
 		SyncError   string          `json:"sync_error"`  // 发送成功但补读失败
@@ -565,6 +602,12 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 		} `json:"diagnostics"`
 	}
 	_ = json.Unmarshal(result, &r)
+	// 手机核对过账号；这里再防一次：执行时的账号与会话不一致，读到的内容不属于这个会话，不保存
+	// （只用于读取：发送已经成功就是已经发出去了，不能改成失败）
+	if op.Kind == "read" && status == "succeeded" && c != nil && c.Account != "" && r.Account != "" && r.Account != c.Account {
+		status, message = "failed", "执行时手机上的微信账号是 "+r.Account+"，与会话的账号 "+c.Account+" 不一致，结果未保存"
+		op.Status, op.Error = status, message
+	}
 	// 保存手机上报的执行记录（步骤只留最后 60 条），发送后补读失败也算一处降级
 	d := r.Diagnostics
 	op.DurationMS, op.Steps, op.Warnings = d.DurationMS, d.Steps[max(0, len(d.Steps)-60):], d.Warnings
@@ -597,7 +640,7 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 		if aligned := a.mergeLocked(c, result, deepEnough); !aligned && !deepEnough {
 			a.queueReadLocked(c, deepRead, "deep")
 		} else if aligned && c.wantsOriginals() && c.firstPendingOriginal() >= 0 && c.firstPendingOriginal() != pendingBefore {
-			c.NeedsRead = true // 还有图片没取原图，且这次有进展：接着读
+			c.OriginalsDue = true // 还有图片没取原图，且这次有进展：过一会儿接着读
 		}
 	default:
 		// 发送后的屏幕快照接不上（发送前有没读到的消息）或补读失败时，再安排一次读取。

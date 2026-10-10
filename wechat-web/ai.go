@@ -97,6 +97,8 @@ func (a *App) aiSettingLocked(c *Conversation) AISetting {
 func (a *App) aiLoop(ctx context.Context) {
 	for pause(ctx, time.Second) {
 		a.mu.Lock()
+		// 没有手机能执行的排队任务直接失败（没有手机时不会有 worker 来处理它们）
+		a.failOrphansLocked()
 		// 加锁挑出一个需要回复的会话并建好记录，解锁后再调用模型（耗时操作不持锁）
 		jobID := a.nextAutoJobLocked()
 		a.mu.Unlock()
@@ -181,6 +183,9 @@ func (a *App) chatHistoryLocked(cfg AIConfig, c *Conversation) []openai.ChatComp
 	}
 	// 逐条转换：过长的文字截到 4000 字；开启看图时，来信图片以 Base64 一并发送
 	for _, m := range c.Messages[max(0, len(c.Messages)-20):] {
+		if m.Kind == "system" {
+			continue // 系统提示不是对话内容
+		}
 		text := m.Text
 		if r := []rune(text); len(r) > 4000 {
 			text = string(r[:4000])
@@ -188,6 +193,10 @@ func (a *App) chatHistoryLocked(cfg AIConfig, c *Conversation) []openai.ChatComp
 		if m.Direction == "outgoing" {
 			history = append(history, openai.AssistantMessage(text))
 			continue
+		}
+		// 群聊里注明是谁说的
+		if c.Kind == "group" && m.Sender != "" {
+			text = m.Sender + "：" + text
 		}
 		if cfg.Vision && m.ImageHash != "" {
 			if data, err := a.readImage(m.ImageHash); err == nil {
@@ -239,6 +248,8 @@ func (a *App) generateReply(ctx context.Context, jobID string) {
 		job.Status, job.Error = "failed", "AI 返回了矢量图内容，无法作为文字发送"
 	case a.aiSettingLocked(c).Mode != "auto":
 		job.Status, job.Error = "failed", "生成期间自动回复已关闭，未发送"
+	case a.phoneForLocked(c) == nil:
+		job.Status, job.Error = "failed", "会话的账号当前没有连接的手机，未发送"
 	default:
 		op := &Operation{ID: "ai-" + job.ID, ConversationID: c.ID, Kind: "send", Text: reply, Status: "queued", Created: now()}
 		a.state.Operations[op.ID] = op

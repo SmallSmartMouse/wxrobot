@@ -3,7 +3,7 @@
 
 const $ = (id) => document.getElementById(id);
 const STATUS = { queued: "排队", running: "执行中", succeeded: "成功", failed: "失败", unknown: "结果未知" };
-const REASONS = { notification: "通知触发", schedule: "定时", deep: "加深读取" };
+const REASONS = { notification: "通知触发", schedule: "定时", originals: "补取原图", deep: "加深读取" };
 const READY_REASONS = {
     ACCESSIBILITY_DISABLED: "无障碍服务未开启",
     READER_SERVICE_REQUIRED: "随选朗读未开启",
@@ -62,14 +62,22 @@ function card(id, title, value, detail, kind) {
 
 // renderCards 三张概况卡片：手机状态、最近 24 小时任务、最近 1 小时手机事件。
 function renderCards() {
-    const device = data.device || {};
-    const info = device.info || {};
-    const reasons = (info.reasons || []).map((r) => READY_REASONS[r] || r);
-    // 手机：没连上 / 微信桥离线 / 未就绪（列出原因）/ 就绪
-    if (!device.info) card("card-phone", "手机", data.connection, data.error || "还没有连上手机", "bad");
-    else if (!device.online) card("card-phone", "手机", "微信桥离线", "超过 45 秒没有心跳，请检查手机上的脚本", "bad");
-    else if (!info.ready) card("card-phone", "手机", "未就绪", reasons.join("、"), "warn");
-    else card("card-phone", "手机", "在线 · 就绪", `微信 ${info.wechat_version || ""} · ${info.wechat_storage_permission === false ? "微信无存储权限（原图改用截图）" : "存储权限正常"}`, "good");
+    // 手机：每台一行（没连上 / 微信桥离线 / 未就绪并列出原因 / 就绪），卡片颜色取最差的一台
+    const phones = data.phones || [];
+    const lines = phones.map((p) => {
+        const device = p.device || {};
+        const info = device.info || {};
+        const name = p.phone_url.replace(/^https?:\/\//, "") + (p.account ? "（" + p.account + "）" : "");
+        if (!device.info) return [name + "：" + (p.error || p.connection), "bad"];
+        if (!device.online) return [name + "：微信桥离线，超过 45 秒没有心跳", "bad"];
+        if (!info.ready) return [name + "：未就绪，" + (info.reasons || []).map((r) => READY_REASONS[r] || r).join("、"), "warn"];
+        const account = info.account?.wechat_id ? "微信号 " + info.account.wechat_id : info.account?.error ? "账号未识别：" + info.account.error.message : "账号识别中";
+        return [`${name}：就绪 · 微信 ${info.wechat_version || ""} · ${account} · ${info.wechat_storage_permission === false ? "微信无存储权限（原图改用截图）" : "存储权限正常"}`, "good"];
+    });
+    const worst = lines.some((l) => l[1] === "bad") ? "bad" : lines.some((l) => l[1] === "warn") ? "warn" : "good";
+    const ready = lines.filter((l) => l[1] === "good").length;
+    if (!phones.length) card("card-phone", "手机", "未连接", "还没有添加手机", "bad");
+    else card("card-phone", "手机", `${ready} / ${phones.length} 台就绪`, lines.map((l) => l[0]).join("\n"), worst);
 
     // 任务：最近 24 小时的总数、失败数、有降级的成功数
     const day = Date.now() - 86400000;
@@ -80,7 +88,7 @@ function renderCards() {
     card("card-tasks", "最近 24 小时任务", recent.length + capped, `失败 ${failed} · 有降级 ${degraded}`, failed ? "bad" : degraded ? "warn" : "good");
 
     // 手机事件：最近 1 小时内出现过的异常和降级
-    const events = device.diagnostics || [];
+    const events = phoneEvents();
     const hour = Date.now() - 3600000;
     const lastHour = events.filter((e) => new Date(e.last_at).getTime() > hour);
     const errors = lastHour.filter((e) => e.level === "error").length;
@@ -89,9 +97,17 @@ function renderCards() {
 
 // ---------- 手机事件 ----------
 
+// phoneEvents 所有手机上报的异常与降级（标上是哪台手机），按时间从旧到新。
+function phoneEvents() {
+    const multiple = (data.phones || []).length > 1;
+    return (data.phones || [])
+        .flatMap((p) => (p.device?.diagnostics || []).map((e) => ({ ...e, phone: multiple ? p.account || p.phone_url.replace(/^https?:\/\//, "") : "" })))
+        .sort((a, b) => (a.last_at < b.last_at ? -1 : 1));
+}
+
 // renderEvents 手机上报的异常与降级，新的在前；属于某个任务的可以点击跳到该任务。
 function renderEvents() {
-    const events = [...(data.device?.diagnostics || [])].reverse();
+    const events = phoneEvents().reverse();
     const box = $("events");
     box.replaceChildren();
     for (const e of events) {
@@ -99,7 +115,7 @@ function renderEvents() {
         row.append(
             el("time", time(e.last_at)),
             chip(e.level === "error" ? "异常" : "降级", e.level === "error" ? "bad" : "warn"),
-            el("span", e.chat || (e.source === "monitor" ? "后台监测" : ""), "who"),
+            el("span", (e.phone ? e.phone + " · " : "") + (e.chat || (e.source === "monitor" ? "后台监测" : e.source === "account" ? "账号识别" : "")), "who"),
             el("span", e.message, "what"),
             el("span", e.count > 1 ? "×" + e.count : "", "count")
         );
@@ -110,7 +126,7 @@ function renderEvents() {
         }
         box.append(row);
     }
-    if (!events.length) box.append(el("p", data.device ? "最近没有异常或降级" : "还没有连上手机", "empty"));
+    if (!events.length) box.append(el("p", (data.phones || []).some((p) => p.device) ? "最近没有异常或降级" : "还没有连上手机", "empty"));
 }
 
 // ---------- 任务 ----------
