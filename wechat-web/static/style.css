@@ -1065,6 +1065,128 @@ dialog h3 {
   font-size: 12px;
 }
 
+/* 消息转发：每条规则一块，源会话和目标各一个可搜索的勾选列表 */
+#forward-dialog {
+  width: 720px;
+}
+
+.forward-rule {
+  margin-top: 14px;
+  padding: 12px 14px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f7faf7;
+}
+
+.forward-rule.disabled {
+  opacity: 0.65;
+}
+
+.forward-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.forward-head label {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  color: #4f6a5a;
+  font-size: 12px;
+}
+
+.forward-head input[data-key="name"] {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid #dfe8e0;
+  border-radius: 7px;
+  background: #fff;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.forward-stats {
+  margin-top: 6px;
+  color: #7d8a85;
+  font-size: 11px;
+}
+
+.forward-stats .problem {
+  color: var(--error-ink);
+}
+
+.picker {
+  margin-top: 6px;
+  border: 1px solid #dfe8e0;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.field .picker input[type="search"] {
+  margin: 0;
+  padding: 7px 10px;
+  border: 0;
+  border-bottom: 1px solid #edf2ee;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+}
+
+.picker-list {
+  max-height: 150px;
+  overflow: auto;
+  padding: 4px 0;
+}
+
+.picker-list label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.picker-list label:hover {
+  background: #f1f6f2;
+}
+
+.picker-list label.unavailable {
+  color: #a3ada3;
+  cursor: not-allowed;
+}
+
+.picker-list label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-list small {
+  flex: none;
+  margin-left: auto;
+  color: #a3ada3;
+  font-size: 10px;
+}
+
+.picker-empty {
+  padding: 8px 10px;
+  color: #a3ada3;
+  font-size: 12px;
+}
+
+.forward-rule .field-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  color: #647d6d;
+  font-size: 12px;
+}
+
 .toast {
   position: fixed;
   bottom: 24px;

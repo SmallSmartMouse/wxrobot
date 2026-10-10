@@ -3,7 +3,7 @@
 // 手机上的 wechat-bridge 负责操作微信；本服务：
 //   - 长轮询手机事件，把聊天内容并入本地会话（phone.go、messages.go）
 //   - 串行执行读取和发送任务（phone.go）
-//   - 按规则生成 AI 回复（ai.go）
+//   - 按规则生成 AI 回复（ai.go）、转发消息（forward.go）
 //   - 提供本机网页和接口（router.go）
 //
 // 数据保存在 SQLite（store.go），运行时全部在内存中，每次修改后只写入变化的部分。
@@ -45,6 +45,7 @@ type State struct {
 	AI            AIConfig                 `json:"ai_config"`
 	AIRules       []AIRule                 `json:"ai_matches"`
 	AIJobs        map[string]*AIJob        `json:"ai_jobs"`
+	ForwardRules  []ForwardRule            `json:"forward_rules"`
 }
 
 type App struct {
@@ -63,10 +64,19 @@ type App struct {
 	allowRemote bool                     // 允许非回环来源地址（容器内运行时使用）
 	aiCursor    map[string]int64         // 会话 → AI 已检查到的消息序号
 	aiLastRun   map[string]time.Time     // 会话 → 上次自动生成时间
+	// 转发（forward.go）
+	forwardCursor map[string]int64         // 会话 → 转发已检查到的消息序号
+	forwardSeen   map[string]time.Time     // 规则 + 原文 → 上次转发时间，用于去重
+	forwardStatus map[string]forwardStatus // 规则 → 最近一次没能转发的原因
+	forwardLast   time.Time                // 最近一个转发任务的创建时间
 }
 
-// now 返回当前 UTC 时间的 RFC3339 字符串（带纳秒，按字符串比较即可排序）。
-func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+// now 返回当前时间的 stamp 字符串。
+func now() string { return stamp(time.Now()) }
+
+// stamp 把时间格式化为 UTC RFC3339 字符串，固定 9 位小数：长度相同，按字符串比较就是按时间先后
+// （RFC3339Nano 会去掉末尾的 0，“05.1Z”比“05.12Z”大）。
+func stamp(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000000000Z07:00") }
 
 // randomID 生成 32 位十六进制随机编号，用于任务、AI 记录等。
 func randomID() string {
@@ -93,6 +103,10 @@ func newApp(path string) (*App, error) {
 		phones:    map[string]*phoneRuntime{},
 		aiCursor:  map[string]int64{},
 		aiLastRun: map[string]time.Time{},
+
+		forwardCursor: map[string]int64{},
+		forwardSeen:   map[string]time.Time{},
+		forwardStatus: map[string]forwardStatus{},
 		state: State{
 			Conversations: map[string]*Conversation{},
 			Operations:    map[string]*Operation{},
@@ -141,6 +155,10 @@ func (a *App) normalizeLocked() {
 			a.state.AIRules[i].Mode = "off"
 		}
 	}
+	// 转发规则的正则在内存中编译
+	for i := range a.state.ForwardRules {
+		_ = a.state.ForwardRules[i].compile()
+	}
 	// 上次退出时正在生成的 AI 回复不会自动重试
 	for _, j := range a.state.AIJobs {
 		if j.Status == "running" {
@@ -185,7 +203,7 @@ func (a *App) deleteConversationLocked(id string) {
 func (a *App) clearHistoryLocked(c *Conversation) {
 	removed := c.clearHistory()
 	a.store.cleared[c.ID] = true
-	a.aiCursor[c.ID] = c.LastSeq // 删掉的消息不再触发 AI 回复
+	a.skipNewMessagesLocked(c) // 删掉的消息不再触发 AI 回复和转发
 	a.removeUnusedMediaLocked(removed, nil)
 }
 
@@ -363,12 +381,13 @@ func main() {
 	defer cancel()
 	a.ctx = ctx
 	a.allowRemote = config.AllowRemote
-	// 后台循环：每台手机一个拉取事件的循环和一个执行读写任务的 worker（添加手机时随时启动），以及 AI 自动回复
+	// 后台循环：每台手机一个拉取事件的循环和一个执行读写任务的 worker（添加手机时随时启动），以及 AI 自动回复和转发
 	a.mu.Lock()
 	a.running = true
 	a.syncPhonesLocked()
 	a.mu.Unlock()
 	go a.aiLoop(ctx)
+	go a.forwardLoop(ctx)
 
 	// 网页服务；退出时最多等 5 秒让进行中的请求完成
 	server := &http.Server{Addr: config.Listen, Handler: a.handler(), ReadHeaderTimeout: 5 * time.Second}

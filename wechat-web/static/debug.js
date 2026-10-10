@@ -145,7 +145,8 @@ function openTask(phoneTaskID) {
 // taskSummary 任务摘要行：时间、状态、会话、类型、问题说明、耗时。
 function taskSummary(op) {
     const row = el("div", undefined, "row task clickable");
-    const kind = op.kind === "send" ? (op.image_hash ? "发送图片" : "发送") : op.auto ? "读取 · " + (REASONS[op.reason] || "自动") : "读取";
+    let kind = op.kind === "send" ? (op.image_hash ? "发送图片" : "发送") : op.auto ? "读取 · " + (REASONS[op.reason] || "自动") : "读取";
+    if (op.forward_rule) kind = (op.image_hash ? "转发图片" : "转发") + " · 来自 " + (data.conversations[op.forward_from] || "已删除的会话");
     const statusKind = op.status === "succeeded" ? (op.warnings?.length ? "warn" : "good") : ["failed", "unknown"].includes(op.status) ? "bad" : "";
     const problem = op.error || op.warnings?.map((w) => w.message).join("；") || "";
     row.append(

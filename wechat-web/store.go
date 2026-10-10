@@ -95,7 +95,7 @@ func (a *App) markMessage(conversationID string, seq int64) {
 
 // settings 表中的配置项。
 func (a *App) settingsLocked() map[string]any {
-	return map[string]any{"phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules}
+	return map[string]any{"phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules, "forward_rules": &a.state.ForwardRules}
 }
 
 // legacySettingsLocked 单手机版本的配置项：只读取，迁移后不再写入（保存时从数据库删除）。

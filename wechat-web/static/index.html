@@ -24,6 +24,9 @@
       <button id="ai-settings" class="system-item" title="全局 AI">
         <span class="system-icon" aria-hidden="true">AI</span><span class="system-label">全局 AI</span>
       </button>
+      <button id="forward-settings" class="system-item" title="消息转发">
+        <span class="system-icon" aria-hidden="true">转</span><span class="system-label">消息转发</span>
+      </button>
     </nav>
   </aside>
 
@@ -150,6 +153,21 @@
     <div id="ai-rules"></div>
     <button type="button" id="ai-rule-add" class="text-button">添加规则</button>
     <div id="ai-error" class="form-error"></div>
+    <div class="dialog-actions">
+      <button type="button" class="secondary close-dialog">取消</button>
+      <button type="submit" class="primary">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 消息转发：源会话的来信按过滤条件转发到其他群或联系人 -->
+<dialog id="forward-dialog">
+  <form id="forward-form">
+    <div class="dialog-heading"><h2>消息转发</h2><button type="button" class="icon-button close-dialog">×</button></div>
+    <p class="muted">源会话收到新来信后，满足过滤条件的由目标会话账号的手机逐条发出。只转发保存之后读到的来信，自己发的、表情包和系统提示不转发。<br>源群需要能收到通知，或在会话设置里开启定时读取，否则读不到新消息。</p>
+    <div id="forward-rules"></div>
+    <button type="button" id="forward-add" class="text-button">＋ 添加规则</button>
+    <div id="forward-error" class="form-error"></div>
     <div class="dialog-actions">
       <button type="button" class="secondary close-dialog">取消</button>
       <button type="submit" class="primary">保存</button>

@@ -44,6 +44,9 @@ func (a *App) handler() http.Handler {
 	api.GET("/ai/config", a.getAIConfig)
 	api.POST("/ai/config", a.setAIConfig)
 
+	api.GET("/forward", a.getForward)
+	api.POST("/forward", a.setForward)
+
 	api.POST("/media", a.uploadMedia)
 	api.GET("/media/:hash", a.getMedia)
 

@@ -25,9 +25,11 @@ type Operation struct {
 	Text           string `json:"text,omitempty"`
 	ImageHash      string `json:"image_hash,omitempty"`
 	Limit          int    `json:"limit,omitempty"`
-	Auto           bool   `json:"auto,omitempty"`   // 自动发起的读取
-	Reason         string `json:"reason,omitempty"` // 自动读取原因：notification | schedule | originals | deep
-	Status         string `json:"status"`           // queued | running | succeeded | failed | unknown
+	Auto           bool   `json:"auto,omitempty"`         // 自动发起的读取
+	Reason         string `json:"reason,omitempty"`       // 自动读取原因：notification | schedule | originals | deep
+	ForwardRule    string `json:"forward_rule,omitempty"` // 转发任务：规则编号
+	ForwardFrom    string `json:"forward_from,omitempty"` // 转发任务：源会话编号
+	Status         string `json:"status"`                 // queued | running | succeeded | failed | unknown
 	Error          string `json:"error,omitempty"`
 	PhoneTaskID    string `json:"phone_task_id,omitempty"`
 	PhoneID        string `json:"phone_id,omitempty"` // 执行这个任务的手机：开始执行时确定，服务重启后仍向同一台手机查询

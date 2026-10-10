@@ -161,13 +161,14 @@ async function refresh() {
     }
 }
 
-// toastFinishedOperations 任务从“进行中”变为结束时弹出提示（自动读取成功不提示）。
+// toastFinishedOperations 任务从“进行中”变为结束时弹出提示（自动读取、转发成功不提示）。
 function toastFinishedOperations() {
     for (const op of state.operations) {
         const before = knownStatus.get(op.id);
         knownStatus.set(op.id, op.status);
         if (!["queued", "running"].includes(before) || ["queued", "running"].includes(op.status)) continue;
-        if (op.status !== "succeeded") toast(STATUS[op.status] + "：" + (op.error || "请查看手机"));
+        if (op.forward_rule && op.status === "succeeded") continue; // 转发是自动的，成功不逐条提示
+        if (op.status !== "succeeded") toast((op.forward_rule ? "转发" : "") + STATUS[op.status] + "：" + (op.error || "请查看手机"));
         else if (op.kind === "send") toast("手机已确认发送");
         else if (!op.auto) toast("手机消息已读取");
     }
@@ -841,6 +842,187 @@ handleForm("ai-form", "ai-error", () =>
         rules: readRules()
     })
 );
+
+// ---------- 消息转发 ----------
+// 规则整体保存：每条规则一块，源会话和转发目标从所有账号的会话里勾选。
+
+// conversationOptions 可选的会话：群聊在前，其次联系人、待分类，同类按名称排序。
+function conversationOptions() {
+    const order = { group: 0, person: 1, unknown: 2 };
+    return [...state.conversations].sort((a, b) => order[a.kind] - order[b.kind] || a.title.localeCompare(b.title, "zh-CN"));
+}
+
+// picker 可搜索的会话勾选列表。转发目标不能选待分类的会话（发送时需要知道是不是群）。
+function picker(key, selected, forTarget) {
+    const box = el("div", undefined, "picker");
+    box.dataset.key = key;
+    const search = el("input");
+    search.type = "search";
+    search.placeholder = "搜索会话";
+    const items = el("div", undefined, "picker-list");
+    const multiple = state.accounts.length > 1;
+    const options = conversationOptions();
+    // 已选的放在最前面
+    options.sort((a, b) => selected.includes(b.id) - selected.includes(a.id));
+    for (const c of options) {
+        const label = el("label");
+        const check = el("input");
+        check.type = "checkbox";
+        check.value = c.id;
+        check.checked = selected.includes(c.id);
+        const unavailable = forTarget && c.kind === "unknown" && !check.checked;
+        check.disabled = unavailable;
+        if (unavailable) {
+            label.className = "unavailable";
+            label.title = "先在会话设置里设置类型（联系人或群聊）";
+        }
+        label.dataset.search = c.title.toLowerCase();
+        label.append(check, el("span", emojify(c.title)), el("small", KINDS[c.kind] + (multiple && c.account ? " · " + c.account : "")));
+        items.append(label);
+    }
+    if (!options.length) items.append(el("div", "还没有会话", "picker-empty"));
+    search.oninput = () => {
+        const q = search.value.toLowerCase();
+        for (const label of items.querySelectorAll("label")) label.hidden = !label.dataset.search.includes(q);
+    };
+    box.append(search, items);
+    return box;
+}
+
+// forwardStats 规则的转发情况：保留的任务记录中成功、失败、排队的条数，以及最近一次没能转发的原因。
+function forwardStats(rule) {
+    const line = el("div", undefined, "forward-stats");
+    if (!rule.id) {
+        line.textContent = "新规则，保存后开始转发";
+        return line;
+    }
+    const parts = ["已转发 " + (rule.forwarded || 0)];
+    if (rule.failed) parts.push("失败 " + rule.failed);
+    if (rule.queued) parts.push("排队 " + rule.queued);
+    if (rule.last_at) parts.push("最近 " + timeLabel(rule.last_at));
+    line.append(el("span", parts.join(" · ")));
+    if (rule.problem) line.append(el("span", " · " + timeLabel(rule.problem_at) + " " + rule.problem, "problem"));
+    return line;
+}
+
+// forwardField 规则里的一个输入框；列表类的值用逗号连起来显示。
+function forwardField(label, key, value, placeholder, type = "text") {
+    const field = el("label", label, "field");
+    const input = el("input");
+    input.type = type;
+    input.dataset.key = key;
+    input.placeholder = placeholder || "";
+    input.value = Array.isArray(value) ? value.join("，") : value ?? "";
+    field.append(input);
+    return field;
+}
+
+// pair 两个输入框并排。
+function pair(...fields) {
+    const row = el("div", undefined, "field-pair");
+    row.append(...fields);
+    return row;
+}
+
+// forwardRuleNode 一条规则的编辑块。
+function forwardRuleNode(rule) {
+    const node = el("section", undefined, "forward-rule");
+    node.dataset.id = rule.id || "";
+    const head = el("div", undefined, "forward-head");
+    const enabled = el("label");
+    const check = el("input");
+    check.type = "checkbox";
+    check.dataset.key = "enabled";
+    check.checked = rule.enabled;
+    check.onchange = () => node.classList.toggle("disabled", !check.checked);
+    node.classList.toggle("disabled", !rule.enabled);
+    enabled.append(check, "启用");
+    const name = el("input");
+    name.dataset.key = "name";
+    name.placeholder = "规则名称，例如：线报群 → 福利群";
+    name.maxLength = 40;
+    name.value = rule.name || "";
+    const remove = el("button", "删除", "text-button danger-text");
+    remove.type = "button";
+    remove.onclick = () => node.remove();
+    head.append(enabled, name, remove);
+
+    const sources = el("div", "源会话（收到的来信）", "field");
+    sources.append(picker("sources", rule.sources || [], false));
+    const targets = el("div", "转发到（群聊或联系人）", "field");
+    targets.append(picker("targets", rule.targets || [], true));
+
+    const images = el("label", undefined, "field-check");
+    const imageCheck = el("input");
+    imageCheck.type = "checkbox";
+    imageCheck.dataset.key = "images";
+    imageCheck.checked = !!rule.images;
+    images.append(imageCheck, "也转发图片（有原图时发原图，最多等 3 分钟；图片不做文字过滤）");
+
+    node.append(
+        head,
+        forwardStats(rule),
+        pair(sources, targets),
+        pair(
+            forwardField("只转发这些发送人", "senders", rule.senders, "群昵称，多个用逗号分隔；空为不限"),
+            forwardField("包含任一关键词", "include", rule.include, "多个用逗号分隔；空为不限")
+        ),
+        pair(
+            forwardField("排除关键词", "exclude", rule.exclude, "包含任一就不转发"),
+            forwardField("还须匹配正则", "regex", rule.regex, "Go RE2，例如 \\d+元")
+        ),
+        pair(
+            forwardField("转发格式", "template", rule.template, "空为原文；可用 {text} {sender} {chat}"),
+            forwardField("相同内容去重（分钟）", "dedup_minutes", rule.dedup_minutes ?? 0, "0 为不去重", "number")
+        ),
+        images
+    );
+    return node;
+}
+
+// readForwardRules 从编辑块读出全部规则。
+function readForwardRules() {
+    return [...$("forward-rules").children].map((node) => {
+        const value = (key) => node.querySelector(`input[data-key="${key}"]`);
+        const checked = (key) => [...node.querySelectorAll(`.picker[data-key="${key}"] input:checked`)].map((c) => c.value);
+        return {
+            id: node.dataset.id,
+            name: value("name").value,
+            enabled: value("enabled").checked,
+            sources: checked("sources"),
+            targets: checked("targets"),
+            senders: [value("senders").value],
+            include: [value("include").value],
+            exclude: [value("exclude").value],
+            regex: value("regex").value,
+            template: value("template").value,
+            dedup_minutes: Number(value("dedup_minutes").value) || 0,
+            images: value("images").checked
+        };
+    });
+}
+
+// 打开消息转发：读取规则和转发情况填入
+$("forward-settings").onclick = async () => {
+    try {
+        const data = await api("forward");
+        $("forward-rules").replaceChildren(...data.rules.map(forwardRuleNode));
+        if (!data.rules.length) $("forward-rules").append(forwardRuleNode({ enabled: true, dedup_minutes: 30 }));
+        $("forward-error").textContent = "";
+        $("forward-dialog").showModal();
+    } catch (e) {
+        toast(e.message);
+    }
+};
+$("forward-add").onclick = () => {
+    const node = forwardRuleNode({ enabled: true, dedup_minutes: 30 });
+    $("forward-rules").append(node);
+    node.scrollIntoView({ block: "nearest", behavior: "smooth" });
+};
+handleForm("forward-form", "forward-error", async () => {
+    await api("forward", { rules: readForwardRules() });
+    toast("转发规则已保存");
+});
 
 // 会话设置：类型、定时读取、图片、AI 回复。只提交有变化的项。
 $("chat-settings").onclick = () => {

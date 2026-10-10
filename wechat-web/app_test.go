@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1084,5 +1085,223 @@ func TestPhonesAPI(t *testing.T) {
 	body = call(a, "GET", "/api/state", "", "").Body.String()
 	if !strings.Contains(body, `"wechat_id":"A"`) || a.state.Conversations[c.ID] == nil {
 		t.Fatalf("account with history should remain listed: %s", body)
+	}
+}
+
+// screen 生成一屏消息：每项是“发送人：文字”，没有冒号时发送人为空；以“我：”开头的是发出的。
+func screen(items ...string) json.RawMessage {
+	var out []observedMessage
+	for _, item := range items {
+		m := observedMessage{Text: item, Direction: "incoming"}
+		if sender, text, ok := strings.Cut(item, "："); ok {
+			m.Sender, m.Text = sender, text
+		}
+		if m.Sender == "我" {
+			m.Sender, m.Direction = "", "outgoing"
+		}
+		out = append(out, m)
+	}
+	b, _ := json.Marshal(map[string]any{"messages": out, "captured_at": now()})
+	return b
+}
+
+// forwards 返回目标会话的转发任务文字（按创建时间排序，图片显示为 img:哈希）。
+func forwards(a *App, targetID string) []string {
+	var ops []*Operation
+	for _, op := range a.state.Operations {
+		if op.ConversationID == targetID && op.ForwardRule != "" {
+			ops = append(ops, op)
+		}
+	}
+	sort.Slice(ops, func(i, j int) bool { return ops[i].Created < ops[j].Created })
+	var out []string
+	for _, op := range ops {
+		if op.ImageHash != "" {
+			out = append(out, "img:"+op.ImageHash)
+		} else {
+			out = append(out, op.Text)
+		}
+	}
+	return out
+}
+
+func forwardApp(t *testing.T) (*App, *Conversation, *Conversation) {
+	phone := &fakePhone{status: "succeeded", result: `{}`}
+	a, source := appWithPhone(t, phone)
+	a.mu.Lock()
+	target := a.conversationLocked("acc", "转发群")
+	target.Kind = "group"
+	a.mu.Unlock()
+	return a, source, target
+}
+
+func TestForwardFiltersFormatAndOrder(t *testing.T) {
+	a, source, target := forwardApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rule := ForwardRule{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{target.ID},
+		Senders: []string{"张三，李四"}, Include: []string{"京东, 淘宝"}, Exclude: []string{"广告"}, Template: "【{chat}】{sender}：{text}"}
+	if err := rule.validate(a.state.Conversations); err != nil {
+		t.Fatal(err)
+	}
+	a.state.ForwardRules = []ForwardRule{rule}
+	a.mergeLocked(source, screen("张三：京东 旧消息"), true)
+	if a.forwardLocked() {
+		t.Fatal("messages present before the first check must not be forwarded")
+	}
+	a.mergeLocked(source, screen("张三：京东 旧消息", "张三：京东 好价 {sender}", "王五：京东 别人发的", "李四：淘宝 广告", "我：京东 自己发的", "李四：淘宝 好价"), false)
+	if !a.forwardLocked() {
+		t.Fatal("matching messages should be forwarded")
+	}
+	got := strings.Join(forwards(a, target.ID), "|")
+	if got != "【家人群】张三：京东 好价 {sender}|【家人群】李四：淘宝 好价" {
+		t.Fatalf("forwarded: %s", got)
+	}
+	if a.forwardLocked() {
+		t.Fatal("same messages must not be forwarded twice")
+	}
+	// 与之前记录没能衔接的批次可能是重复的，不转发
+	a.mergeLocked(source, screen("张三：京东 缺口后"), true)
+	if a.forwardLocked() {
+		t.Fatal("gap batch must not be forwarded")
+	}
+	// 关闭规则后的新消息不转发，重新开启后也不补发
+	a.state.ForwardRules[0].Enabled = false
+	a.mergeLocked(source, screen("张三：京东 缺口后", "张三：京东 关闭期间"), false)
+	a.forwardLocked()
+	a.state.ForwardRules[0].Enabled = true
+	if a.forwardLocked() {
+		t.Fatal("messages received while the rule was off must not be forwarded later")
+	}
+}
+
+func TestForwardDedupAcrossSourcesAndRegex(t *testing.T) {
+	a, source, target := forwardApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	other := a.conversationLocked("acc", "线报2群")
+	other.Kind = "group"
+	rule := ForwardRule{ID: "r1", Enabled: true, Sources: []string{source.ID, other.ID}, Targets: []string{target.ID}, Regex: `\d+元`, DedupMinutes: 30}
+	if err := rule.validate(a.state.Conversations); err != nil {
+		t.Fatal(err)
+	}
+	a.state.ForwardRules = []ForwardRule{rule}
+	a.forwardLocked()
+	a.mergeLocked(source, screen("甲：纸巾 9元", "甲：没有价格"), true)
+	a.mergeLocked(other, screen("乙：纸巾 9元", "乙：牙膏 5元"), true)
+	a.forwardLocked()
+	if got := strings.Join(forwards(a, target.ID), "|"); got != "纸巾 9元|牙膏 5元" {
+		t.Fatalf("dedup/regex: %s", got)
+	}
+}
+
+func TestForwardImageWaitsForOriginal(t *testing.T) {
+	a, source, target := forwardApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{target.ID}, Images: true}}
+	a.forwardLocked()
+	thumb := tinyJPEG(t, 10, 10)
+	a.mergeLocked(source, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"},{"text":"图后文字","direction":"incoming"}],"captured_at":"`+now()+`"}`), true)
+	if a.forwardLocked() {
+		t.Fatal("image should wait for its original, and keep later messages in order")
+	}
+	source.Messages[0].OriginalHash = strings.Repeat("a", 64)
+	a.forwardLocked()
+	if got := strings.Join(forwards(a, target.ID), "|"); got != "img:"+strings.Repeat("a", 64)+"|图后文字" {
+		t.Fatalf("forwarded: %s", got)
+	}
+	// 等原图超时：用缩略图转发
+	a.mergeLocked(source, json.RawMessage(`{"messages":[{"text":"图后文字","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"}],"captured_at":"`+stamp(time.Now().Add(-imageWaitLimit))+`"}`), false)
+	a.forwardLocked()
+	if got := forwards(a, target.ID); len(got) != 3 || got[2] != "img:"+source.Messages[2].ImageHash {
+		t.Fatalf("thumbnail after timeout: %v", got)
+	}
+}
+
+func TestForwardSendsThroughTargetPhone(t *testing.T) {
+	phone := &fakePhone{status: "succeeded", result: `{}`}
+	a, source := appWithPhone(t, phone)
+	a.mu.Lock()
+	target := a.conversationLocked("acc", "小王")
+	target.Kind = "person"
+	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{target.ID}}}
+	a.forwardLocked()
+	a.mergeLocked(source, screen("张三：转给小王"), true)
+	a.forwardLocked()
+	a.mu.Unlock()
+	runAll(a)
+	if phone.lastBody["chat"] != "小王" || phone.lastBody["text"] != "转给小王" || phone.lastBody["chat_type"] != nil {
+		t.Fatalf("phone body: %v", phone.lastBody)
+	}
+	// 目标会话里转发出去的是“发出的”消息，不会再被转发回来
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.ForwardRules = append(a.state.ForwardRules, ForwardRule{ID: "r2", Enabled: true, Sources: []string{target.ID}, Targets: []string{source.ID}})
+	a.forwardLocked()
+	a.mergeLocked(target, screen("我：转给小王"), true)
+	if a.forwardLocked() {
+		t.Fatal("outgoing messages must not be forwarded back")
+	}
+}
+
+func TestForwardBacklogAndMissingPhone(t *testing.T) {
+	a, source, target := forwardApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{target.ID}}}
+	a.forwardLocked()
+	var lines []string
+	for i := 0; i < maxForwardBacklog+5; i++ {
+		lines = append(lines, fmt.Sprintf("甲：第%d条", i))
+	}
+	a.mergeLocked(source, screen(lines...), true)
+	a.forwardLocked()
+	if n := len(forwards(a, target.ID)); n != maxForwardBacklog || a.forwardStatus["r1"].Problem == "" {
+		t.Fatalf("backlog should cap at %d: %d %+v", maxForwardBacklog, n, a.forwardStatus["r1"])
+	}
+	other := a.conversationLocked("另一个号", "外部群")
+	other.Kind = "group"
+	a.state.ForwardRules[0].Targets = []string{other.ID}
+	a.mergeLocked(source, screen("甲：第24条", "甲：新的"), false)
+	a.forwardLocked()
+	if len(forwards(a, other.ID)) != 0 || !strings.Contains(a.forwardStatus["r1"].Problem, "没有连接的手机") {
+		t.Fatalf("no phone for the target account: %+v", a.forwardStatus["r1"])
+	}
+}
+
+func TestForwardAPI(t *testing.T) {
+	a, source, target := forwardApp(t)
+	post := func(rules string) *httptest.ResponseRecorder {
+		return call(a, "POST", "/api/forward", `{"rules":`+rules+`}`, "")
+	}
+	if w := post(`[{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + source.ID + `"]}]`); w.Code != 400 {
+		t.Fatalf("target equal to source: %d", w.Code)
+	}
+	a.mu.Lock()
+	unknown := a.conversationLocked("acc", "没分类")
+	a.mu.Unlock()
+	if w := post(`[{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + unknown.ID + `"]}]`); w.Code != 400 || !strings.Contains(w.Body.String(), "类型") {
+		t.Fatalf("target without kind: %d %s", w.Code, w.Body)
+	}
+	if w := post(`[{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + target.ID + `"],"regex":"("}]`); w.Code != 400 {
+		t.Fatalf("bad regex: %d", w.Code)
+	}
+	if w := post(`[{"name":"线报","enabled":true,"sources":["` + source.ID + `"],"targets":["` + target.ID + `"],"regex":"元$","include":["京东，淘宝"]}]`); w.Code != 200 {
+		t.Fatalf("save: %d %s", w.Code, w.Body)
+	}
+	w := call(a, "GET", "/api/forward", "", "")
+	var got struct {
+		Rules []forwardRuleView `json:"rules"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &got)
+	if len(got.Rules) != 1 || got.Rules[0].ID == "" || strings.Join(got.Rules[0].Include, "|") != "京东|淘宝" {
+		t.Fatalf("get: %s", w.Body)
+	}
+	// 重启后规则还在，正则重新编译
+	b := reopen(t, a)
+	r := b.state.ForwardRules[0]
+	if r.ID != got.Rules[0].ID || !r.accepts(Message{Text: "京东 9元"}) || r.accepts(Message{Text: "京东 9元起"}) {
+		t.Fatalf("rule after restart: %+v", r)
 	}
 }

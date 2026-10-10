@@ -253,8 +253,8 @@ func (a *App) mergeLocked(c *Conversation, raw json.RawMessage, appendOnGap bool
 		}
 	}
 	if !aligned {
-		// 缺口批次可能包含已经回复过的消息，不触发 AI。
-		a.aiCursor[c.ID] = c.LastSeq
+		// 缺口批次可能包含已经回复、转发过的消息，不触发 AI 和转发。
+		a.skipNewMessagesLocked(c)
 	}
 	return aligned
 }
