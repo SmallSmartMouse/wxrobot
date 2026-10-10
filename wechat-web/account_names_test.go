@@ -7,7 +7,7 @@ import (
 
 func TestAccountNamesRemainKeyedByWechatID(t *testing.T) {
 	a := testApp(t)
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	report := func(id, name string) {
 		raw, _ := json.Marshal(map[string]any{"info": map[string]any{"account": map[string]string{"wechat_id": id, "nickname": name}}})
 		a.setPhoneStatus("p1", "在线", raw, nil)

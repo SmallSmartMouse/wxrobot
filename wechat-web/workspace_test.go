@@ -8,7 +8,7 @@ import (
 )
 
 func workspaceDevices(a *App) {
-	a.state.Phones = []*PhoneConfig{{ID: "a1", Account: "A", URL: "http://127.0.0.1:1"}, {ID: "a2", Account: "A", URL: "http://127.0.0.1:2"}, {ID: "b1", Account: "B", URL: "http://127.0.0.1:3"}}
+	a.state.Phones = []*PhoneConfig{{ID: "a1", Account: "A"}, {ID: "a2", Account: "A"}, {ID: "b1", Account: "B"}}
 	a.syncPhonesLocked()
 	for _, p := range a.state.Phones {
 		a.phones[p.ID].connection = "在线"

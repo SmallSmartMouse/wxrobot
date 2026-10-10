@@ -19,7 +19,7 @@ func TestObservedChatKind(t *testing.T) {
 			c := a.conversationLocked("acc", "name")
 			c.Kind = tc.before
 			raw, _ := json.Marshal(map[string]any{"chat_type": tc.observed, "messages": []any{}})
-			a.mergeSnapshotLocked(c, raw, false, true, true)
+			a.mergeLatestLocked(c, raw)
 			if c.Kind != tc.want {
 				t.Fatalf("got %s, want %s", c.Kind, tc.want)
 			}

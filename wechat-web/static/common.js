@@ -1,10 +1,12 @@
-// 网页公共工具：元素创建、接口调用、提示、浏览器本地存储和显示格式。主页面和诊断页共用。
+// 网页公共工具：元素创建、接口调用、提示、浏览器本地存储和显示格式。
 
 export const $ = (id) => document.getElementById(id);
 export const KINDS = { unknown: "待分类", person: "联系人", group: "群聊" };
 
-// app 是主页面各功能模块共享的数据和操作：app.js 启动时设置，其他模块只读取和调用。
-//   state：GET /api/state 的最新结果；refresh：重新拉取并重绘；render：只按现有数据重绘。
+// app 是各功能模块共享的数据和操作：app.js 启动时设置，其他模块只读取和调用。
+//   state：GET /api/state 的最新结果；refresh：重新拉取并重绘；render：只按现有数据重绘；
+//   page：当前页面；selectedAccount、currentPhone：消息页当前的微信号和手机（accounts.js 设置）；
+//   showPhone：打开设备详情（phones.js）；diagnosticTask、diagnosticPhone：要在诊断页展开的任务、筛选的设备。
 export const app = { state: null, refresh: async () => {}, render: () => {} };
 
 // ---------- 元素 ----------
@@ -100,14 +102,9 @@ export const storage = {
 
 // ---------- 显示格式 ----------
 
-// hostOf 手机地址去掉 http:// 前缀，只显示 IP 和端口。
-export function hostOf(url) {
-    return String(url).replace(/^https?:\/\//, "");
-}
-
 // accountName 显示用的账号名称：有昵称显示昵称，否则显示微信号。选择、请求和存储仍使用微信号。
 export function accountName(id) {
-    return app.state.accounts.find((a) => a.wechat_id === id)?.nickname || id || "未归属账号";
+    return app.state.accounts.find((a) => a.wechat_id === id)?.nickname || id || "未选择账号";
 }
 
 // accountLabel 昵称和微信号都显示，例如“小明（wxid_abc）”。

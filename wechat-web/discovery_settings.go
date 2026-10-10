@@ -1,19 +1,22 @@
 package main
 
+// 搜索设置：是否定时搜索、搜索间隔、是否广播本地网络，以及跨网段单播的私有网段。
+
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-const maxDiscoveryAddresses = 4096
+const (
+	maxDiscoveryAddresses = 4096 // 所有网段合计的地址上限
+	maxNetworkAddresses   = 1024 // 单个网段的地址上限（/22）
+	maxDiscoveryNetworks  = 8
+)
 
 type DiscoverySettings struct {
 	Enabled         bool     `json:"enabled"`
@@ -22,6 +25,7 @@ type DiscoverySettings struct {
 	IntervalSeconds int      `json:"interval_seconds"`
 }
 
+// discoveryProgress 一轮搜索的进度，网页上显示。
 type discoveryProgress struct {
 	Searching bool   `json:"searching"`
 	Sent      int    `json:"sent"`
@@ -33,40 +37,32 @@ func defaultDiscoverySettings() DiscoverySettings {
 	return DiscoverySettings{Enabled: true, LocalBroadcast: true, Networks: []string{}, IntervalSeconds: 30}
 }
 
-// 限制在私有 IPv4 地址；先核算上限，再展开地址，避免超大网段分配内存。
+// discoveryEnabledLocked 服务配置开启了发现端口，且网页设置里开启了自动搜索。
+func (a *App) discoveryEnabledLocked() bool { return a.discoveryPort != 0 && a.state.Discovery.Enabled }
+
+// validateDiscoverySettings 校验并规范化搜索设置，返回规范化后的设置、网段和地址总数。
+// 网段限制在私有 IPv4 地址；先核算上限，再展开地址，避免超大网段分配内存。
 func validateDiscoverySettings(s DiscoverySettings) (DiscoverySettings, []netip.Prefix, int, error) {
 	if s.IntervalSeconds < 10 || s.IntervalSeconds > 300 {
 		return s, nil, 0, errors.New("搜索间隔请设置为 10～300 秒")
 	}
-	if len(s.Networks) > 8 {
-		return s, nil, 0, errors.New("最多添加 8 个网段")
+	if len(s.Networks) > maxDiscoveryNetworks {
+		return s, nil, 0, fmt.Errorf("最多添加 %d 个网段", maxDiscoveryNetworks)
 	}
 	var prefixes []netip.Prefix
 	count := 0
 	canonical := []string{}
 	for _, raw := range s.Networks {
-		p, err := netip.ParsePrefix(strings.TrimSpace(raw))
-		if err != nil || !p.Addr().Is4() {
-			return s, nil, 0, fmt.Errorf("%q 不是有效的 IPv4 网段，例如 192.168.1.0/24", raw)
-		}
-		p = p.Masked()
-		if p.Bits() < 22 {
-			return s, nil, 0, fmt.Errorf("%s 范围过大：每个网段最多 1,024 个地址（/22 或更小范围）", raw)
-		}
-		size := 1 << (32 - p.Bits())
-		last := p.Addr()
-		for i := 1; i < size; i++ {
-			last = last.Next()
-		}
-		if !p.Addr().IsPrivate() || !last.IsPrivate() {
-			return s, nil, 0, errors.New("搜索范围只支持局域网私有地址（10.x、172.16～31.x、192.168.x）")
+		p, err := parseNetwork(raw)
+		if err != nil {
+			return s, nil, 0, err
 		}
 		for _, old := range prefixes {
 			if old.Overlaps(p) {
 				return s, nil, 0, fmt.Errorf("%s 与 %s 重复或重叠", p, old)
 			}
 		}
-		count += size
+		count += networkSize(p)
 		if count > maxDiscoveryAddresses {
 			return s, nil, 0, errors.New("所有网段合计最多 4,096 个地址，请缩小搜索范围")
 		}
@@ -80,6 +76,31 @@ func validateDiscoverySettings(s DiscoverySettings) (DiscoverySettings, []netip.
 	return s, prefixes, count, nil
 }
 
+// parseNetwork 解析一个网段：IPv4、不超过 /22、首尾地址都是私有地址。
+func parseNetwork(raw string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(strings.TrimSpace(raw))
+	if err != nil || !p.Addr().Is4() {
+		return p, fmt.Errorf("%q 不是有效的 IPv4 网段，例如 192.168.1.0/24", raw)
+	}
+	p = p.Masked()
+	if networkSize(p) > maxNetworkAddresses {
+		return p, fmt.Errorf("%s 范围过大：每个网段最多 1,024 个地址（/22 或更小范围）", raw)
+	}
+	last := p.Addr()
+	for i := 1; i < networkSize(p); i++ {
+		last = last.Next()
+	}
+	if !p.Addr().IsPrivate() || !last.IsPrivate() {
+		return p, errors.New("搜索范围只支持局域网私有地址（10.x、172.16～31.x、192.168.x）")
+	}
+	return p, nil
+}
+
+// networkSize 网段包含的地址数。
+func networkSize(p netip.Prefix) int { return 1 << (32 - p.Bits()) }
+
+// configuredDiscoveryTargets 按设置算出发送目标：本地广播地址，加上各网段内的可用地址
+// （/31 和 /32 的地址均可用；其余跳过网络地址与定向广播地址）。
 func configuredDiscoveryTargets(s DiscoverySettings, port int) ([]*net.UDPAddr, error) {
 	_, prefixes, _, err := validateDiscoverySettings(s)
 	if err != nil {
@@ -87,11 +108,10 @@ func configuredDiscoveryTargets(s DiscoverySettings, port int) ([]*net.UDPAddr, 
 	}
 	var targets []*net.UDPAddr
 	if s.LocalBroadcast {
-		targets, err = discoveryTargets(port)
+		targets, err = localBroadcastTargets(port)
 	}
 	for _, p := range prefixes {
 		for ip := p.Addr(); p.Contains(ip); ip = ip.Next() {
-			// /31 和 /32 的地址均可用；其余跳过网络地址与定向广播地址。
 			if p.Bits() < 31 && (ip == p.Addr() || !p.Contains(ip.Next())) {
 				continue
 			}
@@ -107,19 +127,15 @@ func configuredDiscoveryTargets(s DiscoverySettings, port int) ([]*net.UDPAddr, 
 	return targets, nil
 }
 
+// discoverySettingsViewLocked 网页上的搜索设置、上限、进度和接入端口状态。
 func (a *App) discoverySettingsViewLocked() gin.H {
 	_, _, count, _ := validateDiscoverySettings(a.state.Discovery)
-	return gin.H{"config": a.state.Discovery, "address_count": count, "max_addresses": 4096, "max_per_network": 1024, "max_networks": 8,
-		"progress": a.discoveryProgress, "link_port": a.linkPort, "link_error": a.linkError}
+	return gin.H{"config": a.state.Discovery, "address_count": count, "max_addresses": maxDiscoveryAddresses, "max_per_network": maxNetworkAddresses,
+		"max_networks": maxDiscoveryNetworks, "progress": a.discoveryProgress, "link_port": a.linkPort, "link_error": a.linkError}
 }
 
-func (a *App) getDiscoverySettings(c *gin.Context) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	c.JSON(200, a.discoverySettingsViewLocked())
-}
-
-func (a *App) setDiscoverySettings(c *gin.Context) {
+// previewDiscoverySettings 校验搜索设置并返回规范化结果，不保存（网页添加网段时先校验）。
+func (a *App) previewDiscoverySettings(c *gin.Context) {
 	var settings DiscoverySettings
 	if !bind(c, &settings) {
 		return
@@ -129,72 +145,5 @@ func (a *App) setDiscoverySettings(c *gin.Context) {
 		fail(c, 400, err.Error())
 		return
 	}
-	if c.Query("preview") == "1" {
-		c.JSON(200, gin.H{"config": settings, "address_count": count})
-		return
-	}
-	a.mu.Lock()
-	old := a.state.Discovery
-	a.state.Discovery = settings
-	if err = a.commitLocked(); err != nil {
-		a.state.Discovery = old
-		a.mu.Unlock()
-		fail(c, 500, "保存搜索范围失败")
-		return
-	}
-	a.mu.Unlock()
-	wake(a.discoveryWake)
-	c.JSON(200, gin.H{"ok": true, "config": settings, "address_count": count})
-}
-
-// 本地广播 + 显式网段的限速 UDP 单播，发完后等 window 收集回复。v2 请求让手机主动连接独立的 WSS 接入端口。
-func (a *App) scanConfiguredPhones(ctx context.Context, targets []*net.UDPAddr, window time.Duration) ([]discoveredPhone, error) {
-	conn, release, err := openDiscoverySocket(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	nonce := randomID()
-	a.mu.Lock()
-	fingerprint, port := a.linkFingerprint, a.linkPort
-	a.mu.Unlock()
-	packet, _ := json.Marshal(gin.H{"type": "wxrobot-discover-v2", "nonce": nonce, "server_id": fingerprint, "link_port": port})
-	// 在首次发送之前记录挑战，只有近期发现请求引来的手机才进入配对队列。
-	a.mu.Lock()
-	a.discoveryNonces[nonce] = time.Now().Add(2 * time.Minute)
-	for n, expiry := range a.discoveryNonces {
-		if time.Now().After(expiry) {
-			delete(a.discoveryNonces, n)
-		}
-	}
-	a.mu.Unlock()
-	if fingerprint == "" || port == 0 {
-		packet, _ = json.Marshal(gin.H{"type": discoveryRequestType, "nonce": nonce})
-	}
-	sent := 0
-	for i, target := range targets {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
-		if _, err = conn.WriteToUDP(packet, target); err == nil {
-			sent++
-		}
-		if i%32 == 31 {
-			a.mu.Lock()
-			a.discoveryProgress.Sent = sent
-			a.notifyLocked()
-			a.mu.Unlock()
-			if !pause(ctx, 125*time.Millisecond) {
-				return nil, ctx.Err()
-			}
-		}
-	}
-	a.mu.Lock()
-	a.discoveryProgress.Sent = sent
-	a.mu.Unlock()
-	if sent == 0 {
-		return nil, errors.New("未能发送发现请求，请检查网卡或防火墙")
-	}
-	return readDiscoveryReplies(ctx, conn, nonce, window)
+	c.JSON(200, gin.H{"config": settings, "address_count": count})
 }

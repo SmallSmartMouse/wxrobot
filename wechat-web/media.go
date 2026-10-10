@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 图片统一存为 JPEG，文件名是内容的 SHA-256，网页通过 /api/media/{hash} 访问。
@@ -112,6 +114,16 @@ func (a *App) saveOriginal(data []byte) (string, error) {
 	}
 }
 
+// imageExists 图片是否已保存。
+func (a *App) imageExists(hash string) bool {
+	path, ok := a.mediaPath(hash)
+	if !ok {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // readImage 读取已保存的图片，返回 Base64。
 func (a *App) readImage(hash string) (string, error) {
 	path, ok := a.mediaPath(hash)
@@ -123,4 +135,34 @@ func (a *App) readImage(hash string) (string, error) {
 		return "", errors.New("图片文件不存在")
 	}
 	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// ---------- 网页接口 ----------
+
+// uploadMedia 保存网页上传的图片（Base64），返回图片哈希，发送图片时使用。
+func (a *App) uploadMedia(c *gin.Context) {
+	var body struct {
+		Data string `json:"data"`
+	}
+	if !bind(c, &body) {
+		return
+	}
+	hash, err := a.saveImage(body.Data)
+	if err != nil {
+		fail(c, 400, err.Error())
+		return
+	}
+	c.JSON(200, gin.H{"image_hash": hash})
+}
+
+// getMedia 返回图片文件。文件名是内容哈希，内容不会变，允许浏览器长期缓存，避免刷新时重复加载图片。
+func (a *App) getMedia(c *gin.Context) {
+	path, ok := a.mediaPath(c.Param("hash"))
+	if !ok {
+		fail(c, 404, "图片不存在")
+		return
+	}
+	c.Header("Content-Type", "image/jpeg")
+	c.Header("Cache-Control", "private, max-age=31536000, immutable")
+	c.File(path)
 }

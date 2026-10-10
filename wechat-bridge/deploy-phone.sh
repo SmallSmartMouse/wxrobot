@@ -5,7 +5,7 @@
 #   ./deploy-phone.sh                       上传并重启
 #   ./deploy-phone.sh --no-restart          上传但不重启
 #   ./deploy-phone.sh --serial 手机序列号    指定目标手机
-# 依赖：Bash、ADB、jq、curl，以及 sha256sum 或 shasum。
+# 依赖：Bash、ADB、jq，以及 sha256sum 或 shasum。
 
 # 命令失败、变量未定义或管道失败时立即退出，避免继续执行不完整的部署。
 set -euo pipefail
@@ -18,10 +18,9 @@ SERIAL=""
 CONFIG=""
 DRY=0
 RESTART=1
-FORWARD=""
 TEMP=""
 
-# 仅上传运行文件，不上传电脑凭证或网页代码。
+# 仅上传运行文件，不上传电脑授权或网页代码。
 FILES=(
     bridge.js
     wechat.js
@@ -69,7 +68,7 @@ while (($#)); do
 done
 
 # 三、检查电脑依赖。优先使用指定的 ADB，其次 PATH，最后 macOS SDK 路径。
-for dependency in jq curl; do
+for dependency in jq; do
     command -v "$dependency" >/dev/null || fail "缺少 $dependency，请先安装"
 done
 
@@ -119,11 +118,8 @@ adb_device() {
     "$ADB_BIN" -s "$SERIAL" "$@"
 }
 
-# 正常完成或异常退出时，释放临时端口并删除包含凭证的临时文件。
+# 正常完成或异常退出时，删除临时文件。
 cleanup() {
-    if [[ -n "$FORWARD" ]]; then
-        adb_device forward --remove "tcp:$FORWARD" >/dev/null 2>&1 || true
-    fi
     if [[ -n "$TEMP" ]]; then
         rm -rf -- "$TEMP"
     fi
@@ -142,11 +138,8 @@ if adb_device shell test -f "$REMOTE/config.json"; then
 fi
 if [[ "$EXISTS" == 0 ]]; then
     [[ -f "$CONFIG" ]] || fail "首次部署需要 --config 配置文件"
-    # 凭证不能是示例占位符，配置里的设备编号必须与目标手机一致。
-    jq -e --arg serial "$SERIAL" '
-        .device_id == $serial and
-        (.phone_api_token | type == "string" and length >= 32 and (contains("REPLACE") | not))
-    ' "$CONFIG" >/dev/null || fail "配置设备编号或凭证无效"
+    # 配置里的设备编号必须与目标手机一致。
+    jq -e --arg serial "$SERIAL" '.device_id == $serial' "$CONFIG" >/dev/null || fail "配置的设备编号与目标手机不一致"
 fi
 
 echo "目标手机：${SERIAL}；运行文件：${#FILES[@]} 个"
@@ -177,7 +170,8 @@ if [[ "$RESTART" == 0 ]]; then
     exit 0
 fi
 
-# 七、打开 AutoJs6 并运行 bridge.js：新实例会先停止正在运行的旧实例，等锁释放后再启动。
+# 七、删除旧的状态文件，打开 AutoJs6 并运行 bridge.js：新实例会先停止正在运行的旧实例，等锁释放后再启动。
+adb_device shell rm -f "$REMOTE/status.json"
 adb_device shell am start \
     -n org.autojs.autojs6/org.autojs.autojs.ui.main.MainActivity >/dev/null
 
@@ -189,34 +183,16 @@ result="$(adb_device shell am start \
 [[ "$result" != *Error* && "$result" != *Exception* ]] || fail "无法启动 bridge.js"
 sleep 6
 
-# 八、通过临时 ADB 端口转发检查真实就绪状态，不依赖手机的局域网 IP。
-# umask 077 确保临时配置和请求头只有当前用户能读取，凭证不放在进程参数中。
-umask 077
+# 八、读取新实例写出的状态文件（每 5 秒更新），确认就绪。状态文件只含就绪状态，不含凭证。
 TEMP="$(mktemp -d)"
-adb_device shell cat "$REMOTE/config.json" > "$TEMP/config.json"
-
-PORT="$(jq -er '
-    .phone_api_port // 8766 |
-    select(type == "number" and . >= 1 and . <= 65535 and floor == .)
-' "$TEMP/config.json")"
-
-jq -er '
-    .phone_api_token |
-    select(type == "string" and (test("[\\r\\n]") | not)) |
-    "Authorization: Bearer " + .
-' "$TEMP/config.json" > "$TEMP/headers"
-
-# tcp:0 让 ADB 分配空闲电脑端口；退出时仅清理本次创建的转发。
-FORWARD="$(adb_device forward tcp:0 "tcp:$PORT" | tr -d "\r")"
-[[ "$FORWARD" =~ ^[0-9]+$ ]] || fail "无法创建临时端口转发"
-
-# 最多尝试 30 次；online 和 ready 同时为 true 才表示微信桥可以接收任务。
 for ((attempt = 0; attempt < 30; attempt++)); do
-    if curl --noproxy "*" --silent --fail --max-time 2 \
-        --header "@$TEMP/headers" \
-        "http://127.0.0.1:$FORWARD/v1/device" > "$TEMP/status.json" &&
-        jq -e '.online == true and .info.ready == true' "$TEMP/status.json" >/dev/null; then
+    if adb_device shell cat "$REMOTE/status.json" > "$TEMP/status.json" 2>/dev/null &&
+        jq -e '.online == true and .info.ready == true' "$TEMP/status.json" >/dev/null 2>&1; then
         echo "部署成功：微信桥已上报就绪。"
+        # 通知使用权不影响就绪，只提醒：没有时收不到微信通知，停在聊天页时其他会话的新消息会发现得慢。
+        if jq -e '.info.notification_permission == false' "$TEMP/status.json" >/dev/null; then
+            echo "提醒：未开启 AutoJs6 的通知使用权，收不到微信通知。请在手机设置中搜索“通知使用权”，打开 AutoJs6。"
+        fi
         exit 0
     fi
     sleep 1

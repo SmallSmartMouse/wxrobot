@@ -37,22 +37,25 @@ func TestDiscoveryRangeLimitsAndPersistence(t *testing.T) {
 	}
 	a := testApp(t)
 	body, _ := json.Marshal(s)
-	if w := call(a, "POST", "/api/discovery?preview=1", string(body), ""); w.Code != 200 {
+	if w := call(a, "POST", "/api/discovery/preview", string(body), ""); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
 	if len(a.state.Discovery.Networks) != 0 {
 		t.Fatal("preview changed saved settings")
 	}
-	if w := call(a, "POST", "/api/discovery", string(body), ""); w.Code != 200 {
-		t.Fatal(w.Body.String())
+	save := func(s DiscoverySettings) int {
+		b, _ := json.Marshal(map[string]any{"discovery": s, "read_history": true})
+		return call(a, "POST", "/api/system-settings", string(b), "").Code
+	}
+	if code := save(s); code != 200 {
+		t.Fatal(code)
 	}
 	var saved string
 	if err = a.store.db.QueryRow("SELECT data FROM settings WHERE id='discovery'").Scan(&saved); err != nil || !strings.Contains(saved, "192.168.3.8/32") {
 		t.Fatalf("settings not persisted: %s %v", saved, err)
 	}
 	s.Networks = []string{"10.0.0.0/8"}
-	bad, _ := json.Marshal(s)
-	if w := call(a, "POST", "/api/discovery", string(bad), ""); w.Code != 400 {
+	if code := save(s); code != 400 {
 		t.Fatal("oversize request accepted")
 	}
 	if len(a.state.Discovery.Networks) != 3 {
@@ -90,9 +93,9 @@ func dialTestPhone(t *testing.T, a *App, address, discovery, secret string) *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ws.CloseNow() })
-	c := &testLinkClient{ws: ws, ctx: ctx, server: a.linkFingerprint}
+	c := &testLinkClient{ws: ws, ctx: ctx, server: a.linkCert}
 	digest := sha256.Sum256([]byte(secret))
-	c.send(t, map[string]any{"type": "hello", "device_id": "test-phone", "name": "测试手机", "api_port": 8766, "discovery_nonce": discovery, "commit": hex.EncodeToString(digest[:])})
+	c.send(t, map[string]any{"type": "hello", "device_id": "test-phone", "name": "测试手机", "discovery_nonce": discovery, "commit": hex.EncodeToString(digest[:])})
 	m := c.read(t)
 	if m["type"] != "challenge" {
 		t.Fatal(m)
@@ -166,7 +169,7 @@ func TestPhonePairingRequiresBothSidesAndReconnects(t *testing.T) {
 	a.mu.Lock()
 	cfg := *a.state.Phones[0]
 	a.mu.Unlock()
-	if cfg.Transport != "reverse" || cfg.Token != token {
+	if cfg.Token != token || cfg.Address != "127.0.0.1" {
 		t.Fatal("pairing not persisted")
 	}
 	state = call(a, "GET", "/api/state", "", "").Body.String()
@@ -177,7 +180,7 @@ func TestPhonePairingRequiresBothSidesAndReconnects(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		var out struct{ Online bool }
-		err := a.phoneRequest(context.Background(), cfg, "GET", "/v1/device", nil, "", &out)
+		err := a.phoneRequest(context.Background(), cfg.ID, "GET", "/v1/device", nil, "", &out)
 		if err == nil && !out.Online {
 			err = fmt.Errorf("missing response")
 		}
@@ -274,7 +277,7 @@ func TestPhoneAuthRejectsReplayedProof(t *testing.T) {
 	a, address, nonce := newTestLinkServer(t)
 	token := strings.Repeat("ef", 32)
 	a.mu.Lock()
-	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "saved", DeviceID: "test-phone", Transport: "reverse", Token: token})
+	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "saved", DeviceID: "test-phone", Token: token})
 	a.syncPhonesLocked()
 	a.mu.Unlock()
 	c := dialTestPhone(t, a, address, nonce, strings.Repeat("ab", 32))
@@ -300,7 +303,7 @@ func TestUnknownPhoneNeedsDiscoveryNonce(t *testing.T) {
 	}
 	defer ws.CloseNow()
 	digest := sha256.Sum256([]byte(strings.Repeat("ab", 32)))
-	if err := wsjson.Write(ctx, ws, map[string]any{"type": "hello", "device_id": "stranger", "api_port": 8766, "discovery_nonce": randomID(), "commit": hex.EncodeToString(digest[:])}); err != nil {
+	if err := wsjson.Write(ctx, ws, map[string]any{"type": "hello", "device_id": "stranger", "discovery_nonce": randomID(), "commit": hex.EncodeToString(digest[:])}); err != nil {
 		t.Fatal(err)
 	}
 	var m map[string]any
@@ -314,20 +317,15 @@ func TestUnknownPhoneNeedsDiscoveryNonce(t *testing.T) {
 	}
 }
 
-func TestPairingDoesNotReuseAnotherDevicesRecord(t *testing.T) {
+func TestPairingReusesOnlyTheSameDevicesRecord(t *testing.T) {
 	a := testApp(t)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	other := &PhoneConfig{ID: "a", URL: "http://192.168.0.2:8766", DeviceID: "phone-a", Account: "acc-a", Cursor: 50}
-	manual := &PhoneConfig{ID: "m", URL: "http://192.168.0.3:8766"}
-	a.state.Phones = []*PhoneConfig{other, manual}
-	if got := a.findPairingPhoneLocked(&phonePairing{DeviceID: "phone-b", URL: other.URL}); got != nil {
-		t.Fatalf("another device at the same address must get a new record: %+v", got)
+	other := &PhoneConfig{ID: "a", Address: "192.168.0.2", DeviceID: "phone-a", Account: "acc-a", Cursor: 50}
+	a.state.Phones = []*PhoneConfig{other}
+	if got := a.phoneByDeviceLocked("phone-b"); got != nil {
+		t.Fatalf("another device must get a new record: %+v", got)
 	}
-	if got := a.findPairingPhoneLocked(&phonePairing{DeviceID: "phone-c", URL: manual.URL}); got != manual {
-		t.Fatal("manually added phone without device id should be upgraded")
-	}
-	if got := a.findPairingPhoneLocked(&phonePairing{DeviceID: "phone-a", URL: "http://192.168.0.9:8766"}); got != other {
-		t.Fatal("same device with a new address should keep its record")
+	cfg, err := a.authorizePairing(&phonePairing{DeviceID: "phone-a", Address: "192.168.0.9"})
+	if err != nil || cfg.ID != "a" || cfg.Account != "acc-a" || cfg.Cursor != 50 || cfg.Address != "192.168.0.9" {
+		t.Fatalf("same device with a new address should keep its record: %+v %v", cfg, err)
 	}
 }

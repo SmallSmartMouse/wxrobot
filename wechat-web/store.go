@@ -10,10 +10,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"log"
-	"os"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -45,11 +42,6 @@ CREATE TABLE IF NOT EXISTS messages (
 
 const messageColumns = "conversation_id, seq, id, text, direction, sender, kind, image_hash, image_error, original_hash, original_error, original_tries, original_note, time, gap"
 
-// addedColumns 是建表之后新增的列：旧数据库里没有时补上。
-var addedColumns = []struct{ table, column, definition string }{
-	{"messages", "sender", "TEXT NOT NULL DEFAULT ''"},
-}
-
 type store struct {
 	db      *sql.DB
 	written map[string]string         // "表:编号" → 上次写入的 JSON
@@ -70,17 +62,6 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, fmt.Errorf("数据库初始化失败：%w", err)
 	}
-	for _, c := range addedColumns {
-		var exists int
-		err = db.QueryRow("SELECT count(*) FROM pragma_table_info(?) WHERE name = ?", c.table, c.column).Scan(&exists)
-		if err == nil && exists == 0 {
-			_, err = db.Exec("ALTER TABLE " + c.table + " ADD COLUMN " + c.column + " " + c.definition)
-		}
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("数据库升级失败：%w", err)
-		}
-	}
 	return &store{db: db, written: map[string]string{}, dirty: map[string]map[int64]bool{}, cleared: map[string]bool{}}, nil
 }
 
@@ -92,79 +73,80 @@ func (a *App) markMessage(conversationID string, seq int64) {
 	a.store.dirty[conversationID][seq] = true
 }
 
-// settings 表中的配置项。
+// settingsLocked settings 表中的配置项：配置项名 → 内存中对应字段的指针。
 func (a *App) settingsLocked() map[string]any {
-	return map[string]any{"account_ai": &a.state.AccountAI, "phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules, "forward_rules": &a.state.ForwardRules, "discovery": &a.state.Discovery, "new_messages_only": &a.state.NewMessagesOnly, "account_names": &a.state.AccountNames}
-}
-
-// legacySettingsLocked 单手机版本的配置项：只读取，迁移后不再写入（保存时从数据库删除）。
-func (a *App) legacySettingsLocked() map[string]any {
-	return map[string]any{"phone": &a.state.Phone, "cursor": &a.state.Cursor}
-}
-
-// loadLocked 从数据库读入全部数据，返回数据库是否为空。
-func (a *App) loadLocked() (empty bool, err error) {
-	// 配置项名 → 内存中对应字段的指针，读出的 JSON 直接解析进去
-	settings := a.settingsLocked()
-	for id, target := range a.legacySettingsLocked() {
-		settings[id] = target
+	return map[string]any{
+		"account_ai": &a.state.AccountAI, "phones": &a.state.Phones, "ai": &a.state.AI, "ai_rules": &a.state.AIRules,
+		"forward_rules": &a.state.ForwardRules, "discovery": &a.state.Discovery, "new_messages_only": &a.state.NewMessagesOnly,
+		"account_names": &a.state.AccountNames,
 	}
-	rowsRead := 0
-	// readJSON 逐行读取 (id, data) 表，交给 each 解析，并记下读到的内容，后续保存时用于判断是否变化
-	readJSON := func(table string, each func(id, data string) error) error {
-		rows, err := a.store.db.Query("SELECT id, data FROM " + table)
-		if err != nil {
+}
+
+// ---------- 读取 ----------
+
+// loadLocked 从数据库读入全部数据：配置、会话、任务、AI 记录，最后是各会话的消息。
+func (a *App) loadLocked() error {
+	settings := a.settingsLocked()
+	readers := []struct {
+		table string
+		each  func(id, data string) error
+	}{
+		{"settings", func(id, data string) error {
+			if target, ok := settings[id]; ok {
+				return json.Unmarshal([]byte(data), target)
+			}
+			return nil
+		}},
+		{"conversations", func(id, data string) error {
+			return decodeInto(a.state.Conversations, id, data)
+		}},
+		{"operations", func(id, data string) error {
+			return decodeInto(a.state.Operations, id, data)
+		}},
+		{"ai_jobs", func(id, data string) error {
+			return decodeInto(a.state.AIJobs, id, data)
+		}},
+	}
+	for _, r := range readers {
+		if err := a.readJSONTable(r.table, r.each); err != nil {
 			return err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, data string
-			if err := rows.Scan(&id, &data); err != nil {
-				return err
-			}
-			if err := each(id, data); err != nil {
-				return fmt.Errorf("%s 表的 %s 无法读取：%w", table, id, err)
-			}
-			a.store.written[table+":"+id] = data
-			rowsRead++
-		}
-		return rows.Err()
 	}
-	// 依次读配置、会话、任务、AI 记录；任意一步出错就停止
-	err = readJSON("settings", func(id, data string) error {
-		if target, ok := settings[id]; ok {
-			return json.Unmarshal([]byte(data), target)
-		}
-		return nil
-	})
-	if err == nil {
-		err = readJSON("conversations", func(id, data string) error {
-			c := &Conversation{}
-			a.state.Conversations[id] = c
-			return json.Unmarshal([]byte(data), c)
-		})
-	}
-	if err == nil {
-		err = readJSON("operations", func(id, data string) error {
-			op := &Operation{}
-			a.state.Operations[id] = op
-			return json.Unmarshal([]byte(data), op)
-		})
-	}
-	if err == nil {
-		err = readJSON("ai_jobs", func(id, data string) error {
-			j := &AIJob{}
-			a.state.AIJobs[id] = j
-			return json.Unmarshal([]byte(data), j)
-		})
-	}
+	return a.readMessages()
+}
+
+// decodeInto 把一行 JSON 解析为新记录，放进 records[id]。
+func decodeInto[T any](records map[string]*T, id, data string) error {
+	record := new(T)
+	records[id] = record
+	return json.Unmarshal([]byte(data), record)
+}
+
+// readJSONTable 逐行读取 (id, data) 表交给 each 解析，并记下读到的内容，保存时据此判断是否变化。
+func (a *App) readJSONTable(table string, each func(id, data string) error) error {
+	rows, err := a.store.db.Query("SELECT id, data FROM " + table)
 	if err != nil {
-		return false, err
+		return err
 	}
-	// 消息按会话和序号排序读出，依次追加到各自会话
+	defer rows.Close()
+	for rows.Next() {
+		var id, data string
+		if err := rows.Scan(&id, &data); err != nil {
+			return err
+		}
+		if err := each(id, data); err != nil {
+			return fmt.Errorf("%s 表的 %s 无法读取：%w", table, id, err)
+		}
+		a.store.written[table+":"+id] = data
+	}
+	return rows.Err()
+}
+
+// readMessages 按会话和序号顺序读出消息，依次追加到各自的会话。
+func (a *App) readMessages() error {
 	rows, err := a.store.db.Query("SELECT " + messageColumns + " FROM messages ORDER BY conversation_id, seq")
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -173,96 +155,91 @@ func (a *App) loadLocked() (empty bool, err error) {
 		err := rows.Scan(&conversationID, &m.Seq, &m.ID, &m.Text, &m.Direction, &m.Sender, &m.Kind, &m.ImageHash, &m.ImageError,
 			&m.OriginalHash, &m.OriginalError, &m.OriginalTries, &m.OriginalNote, &m.Time, &m.Gap)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if c := a.state.Conversations[conversationID]; c != nil {
 			c.Messages = append(c.Messages, m)
 		}
 	}
-	return rowsRead == 0, rows.Err()
+	return rows.Err()
 }
 
-// saveLocked 在一个事务中写入所有变化。失败时内存不变，下次保存会再次尝试写入。
+// ---------- 保存 ----------
+
+// saveLocked 在一个事务中写入所有变化：要么全部成功，要么全部不生效。失败时下次保存会再次尝试写入。
 func (a *App) saveLocked() error {
 	a.pruneLocked()
-	// 一次保存的所有写入放在同一个事务里，要么全部成功，要么全部不生效
 	tx, err := a.store.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
-	changed := map[string]string{} // 提交成功后更新到 written
-	current := map[string]bool{}
-	// put 把一条记录序列化为 JSON；与上次写入的内容相同就跳过，不同才写入
-	put := func(table, id string, value any) error {
-		b, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		key := table + ":" + id
-		current[key] = true
-		if a.store.written[key] == string(b) {
-			return nil
-		}
-		changed[key] = string(b)
-		_, err = tx.Exec("INSERT INTO "+table+"(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data", id, string(b))
+	w := &recordWriter{tx: tx, written: a.store.written, changed: map[string]string{}, current: map[string]bool{}}
+	if err = a.writeRecords(w); err != nil {
 		return err
 	}
+	removed, err := w.deleteMissing()
+	if err != nil {
+		return err
+	}
+	if err = a.writeMessages(tx); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	// 提交成功后才更新“已写入”的记录；提交失败时下次保存会重新写
+	w.remember(removed)
+	a.store.dirty = map[string]map[int64]bool{}
+	a.store.cleared = map[string]bool{}
+	return nil
+}
 
-	// 配置、会话（不含消息）、任务、AI 记录：逐条比较后写入变化的
+// writeRecords 写入配置、会话（不含消息，消息单独存在 messages 表）、任务和 AI 记录中变化的。
+func (a *App) writeRecords(w *recordWriter) error {
 	for id, value := range a.settingsLocked() {
-		if err = put("settings", id, value); err != nil {
+		if err := w.put("settings", id, value); err != nil {
 			return err
 		}
 	}
 	for id, c := range a.state.Conversations {
 		meta := *c
-		meta.Messages = nil // 消息单独存在 messages 表
-		if err = put("conversations", id, meta); err != nil {
+		meta.Messages = nil
+		if err := w.put("conversations", id, meta); err != nil {
 			return err
 		}
 	}
 	for id, op := range a.state.Operations {
-		if err = put("operations", id, op); err != nil {
+		if err := w.put("operations", id, op); err != nil {
 			return err
 		}
 	}
 	for id, j := range a.state.AIJobs {
-		if err = put("ai_jobs", id, j); err != nil {
+		if err := w.put("ai_jobs", id, j); err != nil {
 			return err
 		}
 	}
-	// 上次写过、但内存里已经没有的记录（例如被清理的旧任务），从数据库删除
-	var removed []string
-	for key := range a.store.written {
-		if !current[key] {
-			table, id, _ := strings.Cut(key, ":")
-			if _, err = tx.Exec("DELETE FROM "+table+" WHERE id = ?", id); err != nil {
-				return err
-			}
-			removed = append(removed, key)
-		}
-	}
-	// 删除过聊天记录的会话：先删掉已保存的全部消息，之后新增的消息在下面照常写入
+	return nil
+}
+
+// writeMessages 先删除清空过聊天记录的会话已保存的消息，再写入被标记过的消息（新增的、补上图片的）。
+func (a *App) writeMessages(tx *sql.Tx) error {
 	for conversationID := range a.store.cleared {
-		if _, err = tx.Exec("DELETE FROM messages WHERE conversation_id = ?", conversationID); err != nil {
+		if _, err := tx.Exec("DELETE FROM messages WHERE conversation_id = ?", conversationID); err != nil {
 			return err
 		}
 	}
-	// 消息只写被标记过的行（新增的消息、补上图片的消息）
 	for conversationID, seqs := range a.store.dirty {
 		c := a.state.Conversations[conversationID]
 		if c == nil {
 			continue
 		}
 		for seq := range seqs {
-			// 找不到说明已被删除，跳过
 			m := c.messageBySeq(seq)
 			if m == nil {
-				continue
+				continue // 已被删除
 			}
-			_, err = tx.Exec("INSERT OR REPLACE INTO messages("+messageColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+			_, err := tx.Exec("INSERT OR REPLACE INTO messages("+messageColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 				conversationID, m.Seq, m.ID, m.Text, m.Direction, m.Sender, m.Kind, m.ImageHash, m.ImageError,
 				m.OriginalHash, m.OriginalError, m.OriginalTries, m.OriginalNote, m.Time, m.Gap)
 			if err != nil {
@@ -270,47 +247,55 @@ func (a *App) saveLocked() error {
 			}
 		}
 	}
-	// 提交成功后才更新“已写入”的记录；提交失败时下次保存会重新写
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	for key, data := range changed {
-		a.store.written[key] = data
-	}
-	for _, key := range removed {
-		delete(a.store.written, key)
-	}
-	a.store.dirty = map[string]map[int64]bool{}
-	a.store.cleared = map[string]bool{}
 	return nil
 }
 
-// importJSON 把旧版本的 state.json 导入数据库（只在数据库为空时调用），成功后改名保留为 .migrated。
-func (a *App) importJSON(path string) error {
-	// 没有旧数据文件就什么都不做
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+// recordWriter 在一次保存中写入 JSON 记录：只写与上次写入不同的，并记下本次仍存在的记录。
+type recordWriter struct {
+	tx      *sql.Tx
+	written map[string]string // 上次写入的内容（store.written）
+	changed map[string]string // 本次写入的内容，提交成功后更新到 written
+	current map[string]bool   // 本次仍存在的记录
+}
+
+// put 把一条记录序列化为 JSON；与上次写入的内容相同就跳过。
+func (w *recordWriter) put(table, id string, value any) error {
+	b, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	var legacy State
-	if err = json.Unmarshal(b, &legacy); err != nil {
-		return fmt.Errorf("旧数据 %s 无法读取：%w", path, err)
+	key := table + ":" + id
+	w.current[key] = true
+	if w.written[key] == string(b) {
+		return nil
 	}
-	// 用旧数据替换内存状态并整理，然后把所有消息标记为待写入
-	a.state = legacy
-	a.normalizeLocked()
-	for id, c := range a.state.Conversations {
-		for _, m := range c.Messages {
-			a.markMessage(id, m.Seq)
+	w.changed[key] = string(b)
+	_, err = w.tx.Exec("INSERT INTO "+table+"(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data", id, string(b))
+	return err
+}
+
+// deleteMissing 删除上次写过、但本次已不存在的记录（例如被清理的旧任务），返回删除的键。
+func (w *recordWriter) deleteMissing() ([]string, error) {
+	var removed []string
+	for key := range w.written {
+		if w.current[key] {
+			continue
 		}
+		table, id, _ := strings.Cut(key, ":")
+		if _, err := w.tx.Exec("DELETE FROM "+table+" WHERE id = ?", id); err != nil {
+			return nil, err
+		}
+		removed = append(removed, key)
 	}
-	if err = a.saveLocked(); err != nil {
-		return err
+	return removed, nil
+}
+
+// remember 提交成功后，把本次写入和删除的记录同步到“已写入”。
+func (w *recordWriter) remember(removed []string) {
+	for key, data := range w.changed {
+		w.written[key] = data
 	}
-	// 改名保留原文件，需要时可以回退
-	log.Printf("已把 %s 导入数据库", path)
-	return os.Rename(path, path+".migrated")
+	for _, key := range removed {
+		delete(w.written, key)
+	}
 }

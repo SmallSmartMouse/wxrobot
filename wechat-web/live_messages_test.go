@@ -16,20 +16,19 @@ func TestFirstUnreadWindowKeepsIncrement(t *testing.T) {
 		t.Run(map[bool]string{true: "badge", false: "notification"}[withCount], func(t *testing.T) {
 			a := testApp(t)
 			a.state.NewMessagesOnly = true
-			p := &PhoneConfig{Account: "acc"}
 			if withCount {
-				a.ingestLocked(p, PhoneEvent{Kind: "unread_chat", Chat: "小王", UnreadCount: 2})
+				a.ingestLocked(PhoneEvent{Account: "acc", Kind: "unread_chat", Chat: "小王", UnreadCount: 2})
 			} else {
-				a.ingestLocked(p, PhoneEvent{Kind: "notification", Chat: "小王", Text: "new1"})
-				a.ingestLocked(p, PhoneEvent{Kind: "notification", Chat: "小王", Text: "new2"})
+				a.ingestLocked(PhoneEvent{Account: "acc", Kind: "notification", Chat: "小王", Text: "new1"})
+				a.ingestLocked(PhoneEvent{Account: "acc", Kind: "notification", Chat: "小王", Text: "new2"})
 			}
 			c := a.conversationLocked("acc", "小王")
 			// 用户手动打开手机对话框，未读角标消失，底部快照仍必须保住打开之前的增量。
-			a.ingestLocked(p, PhoneEvent{Kind: "visible_snapshot", Chat: "小王", Snapshot: latestJSON("old1", "old2", "new1", "new2")})
+			a.ingestLocked(PhoneEvent{Account: "acc", Kind: "visible_snapshot", Chat: "小王", Snapshot: latestJSON("old1", "old2", "new1", "new2")})
 			if texts(c) != "new1,new2" {
 				t.Fatalf("first unread messages lost/imported history: %s", texts(c))
 			}
-			a.mergeLocked(c, latestJSON("old2", "new1", "new2"), false)
+			a.mergeLocked(c, latestJSON("old2", "new1", "new2"))
 			if texts(c) != "new1,new2" {
 				t.Fatal("duplicate window imported twice")
 			}
@@ -40,21 +39,21 @@ func TestFirstUnreadWindowKeepsIncrement(t *testing.T) {
 func TestToggleRetainsBoundaryAndInFlightIncrement(t *testing.T) {
 	a := testApp(t)
 	c := a.conversationLocked("acc", "小王")
-	a.mergeLocked(c, snapshotJSON("old"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("old"))
 	oldTask := &Operation{ID: "old-task", Kind: "read", ConversationID: c.ID}
-	if w := call(a, "POST", "/api/reading", `{"read_history":false}`, ""); w.Code != 200 {
+	if w := setReadHistory(a, false); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
 	a.finishLocked(oldTask, "succeeded", latestJSON("old", "during-toggle"), "")
 	if texts(c) != "old,during-toggle" || !c.NeedsRead {
 		t.Fatal(texts(c), c.NeedsRead)
 	}
-	a.mergeModeLocked(c, latestJSON("during-toggle", "new"), false, true)
+	a.mergeLatestLocked(c, latestJSON("during-toggle", "new"))
 	if texts(c) != "old,during-toggle,new" {
 		t.Fatal(texts(c))
 	}
 	// 反向切换也不能丢掉已完成的仅新增任务。
-	call(a, "POST", "/api/reading", `{"read_history":true}`, "")
+	setReadHistory(a, true)
 	liveTask := &Operation{ID: "live-task", Kind: "read", ConversationID: c.ID, NewMessagesOnly: true}
 	a.finishLocked(liveTask, "succeeded", latestJSON("new", "after-toggle"), "")
 	if texts(c) != "old,during-toggle,new,after-toggle" {
@@ -66,14 +65,14 @@ func TestGapAndStaleResultDoNotSwallowIncrement(t *testing.T) {
 	a := testApp(t)
 	a.state.NewMessagesOnly = true
 	c := a.conversationLocked("acc", "小王")
-	a.mergeModeLocked(c, snapshotJSON("baseline"), false, true)
+	a.mergeLatestLocked(c, snapshotJSON("baseline"))
 	stale := latestJSON("baseline", "old-result")
-	a.mergeLocked(c, latestJSON("gap-new1", "gap-new2"), false)
+	a.mergeLocked(c, latestJSON("gap-new1", "gap-new2"))
 	if texts(c) != "|gap-new1,gap-new2" || c.ReadWarning == "" {
 		t.Fatal(texts(c))
 	}
-	a.mergeModeLocked(c, stale, false, true)
-	a.mergeLocked(c, latestJSON("gap-new2", "new3"), false)
+	a.mergeLatestLocked(c, stale)
+	a.mergeLocked(c, latestJSON("gap-new2", "new3"))
 	if texts(c) != "|gap-new1,gap-new2,|baseline,old-result,new3" {
 		t.Fatal("late response rewound baseline", texts(c))
 	}
@@ -83,8 +82,8 @@ func TestEmptyVisibleChatKeepsFirstArrival(t *testing.T) {
 	a := testApp(t)
 	a.state.NewMessagesOnly = true
 	c := a.conversationLocked("acc", "小王")
-	a.ingestLocked(&PhoneConfig{Account: "acc"}, PhoneEvent{Chat: c.Title, Kind: "visible_snapshot", Snapshot: latestJSON()})
-	a.ingestLocked(&PhoneConfig{Account: "acc"}, PhoneEvent{Chat: c.Title, Kind: "visible_snapshot", Snapshot: latestJSON("first")})
+	a.ingestLocked(PhoneEvent{Account: "acc", Chat: c.Title, Kind: "visible_snapshot", Snapshot: latestJSON()})
+	a.ingestLocked(PhoneEvent{Account: "acc", Chat: c.Title, Kind: "visible_snapshot", Snapshot: latestJSON("first")})
 	if texts(c) != "first" {
 		t.Fatal(texts(c))
 	}
@@ -92,7 +91,7 @@ func TestEmptyVisibleChatKeepsFirstArrival(t *testing.T) {
 
 func TestFailedReadRetriesWithBackoff(t *testing.T) {
 	a := testApp(t)
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	a.state.NewMessagesOnly = true
 	c := a.conversationLocked("acc", "小王")
 	c.NeedsRead = true
@@ -120,8 +119,7 @@ func TestFailedReadRetriesWithBackoff(t *testing.T) {
 func TestUnreadHintSurvivesRestartAndBrowserOpening(t *testing.T) {
 	a := testApp(t)
 	a.state.NewMessagesOnly = true
-	p := &PhoneConfig{Account: "acc"}
-	a.ingestLocked(p, PhoneEvent{Kind: "unread_chat", Chat: "小王", UnreadCount: 1})
+	a.ingestLocked(PhoneEvent{Account: "acc", Kind: "unread_chat", Chat: "小王", UnreadCount: 1})
 	c := a.conversationLocked("acc", "小王")
 	call(a, "POST", "/api/conversations/"+c.ID+"/seen", `{}`, "")
 	if err := a.commitLocked(); err != nil {
@@ -133,39 +131,15 @@ func TestUnreadHintSurvivesRestartAndBrowserOpening(t *testing.T) {
 	}
 	defer b.store.db.Close()
 	d := b.state.Conversations[c.ID]
-	b.mergeModeLocked(d, latestJSON("old", "new"), false, true)
+	b.mergeLatestLocked(d, latestJSON("old", "new"))
 	if texts(d) != "new" {
 		t.Fatal(texts(d))
 	}
 }
 
-func TestRecoverOnlyLostNotificationBaselineOnce(t *testing.T) {
-	a := testApp(t)
-	a.state.NewMessagesOnly = true
-	c := a.conversationLocked("acc", "曾漏存")
-	a.mergeModeLocked(c, snapshotJSON("buffered1", "buffered2"), false, true)
-	a.state.Operations["old-read"] = &Operation{ID: "old-read", Kind: "read", ConversationID: c.ID, NewMessagesOnly: true, Reason: "notification", Status: "succeeded"}
-	quiet := a.conversationLocked("acc", "安静聊天")
-	a.mergeModeLocked(quiet, snapshotJSON("old"), false, true)
-	a.recoverLiveBaselinesLocked()
-	if texts(c) != "|buffered1,buffered2" || c.ReadWarning == "" {
-		t.Fatal(texts(c))
-	}
-	if len(quiet.Messages) > 0 {
-		t.Fatal("untriggered history must not be recovered")
-	}
-	a.recoverLiveBaselinesLocked()
-	if texts(c) != "|buffered1,buffered2" {
-		t.Fatal("recovery duplicated messages")
-	}
-	if a.aiCursor[c.ID] != c.LastSeq {
-		t.Fatal("recovery must not trigger auto replies")
-	}
-}
-
 func TestReadRetryBacksOffAndSkipsManualReads(t *testing.T) {
 	a := testApp(t)
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	c := a.conversationLocked("acc", "小王")
 	// 手动读取失败不自动重读
 	manual := &Operation{ID: "m", Kind: "read", ConversationID: c.ID, Limit: 20, Status: "running", Created: now()}
@@ -198,7 +172,7 @@ func TestEmptyLiveReadWithSignalBacksOff(t *testing.T) {
 	a := testApp(t)
 	a.state.NewMessagesOnly = true
 	c := a.conversationLocked("acc", "小王")
-	a.ingestLocked(&PhoneConfig{Account: "acc"}, PhoneEvent{Kind: "unread_chat", Chat: c.Title, UnreadCount: 1})
+	a.ingestLocked(PhoneEvent{Account: "acc", Kind: "unread_chat", Chat: c.Title, UnreadCount: 1})
 	for i := 1; i <= 2; i++ {
 		op := &Operation{ID: randomID(), Kind: "read", Auto: true, NewMessagesOnly: true, ConversationID: c.ID, Limit: 30, Status: "running", Created: now()}
 		a.state.Operations[op.ID] = op
@@ -220,12 +194,12 @@ func TestAlignedLatestReadClearsGapWarning(t *testing.T) {
 	a := testApp(t)
 	a.state.NewMessagesOnly = true
 	c := a.conversationLocked("acc", "小王")
-	a.mergeModeLocked(c, snapshotJSON("baseline"), false, true)
-	a.mergeModeLocked(c, latestJSON("gap1", "gap2"), false, true)
+	a.mergeLatestLocked(c, snapshotJSON("baseline"))
+	a.mergeLatestLocked(c, latestJSON("gap1", "gap2"))
 	if c.ReadWarning == "" {
 		t.Fatal("gap must be reported")
 	}
-	a.mergeModeLocked(c, latestJSON("gap2", "new"), false, true)
+	a.mergeLatestLocked(c, latestJSON("gap2", "new"))
 	if c.ReadWarning != "" || texts(c) != "|gap1,gap2,new" {
 		t.Fatal("aligned read kept stale warning:", c.ReadWarning, texts(c))
 	}

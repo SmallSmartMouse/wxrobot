@@ -8,28 +8,27 @@ package main
 // 转发出去的消息在目标会话里是“发出的”，不会再被当作来信转发，所以不会循环。
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/gin-gonic/gin"
 )
 
 const (
 	maxForwardRules   = 50
 	maxForwardBacklog = 20              // 目标会话排队中的转发超过这么多条时，新的不再转发（手机一条条发，避免越积越多）
 	imageWaitLimit    = 3 * time.Minute // 图片等原图最多等这么久，之后用已有的缩略图转发
+	maxDedupMinutes   = 1440
 )
 
 // ForwardRule 是一条转发规则。过滤条件都为空时，源会话的所有来信（文字；开启图片时含图片）都转发。
 type ForwardRule struct {
-	TargetPhones map[string]string `json:"target_phones,omitempty"`
+	TargetPhones map[string]string `json:"target_phones,omitempty"` // 目标会话 → 指定的执行设备
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
 	Enabled      bool              `json:"enabled"`
@@ -49,6 +48,12 @@ type ForwardRule struct {
 	re *regexp.Regexp // 编译好的 Regex：保存规则时和启动时（compile）设置
 }
 
+// forwardStatus 规则只在内存中的状态：最近一次没能转发的原因，网页上显示。
+type forwardStatus struct {
+	Problem   string `json:"problem,omitempty"`
+	ProblemAt string `json:"problem_at,omitempty"`
+}
+
 // compile 编译正则。启动时从数据库读出的规则也要调用。
 func (r *ForwardRule) compile() error {
 	r.re = nil
@@ -60,10 +65,60 @@ func (r *ForwardRule) compile() error {
 	return err
 }
 
-// forwardStatus 规则只在内存中的状态：最近一次没能转发的原因，网页上显示。
-type forwardStatus struct {
-	Problem   string `json:"problem,omitempty"`
-	ProblemAt string `json:"problem_at,omitempty"`
+// validate 整理并检查规则：源和目标必须是已有的会话、不能相同，目标需设置过会话类型；正则能编译。
+func (r *ForwardRule) validate(conversations map[string]*Conversation) error {
+	r.Name = strings.TrimSpace(r.Name)
+	r.Senders, r.Include, r.Exclude = splitList(r.Senders), splitList(r.Include), splitList(r.Exclude)
+	r.Regex = strings.TrimSpace(r.Regex)
+	r.Template = strings.TrimSpace(r.Template)
+	switch {
+	case utf8.RuneCountInString(r.Name) > 40:
+		return errors.New("规则名称最多 40 字")
+	case len(r.Sources) == 0 || len(r.Targets) == 0:
+		return errors.New("请选择源会话和转发目标")
+	}
+	if err := r.validateRoutes(conversations); err != nil {
+		return err
+	}
+	switch {
+	case len(r.Senders) > 100 || len(r.Include) > 100 || len(r.Exclude) > 100:
+		return errors.New("发送人和关键词各最多 100 个")
+	case r.compile() != nil:
+		return errors.New("正则表达式无效：" + r.Regex)
+	case r.DedupMinutes < 0 || r.DedupMinutes > maxDedupMinutes:
+		return errors.New("去重时间为 0–1440 分钟")
+	case r.Template != "" && (!strings.Contains(r.Template, "{text}") || utf8.RuneCountInString(r.Template) > 200):
+		return errors.New("转发格式必须包含 {text}，最多 200 字")
+	}
+	return nil
+}
+
+// validateRoutes 源和目标必须是已有的会话、不能相同；目标需设置过会话类型；指定设备只能属于已选的目标。
+func (r *ForwardRule) validateRoutes(conversations map[string]*Conversation) error {
+	sources := map[string]bool{}
+	for _, id := range r.Sources {
+		if conversations[id] == nil {
+			return errors.New("源会话不存在，请重新选择")
+		}
+		sources[id] = true
+	}
+	for _, id := range r.Targets {
+		c := conversations[id]
+		switch {
+		case c == nil:
+			return errors.New("转发目标不存在，请重新选择")
+		case sources[id]:
+			return errors.New("转发目标不能同时是源会话：" + c.Title)
+		case !c.classified():
+			return errors.New("请先在会话设置里设置转发目标的类型（联系人或群聊）：" + c.Title)
+		}
+	}
+	for target := range r.TargetPhones {
+		if !slices.Contains(r.Targets, target) {
+			return errors.New("设备策略必须属于已选择的目标会话")
+		}
+	}
+	return nil
 }
 
 // splitList 把“逗号、顿号或换行分隔”的文字拆成去掉空白的列表。
@@ -79,62 +134,12 @@ func splitList(items []string) []string {
 	return out
 }
 
-// validate 整理并检查规则：源和目标必须是已有的会话、不能相同，目标需设置过会话类型；正则能编译。
-func (r *ForwardRule) validate(conversations map[string]*Conversation) error {
-	r.Name = strings.TrimSpace(r.Name)
-	if utf8.RuneCountInString(r.Name) > 40 {
-		return errors.New("规则名称最多 40 字")
-	}
-	if len(r.Sources) == 0 || len(r.Targets) == 0 {
-		return errors.New("请选择源会话和转发目标")
-	}
-	sources := map[string]bool{}
-	for _, id := range r.Sources {
-		if conversations[id] == nil {
-			return errors.New("源会话不存在，请重新选择")
-		}
-		sources[id] = true
-	}
-	for _, id := range r.Targets {
-		c := conversations[id]
-		switch {
-		case c == nil:
-			return errors.New("转发目标不存在，请重新选择")
-		case sources[id]:
-			return errors.New("转发目标不能同时是源会话：" + c.Title)
-		case c.Kind == "unknown":
-			return errors.New("请先在会话设置里设置转发目标的类型（联系人或群聊）：" + c.Title)
-		}
-	}
-	for target := range r.TargetPhones {
-		if !slices.Contains(r.Targets, target) {
-			return errors.New("设备策略必须属于已选择的目标会话")
-		}
-	}
-	r.Senders, r.Include, r.Exclude = splitList(r.Senders), splitList(r.Include), splitList(r.Exclude)
-	if len(r.Senders) > 100 || len(r.Include) > 100 || len(r.Exclude) > 100 {
-		return errors.New("发送人和关键词各最多 100 个")
-	}
-	r.Regex = strings.TrimSpace(r.Regex)
-	if r.compile() != nil {
-		return errors.New("正则表达式无效：" + r.Regex)
-	}
-	if r.DedupMinutes < 0 || r.DedupMinutes > 1440 {
-		return errors.New("去重时间为 0–1440 分钟")
-	}
-	r.Template = strings.TrimSpace(r.Template)
-	if r.Template != "" && (!strings.Contains(r.Template, "{text}") || utf8.RuneCountInString(r.Template) > 200) {
-		return errors.New("转发格式必须包含 {text}，最多 200 字")
-	}
-	return nil
-}
-
 // accepts 判断消息是否满足规则的过滤条件（只看内容，不看方向和类型）。
 func (r *ForwardRule) accepts(m Message) bool {
 	if len(r.Senders) > 0 && !slices.Contains(r.Senders, m.Sender) {
 		return false
 	}
-	if m.Kind == "image" {
+	if m.Kind == msgImage {
 		return r.Images
 	}
 	if len(r.Include) > 0 && !containsAny(m.Text, r.Include) {
@@ -154,10 +159,15 @@ func (r *ForwardRule) format(c *Conversation, m Message) string {
 		// 一次替换完，原文里的 {sender} 等字样不会被再次替换
 		text = strings.NewReplacer("{text}", m.Text, "{sender}", m.Sender, "{chat}", c.Title).Replace(r.Template)
 	}
-	if runes := []rune(text); len(runes) > 2000 {
-		text = string(runes[:2000])
+	return truncateRunes(text, maxReplyRunes)
+}
+
+// dedupKey 去重用的键：同一规则里相同的原文；图片每次截图字节不同，不去重，返回空。
+func (r *ForwardRule) dedupKey(m Message) string {
+	if m.Kind == msgImage || r.DedupMinutes <= 0 {
+		return ""
 	}
-	return text
+	return r.ID + "\x00" + m.Text
 }
 
 func containsAny(text string, words []string) bool {
@@ -172,7 +182,7 @@ func containsAny(text string, words []string) bool {
 // forwardable 只转发别人发来的文字和图片：表情包只有截图、系统提示不是聊天内容；
 // 方向未识别的可能是自己发的，不转发，避免转发循环。
 func forwardable(m Message) bool {
-	return m.Direction == "incoming" && (m.Kind == "" || m.Kind == "image")
+	return m.Direction == dirIncoming && (m.Kind == "" || m.Kind == msgImage)
 }
 
 // imageReady 图片是否可以转发：已有原图，或不会再取原图（会话不取原图、已失败 2 次、
@@ -182,9 +192,11 @@ func imageReady(c *Conversation, index int) bool {
 	if m.OriginalHash != "" || !c.wantsOriginals() || m.OriginalTries >= 2 || index < len(c.Messages)-originalWindow {
 		return true
 	}
-	observed, err := time.Parse(time.RFC3339Nano, m.Time)
-	return err != nil || time.Since(observed) >= imageWaitLimit
+	observed := parseStamp(m.Time)
+	return observed.IsZero() || time.Since(observed) >= imageWaitLimit
 }
+
+// ---------- 转发循环 ----------
 
 // forwardLoop 每秒检查一次源会话的新来信，按规则建立转发任务。
 func (a *App) forwardLoop(ctx context.Context) {
@@ -199,117 +211,146 @@ func (a *App) forwardLoop(ctx context.Context) {
 }
 
 // forwardLocked 处理所有会话游标之后的新来信，返回是否建立了转发任务。
-// 有启用的规则要转发图片、而图片还在等原图时，游标停在这张图片前，下次再看，保证转发顺序与原来一致。
 func (a *App) forwardLocked() bool {
-	// 源会话 → 以它为源的启用规则
-	bySource := map[string][]*ForwardRule{}
-	for i := range a.state.ForwardRules {
-		r := &a.state.ForwardRules[i]
-		if r.Enabled {
-			for _, id := range r.Sources {
-				bySource[id] = append(bySource[id], r)
-			}
-		}
-	}
+	bySource := a.enabledRulesBySourceLocked()
 	a.pruneForwardSeenLocked()
 	created := false
 	for id, c := range a.state.Conversations {
-		cursor, seen := a.forwardCursor[id]
-		rules := bySource[id]
-		// 首次见到的会话、没有规则的会话只跟上最新位置：规则启用后只转发之后的新来信
-		if !seen || len(rules) == 0 {
-			a.forwardCursor[id] = c.LastSeq
+		if a.forwardNewMessagesLocked(c, bySource[id]) {
+			created = true
+		}
+	}
+	return created
+}
+
+// enabledRulesBySourceLocked 源会话 → 以它为源的启用规则。
+func (a *App) enabledRulesBySourceLocked() map[string][]*ForwardRule {
+	bySource := map[string][]*ForwardRule{}
+	for i := range a.state.ForwardRules {
+		r := &a.state.ForwardRules[i]
+		if !r.Enabled {
 			continue
 		}
-		if cursor >= c.LastSeq {
-			continue
+		for _, id := range r.Sources {
+			bySource[id] = append(bySource[id], r)
 		}
-		waitImages := false
-		for _, r := range rules {
-			waitImages = waitImages || r.Images
+	}
+	return bySource
+}
+
+// forwardNewMessagesLocked 按 rules 转发会话游标之后的新来信，返回是否建立了转发任务。
+// 首次见到的会话、没有规则的会话只跟上最新位置：规则启用后只转发之后的新来信。
+// 有规则要转发图片、而图片还在等原图时，游标停在这张图片前，下次再看，保证转发顺序与原来一致。
+func (a *App) forwardNewMessagesLocked(c *Conversation, rules []*ForwardRule) bool {
+	cursor, seen := a.forwardCursor[c.ID]
+	if !seen || len(rules) == 0 {
+		a.forwardCursor[c.ID] = c.LastSeq
+		return false
+	}
+	if cursor >= c.LastSeq {
+		return false
+	}
+	waitImages := slices.ContainsFunc(rules, func(r *ForwardRule) bool { return r.Images })
+	created := false
+	// 消息按序号有序，从游标之后的第一条开始
+	i := sort.Search(len(c.Messages), func(i int) bool { return c.Messages[i].Seq > cursor })
+	for ; i < len(c.Messages); i++ {
+		m := c.Messages[i]
+		if waitImages && m.Kind == msgImage && forwardable(m) && !imageReady(c, i) {
+			break
 		}
-		// 消息按序号有序，从游标之后的第一条开始
-		i := sort.Search(len(c.Messages), func(i int) bool { return c.Messages[i].Seq > cursor })
-		for ; i < len(c.Messages); i++ {
-			m := c.Messages[i]
-			if m.Kind == "image" && forwardable(m) && waitImages && !imageReady(c, i) {
-				break
-			}
-			cursor = m.Seq
-			if !forwardable(m) {
-				continue
-			}
-			for _, r := range rules {
-				if r.accepts(m) && a.forwardMessageLocked(r, c, m) {
-					created = true
-				}
-			}
+		cursor = m.Seq
+		if forwardable(m) && a.forwardByRulesLocked(rules, c, m) {
+			created = true
 		}
-		// 全部看完就跟到 LastSeq（删除过聊天记录时，消息的序号可能都比 LastSeq 小）
-		if i == len(c.Messages) {
-			cursor = c.LastSeq
+	}
+	// 全部看完就跟到 LastSeq（删除过聊天记录时，消息的序号可能都比 LastSeq 小）
+	if i == len(c.Messages) {
+		cursor = c.LastSeq
+	}
+	a.forwardCursor[c.ID] = cursor
+	return created
+}
+
+// forwardByRulesLocked 按每条接受这条消息的规则转发，返回是否建立了任务。
+func (a *App) forwardByRulesLocked(rules []*ForwardRule, c *Conversation, m Message) bool {
+	created := false
+	for _, r := range rules {
+		if r.accepts(m) && a.forwardMessageLocked(r, c, m) {
+			created = true
 		}
-		a.forwardCursor[id] = cursor
 	}
 	return created
 }
 
 // forwardMessageLocked 把一条消息按规则发到所有目标，返回是否建立了任务。
+// 至少交给一个目标才算转发过；都没能转发（手机未连接、排队过多）时，之后相同的内容仍可以转发。
 func (a *App) forwardMessageLocked(r *ForwardRule, c *Conversation, m Message) bool {
-	op := Operation{Kind: "send", ForwardRule: r.ID, ForwardFrom: c.ID}
-	if m.Kind == "image" {
-		op.ImageHash = m.OriginalHash
-		if op.ImageHash == "" {
-			op.ImageHash = m.ImageHash
-		}
-		if op.ImageHash == "" {
-			return false // 缩略图也没截到
-		}
-	} else {
-		op.Text = r.format(c, m)
-		if strings.TrimSpace(op.Text) == "" {
-			return false
-		}
+	op, ok := r.sendOperation(c, m)
+	if !ok {
+		return false
 	}
-	// 去重：同一规则里相同的原文在设定时间内只转发一次（图片每次截图字节不同，不去重）
-	dedupKey := ""
-	if m.Kind != "image" && r.DedupMinutes > 0 {
-		dedupKey = r.ID + "\x00" + m.Text
-		if at, ok := a.forwardSeen[dedupKey]; ok && time.Since(at) < time.Duration(r.DedupMinutes)*time.Minute {
-			return false
-		}
+	key := r.dedupKey(m)
+	if at, seen := a.forwardSeen[key]; key != "" && seen && time.Since(at) < time.Duration(r.DedupMinutes)*time.Minute {
+		return false
 	}
 	created := false
 	for _, targetID := range r.Targets {
-		target := a.state.Conversations[targetID]
-		switch {
-		case target == nil:
-			a.forwardProblemLocked(r, "转发目标已被删除")
-		case a.phoneForLocked(target) == nil:
-			a.forwardProblemLocked(r, "「"+target.Title+"」的账号当前没有连接的手机，未转发")
-		case a.queuedForwardsLocked(targetID) >= maxForwardBacklog:
-			a.forwardProblemLocked(r, "「"+target.Title+"」排队中的转发过多，新消息未转发")
-		default:
-			next := op
-			next.PhoneID, next.Account = a.phoneForLocked(target).ID, target.Account
-			if requested := r.TargetPhones[targetID]; requested != "" {
-				p := a.selectDeviceLocked(target, requested)
-				if p == nil {
-					a.forwardProblemLocked(r, "指定设备不可用，未转发")
-					continue
-				}
-				next.PhoneID, next.RequestedPhoneID, next.Account = p.ID, p.ID, target.Account
-			}
-			next.ID, next.ConversationID, next.Status, next.Created = "fwd-"+randomID(), targetID, "queued", a.forwardTimeLocked()
-			a.state.Operations[next.ID] = &next
+		if a.queueForwardLocked(r, op, targetID) {
 			created = true
 		}
 	}
-	// 至少交给一个目标才算转发过；都没能转发（手机未连接、排队过多）时，之后相同的内容仍可以转发
-	if created && dedupKey != "" {
-		a.forwardSeen[dedupKey] = time.Now()
+	if created && key != "" {
+		a.forwardSeen[key] = time.Now()
 	}
 	return created
+}
+
+// sendOperation 转发的发送内容：图片发原图（没有就发缩略图），文字按格式生成；没有可发的内容返回 false。
+func (r *ForwardRule) sendOperation(c *Conversation, m Message) (Operation, bool) {
+	op := Operation{Kind: opSend, ForwardRule: r.ID, ForwardFrom: c.ID}
+	if m.Kind == msgImage {
+		op.ImageHash = cmp.Or(m.OriginalHash, m.ImageHash)
+		return op, op.ImageHash != ""
+	}
+	op.Text = r.format(c, m)
+	return op, strings.TrimSpace(op.Text) != ""
+}
+
+// queueForwardLocked 为一个目标建立转发任务；没有能执行的手机或积压过多时记下原因，返回 false。
+func (a *App) queueForwardLocked(r *ForwardRule, op Operation, targetID string) bool {
+	target := a.state.Conversations[targetID]
+	phone, problem := a.forwardPhoneLocked(r, target, targetID)
+	if problem != "" {
+		a.forwardProblemLocked(r, problem)
+		return false
+	}
+	op.PhoneID, op.Account = phone.ID, target.Account
+	if r.TargetPhones[targetID] != "" {
+		op.RequestedPhoneID = phone.ID
+	}
+	op.ID, op.ConversationID, op.Status, op.Created = "fwd-"+randomID(), targetID, opQueued, a.forwardTimeLocked()
+	a.state.Operations[op.ID] = &op
+	return true
+}
+
+// forwardPhoneLocked 选出发往目标的手机：指定了设备就只用它，否则用负责目标会话的手机。不能转发时返回原因。
+func (a *App) forwardPhoneLocked(r *ForwardRule, target *Conversation, targetID string) (*PhoneConfig, string) {
+	switch {
+	case target == nil:
+		return nil, "转发目标已被删除"
+	case a.phoneForLocked(target) == nil:
+		return nil, "「" + target.Title + "」的账号当前没有连接的手机，未转发"
+	case a.queuedForwardsLocked(targetID) >= maxForwardBacklog:
+		return nil, "「" + target.Title + "」排队中的转发过多，新消息未转发"
+	}
+	if requested := r.TargetPhones[targetID]; requested != "" {
+		if p := a.selectDeviceLocked(target, requested); p != nil {
+			return p, ""
+		}
+		return nil, "指定设备不可用，未转发"
+	}
+	return a.phoneForLocked(target), ""
 }
 
 // forwardTimeLocked 转发任务的创建时间：比上一个转发任务晚，worker 按创建时间执行，保证同一批消息按原顺序发出。
@@ -326,7 +367,7 @@ func (a *App) forwardTimeLocked() string {
 func (a *App) queuedForwardsLocked(conversationID string) int {
 	n := 0
 	for _, op := range a.state.Operations {
-		if op.ConversationID == conversationID && op.ForwardRule != "" && op.Status == "queued" {
+		if op.ConversationID == conversationID && op.ForwardRule != "" && op.Status == opQueued {
 			n++
 		}
 	}
@@ -341,7 +382,7 @@ func (a *App) forwardProblemLocked(r *ForwardRule, problem string) {
 // pruneForwardSeenLocked 删除超过最长去重时间的去重记录。
 func (a *App) pruneForwardSeenLocked() {
 	for key, at := range a.forwardSeen {
-		if time.Since(at) > 24*time.Hour {
+		if time.Since(at) > maxDedupMinutes*time.Minute {
 			delete(a.forwardSeen, key)
 		}
 	}
@@ -351,81 +392,4 @@ func (a *App) pruneForwardSeenLocked() {
 func (a *App) skipNewMessagesLocked(c *Conversation) {
 	a.aiCursor[c.ID] = c.LastSeq
 	a.forwardCursor[c.ID] = c.LastSeq
-}
-
-// ---------- 网页接口 ----------
-
-// forwardRuleView 网页上的一条规则：规则本身，加上最近的转发情况。
-type forwardRuleView struct {
-	ForwardRule
-	forwardStatus
-	Forwarded int    `json:"forwarded"`         // 保留的任务记录中转发成功的条数
-	Failed    int    `json:"failed"`            // 失败或结果未知的条数
-	Queued    int    `json:"queued"`            // 排队或发送中的条数
-	LastAt    string `json:"last_at,omitempty"` // 最近一次转发时间
-}
-
-// getForward 返回转发规则和每条规则最近的转发情况。
-func (a *App) getForward(c *gin.Context) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	views := make([]forwardRuleView, 0, len(a.state.ForwardRules))
-	index := map[string]*forwardRuleView{}
-	for _, r := range a.state.ForwardRules {
-		views = append(views, forwardRuleView{ForwardRule: r, forwardStatus: a.forwardStatus[r.ID]})
-	}
-	for i := range views {
-		index[views[i].ID] = &views[i]
-	}
-	for _, op := range a.state.Operations {
-		v := index[op.ForwardRule]
-		if v == nil {
-			continue
-		}
-		switch {
-		case op.active():
-			v.Queued++
-		case op.Status == "succeeded":
-			v.Forwarded++
-		default:
-			v.Failed++
-		}
-		v.LastAt = max(v.LastAt, op.Created)
-	}
-	c.JSON(200, gin.H{"rules": views})
-}
-
-// setForward 校验并保存全部转发规则（整体替换）。没有编号的是新规则。
-func (a *App) setForward(c *gin.Context) {
-	var body struct {
-		Rules []ForwardRule `json:"rules"`
-	}
-	if !bind(c, &body) {
-		return
-	}
-	if len(body.Rules) > maxForwardRules {
-		fail(c, 400, "最多 50 条转发规则")
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for i := range body.Rules {
-		r := &body.Rules[i]
-		if err := r.validate(a.state.Conversations); err != nil {
-			name := r.Name
-			if name == "" {
-				name = "第 " + strconv.Itoa(i+1) + " 条"
-			}
-			fail(c, 400, "规则「"+name+"」："+err.Error())
-			return
-		}
-		if r.ID == "" {
-			r.ID = randomID()[:12]
-		}
-	}
-	if body.Rules == nil {
-		body.Rules = []ForwardRule{}
-	}
-	a.state.ForwardRules = body.Rules
-	a.saved(c, gin.H{"ok": true})
 }

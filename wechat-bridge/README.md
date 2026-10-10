@@ -1,29 +1,31 @@
 # 手机微信桥
 
-AutoJs6 脚本，在手机上同时提供 HTTP 接口并操作微信。电脑用 Bash + ADB 部署。
+AutoJs6 脚本，在手机上操作微信，经加密连接接收电脑的读写任务。电脑用 Bash + ADB 部署。
 
 | 文件 | 作用 |
 | --- | --- |
-| `bridge.js` | 主脚本：HTTP 接口、任务执行、消息监测；启动时先停止正在运行的旧实例 |
-| `connection.js` | 局域网 UDP 发现（回复电脑的发现请求）、WSS 主动连接、手机验证码与授权保存 |
+| `bridge.js` | 主脚本：处理电脑的请求、任务执行、消息监测；启动时先停止正在运行的旧实例 |
+| `connection.js` | 局域网 UDP 发现（收到电脑的发现请求）、WSS 主动连接、手机验证码与授权保存 |
 | `wechat.js` | 微信界面操作：打开聊天、读取消息、发送文字和图片 |
 | `deploy-phone.sh` | 电脑端部署入口 |
 | `config.example.json` | 首次部署的配置模板 |
 | `project.json` | AutoJs6 项目配置（入口 `bridge.js`，`ignore` 列出不发送到手机的文件） |
 | `package.json`、`jsconfig.json` | VSCode 代码补全：`npm install` 安装 AutoJs6 声明文件 |
 
-手机上的目录固定为 `/sdcard/wechat-bridge/`。`config.json`、锁、日志、原图都放在这里；代码从 `bridge.js` 所在目录加载。
+手机上的目录固定为 `/sdcard/wechat-bridge/`。`config.json`、锁、日志、状态文件、原图都放在这里；代码从 `bridge.js` 所在目录加载。
 
 ## 运行方式
 
 `bridge.js` 只有一个进程，三条执行线：
 
 ```
-HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）           通知回调
+连接线程（每个请求一个）        主线程（循环，每 0.4 秒）           通知回调
   POST /v1/messages/*  ─► 排队任务 ─► 执行任务：打开聊天 → 读取/发送       微信通知
   GET  /v1/tasks/{id}  ◄── 任务结果       ↓ 空闲时
   GET  /v1/events      ◄── 事件队列 ◄── 监测：首页未读 / 当前聊天变化  ◄──┘
 ```
+
+电脑的请求都经手机主动建立的 WSS 加密连接到达（`connection.js`），手机不开放任何 HTTP 端口。
 
 - **同一时刻最多一个排队任务**，界面操作完全串行。手机长时间未就绪时，排队超过 60 秒的任务标记失败（未执行，可安全重试）；排队时间从前一个任务结束时算起。
 - 读取时最多向上翻 20 页；读完为取原图回头找图片时最多翻 8 页。判断能否继续向上翻之前先刷新列表控件（无障碍缓存的旧信息曾让刚进入的聊天误报“已到最早”）。
@@ -38,7 +40,7 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 
 ## 部署
 
-电脑需要 Bash、ADB、jq、curl 和 `sha256sum` 或 `shasum`。在本目录执行：
+电脑需要 Bash、ADB、jq 和 `sha256sum` 或 `shasum`。在本目录执行：
 
 ```bash
 ./deploy-phone.sh --dry-run
@@ -56,7 +58,7 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 | `--no-restart` | 只更新文件 |
 | `--dry-run` | 只检查，不修改手机 |
 
-脚本上传 3 个运行文件并核对 SHA-256，保留手机上的配置，然后运行 `bridge.js`（它会先停止旧实例、等锁释放）并通过 ADB 端口转发确认就绪。不要在发送过程中部署。
+脚本上传 3 个运行文件并核对 SHA-256，保留手机上的配置，然后运行 `bridge.js`（它会先停止旧实例、等锁释放），再经 ADB 读取手机桥每 5 秒写出的 `status.json`（只含就绪状态）确认就绪。不要在发送过程中部署。
 
 ### VSCode 调试
 
@@ -73,27 +75,27 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 
 ## 配置
 
-`config.json` 字段：`device_id`（ADB 序列号）、`phone_api_token`（至少 32 字符）、`phone_api_port`、`discovery_port`（默认 `39000`，`0` 关闭）、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准；可选 `image_id`、`sticker_id`、`sticker_desc`、`sender_id`、`account_id`）、`chat_aliases`（名称不一致时的别名）。
+`config.json` 字段：`device_id`（ADB 序列号）、`discovery_port`（默认 `39000`，`0` 关闭）、`wechat_version`、`profile`（控件编号，`message_id`、`list_id`、`input_id` 必须校准；可选 `image_id`、`sticker_id`、`sticker_desc`、`sender_id`、`account_id`）、`chat_aliases`（名称不一致时的别名）。
 
-手机桥默认监听 `39000/udp`。收到电脑 v2 广播或单播发现请求后，主动向报文来源电脑建立 WSS 连接，固定电脑证书指纹。首次弹出 6 位验证码：在网页输入此码，并在手机点击“允许这台电脑”，两端均确认后才授权。验证码有效 3 分钟，网页最多尝试 5 次，配对框显示期间暂停微信界面自动操作；无需扫码或复制 Token。未授权的电脑被拒绝或配对超时后，再次弹框的间隔从 1 分钟起每次加倍，最长 30 分钟。
+手机桥默认监听 `39000/udp`。收到电脑的广播或单播发现请求后，主动向报文来源电脑建立 WSS 连接，固定电脑证书指纹。首次弹出 6 位验证码：在网页输入此码，并在手机点击“允许这台电脑”，两端均确认后才授权。验证码有效 3 分钟，网页最多尝试 5 次，配对框显示期间暂停微信界面自动操作；无需扫码或复制 Token。未授权的电脑被拒绝或配对超时后，再次弹框的间隔从 1 分钟起每次加倍，最长 30 分钟。
 
-授权凭证和电脑上次的地址保存在 `/sdcard/wechat-bridge/trusted-computers.json`，以后按这个地址自动验证并重连，电脑关闭自动搜索也能连上（电脑换了 IP 时需要它的发现广播才能找到）。一台手机只信任一台电脑：与新电脑配对并连上后，旧电脑的授权自动删除，旧电脑需要重新配对才能再用。已授权电脑连不上时从 5 秒起加倍重试，最长 5 分钟一次，日志只记第一次中断；它换了 IP 或重新上线（收到它的广播）时马上重连。电脑撤销授权后需要重新配对。跨网段搜索由电脑端配置私有 IPv4 范围，网络必须允许电脑向手机发 UDP、手机向电脑接入端口发 TCP。电脑默认接入端口为 `8788`，可配置。
+授权凭证和电脑上次的地址保存在 `/sdcard/wechat-bridge/trusted-computers.json`，以后按这个地址自动验证并重连，电脑关闭自动搜索也能连上（电脑换了 IP 时需要它的发现广播才能找到）。一台手机只信任一台电脑：与新电脑配对并连上后，旧电脑的授权自动删除，旧电脑需要重新配对才能再用。手机与一台电脑建立连接后，不再理会其他电脑的发现请求，也不弹配对框；连接断开满 30 秒后才接受其他电脑，期间原电脑可直接连回（脚本重启时同样为已授权电脑保留 30 秒；电脑撤销授权则立即放开）。已授权电脑连不上时从 5 秒起加倍重试，最长 5 分钟一次，日志只记第一次中断；它换了 IP 或重新上线（收到它的广播）时马上重连。电脑撤销授权后需要重新配对。跨网段搜索由电脑端配置私有 IPv4 范围，网络必须允许电脑向手机发 UDP、手机向电脑接入端口发 TCP。电脑默认接入端口为 `8788`，可配置。
 
-旧版 v1 发现仍可回复用原有 Token 签名的设备信息，原 HTTP 接口保留。未配置 `device_id` 时生成 UUID 并保存到 `/sdcard/wechat-bridge/device-id`。UDP 监听失败不会影响 HTTP 服务，错误记录在 `bridge.log`。
+未配置 `device_id` 时生成 UUID 并保存到 `/sdcard/wechat-bridge/device-id`。UDP 监听失败时已授权的电脑仍按保存的地址重连，错误记录在 `bridge.log`。
 
-## 接口
+## 电脑的请求
 
-除 `/health` 外都需要 `Authorization: Bearer <phone_api_token>`。
+电脑经加密连接发送 `{ method, path, body, key }`（`key` 即 Idempotency-Key），手机按路径处理后回复状态码和响应体：
 
 | 方法和路径 | 作用 |
 | --- | --- |
-| `GET /health` | 存活检查 |
 | `GET /v1/device` | `online`（主循环 45 秒内有心跳，或正在执行未超时的任务）、`busy`（正在执行任务）和 `info.ready`、`info.reasons`、`info.account` |
-| `POST /v1/messages/read` | `{chat, chat_type, account, limit, return_list}`，需要 `Idempotency-Key` |
-| `POST /v1/messages/send` | `{chat, chat_type, account, text}` 或 `{chat, chat_type, account, image_base64}`，需要 `Idempotency-Key` |
+| `POST /v1/messages/read` | `{chat, chat_type, account, limit, return_list}`，需要 `key` |
+| `POST /v1/messages/send` | `{chat, chat_type, account, text}` 或 `{chat, chat_type, account, image_base64}`，需要 `key` |
 | `GET /v1/tasks/{id}` | 任务状态和结果；最近 50 个任务 |
 | `POST /v1/account/refresh` | 下次空闲时重新识别当前微信号（切换账号后调用） |
 | `GET /v1/events?after=&limit=&wait=` | 长轮询消息事件：`notification`、`unread_chat`、`visible_snapshot` |
+| `GET /v1/files/{name}?offset=` | 原图分块（每块 256 KB，Base64）；`?done=1` 表示电脑已取完，手机删除文件 |
 
 ## 诊断
 
@@ -104,14 +106,15 @@ HTTP 线程（每个连接一个）       主线程（循环，每 0.4 秒）   
 
 ## 排查
 
-- **未就绪**：查看 `/v1/device` 的 `info.reasons`（无障碍、随选朗读、锁屏、微信版本、截图授权、控件校准）。
+- **未就绪**：在网页诊断页或手机上的 `status.json` 查看 `info.reasons`（无障碍、随选朗读、锁屏、微信版本、截图授权、控件校准）。
+- **收不到微信通知**：`info.notification_permission` 为 false 表示没开通知使用权，网页设备状态和 `deploy-phone.sh` 会提醒（不影响就绪）；在手机设置中搜索“通知使用权”，打开 AutoJs6。`info.notification_access` 为 false 而权限已开，说明系统没连上 AutoJs6 的通知监听（诊断 `NOTIFICATION_LISTENER_UNBOUND`）：关闭再打开通知使用权，MIUI 还需允许 AutoJs6 自启动，仍不行就重启手机。收不到通知时，手机桥进入的聊天空闲 8 秒后回到会话列表，靠首页未读标记发现新消息。
 - **聊天不匹配**：检查完整名称、别名、群人数后缀。
 - **发送结果未知**：先看手机，不要直接重发。
 - 手机上的 `bridge.log` 记录任务开始、结束和错误码，不含消息正文。
 
 ### 最近历史消息开关
 
-网页「手机连接」中的「读取最近历史消息」默认开启，允许读取最近消息并向上翻页。关闭后对所有手机和会话生效：读取聊天底部当前一屏，消息和原图均不回翻，也不自动加深读取。已有会话沿用已读边界；新会话根据未读数量或通知定位增量，无新消息提示时首次读取才建立基准。当前屏无法衔接时保留内容并标记缺口，不回翻补漏；不确定批次不触发自动回复或转发。设置和基准保存在电脑端，重启后保留，已有记录不删除。切换从下一次读取生效，执行中的结果保留可衔接增量并按需补读当前屏。旧手机桥不支持此模式时会提示更新脚本。
+网页「手机连接」中的「读取最近历史消息」默认开启，允许读取最近消息并向上翻页。关闭后对所有手机和会话生效：读取聊天底部当前一屏，消息和原图均不回翻，也不自动加深读取。已有会话沿用已读边界；新会话根据未读数量或通知定位增量，无新消息提示时首次读取才建立基准。当前屏无法衔接时保留内容并标记缺口，不回翻补漏；不确定批次不触发自动回复或转发。设置和基准保存在电脑端，重启后保留，已有记录不删除。切换从下一次读取生效，执行中的结果保留可衔接增量并按需补读当前屏。
 
 账号识别同时读取“我”页面的微信名，并以 `info.account.nickname` 上报。微信 8.0.78 默认昵称控件为 `com.tencent.mm:id/kbb`，其他版本可通过 `profile.nickname_id` 校准。昵称只用于展示，任务中的 `account` 仍必须是微信号。
 

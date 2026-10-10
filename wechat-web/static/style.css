@@ -170,14 +170,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   color: var(--green);
 }
 
-.system-icon {
-  flex-shrink: 0;
-  width: 22px;
-  font-size: 13px;
-  font-weight: 700;
-  text-align: center;
-}
-
 /* 折叠后只显示图标 */
 .system-sidebar.collapsed {
   width: 56px;
@@ -205,30 +197,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   border-right: 1px solid var(--line);
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 20px 16px 12px 20px;
-}
-
-.logo {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: var(--green);
-  color: #fff;
-  font-size: 17px;
-  font-weight: 600;
-}
-
-.brand strong {
-  font-size: 16px;
-  letter-spacing: .5px;
-}
-
 /* 诊断入口上的红点：新的异常或降级数量 */
 .alert-badge {
   position: absolute;
@@ -245,27 +213,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   font-weight: 600;
   line-height: 16px;
   text-align: center;
-}
-
-/* 账号切换：每个微信号的会话分开显示 */
-.account-switch {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 16px 8px;
-  color: #788f80;
-  font-size: 11px;
-}
-
-.account-switch select {
-  flex: 1;
-  min-width: 0;
-  padding: 7px 8px;
-  border: 1px solid #dceae0;
-  border-radius: 8px;
-  background: #fff;
-  color: var(--ink);
-  font-size: 12px;
 }
 
 .connection-card {
@@ -968,7 +915,7 @@ dialog h3 {
 }
 
 .discovery-settings { margin: 18px 0; padding: 14px; border: 1px solid #dce9e1; border-radius: 12px; background: #f7faf8; }
-.discovery-settings summary, .manual-phone summary { cursor: pointer; font-size: 14px; font-weight: 600; }
+.discovery-settings summary { cursor: pointer; font-size: 14px; font-weight: 600; }
 .discovery-settings summary span { display: block; padding: 5px 0 0 16px; font-size: 12px; font-weight: 400; }
 .discovery-toggle { display: flex; align-items: center; gap: 9px; margin: 14px 0; font-size: 13px; }
 .discovery-toggle input { width: auto; margin: 0; accent-color: #287a54; }
@@ -988,8 +935,6 @@ dialog h3 {
 .pairing-card p { font-size: 12px; line-height: 1.6; color: #61786b; }
 .pairing-code { font-size: 24px; letter-spacing: .35em; text-align: center; font-variant-numeric: tabular-nums; }
 .pairing-checks { padding: 8px 0; }
-.manual-phone { margin-top: 20px; padding-top: 16px; border-top: 1px solid #e4ebe7; color: #697a70; }
-#settings-dialog .phone-copy small { white-space: normal; overflow: visible; line-height: 1.6; overflow-wrap: anywhere; }
 
 .phone-list {
   margin-top: 14px;
@@ -997,52 +942,6 @@ dialog h3 {
 
 .phone-list .empty-list {
   padding: 16px 12px;
-}
-
-.phone-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 4px;
-  border-bottom: 1px solid #edf2ee;
-}
-
-.phone-copy {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-width: 0;
-  margin-left: 4px;
-}
-
-.phone-copy strong {
-  overflow: hidden;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* 窄屏：按钮换到地址下面一行，靠右 */
-@media (max-width: 560px) {
-  .phone-row {
-    flex-wrap: wrap;
-  }
-
-  .phone-copy {
-    flex-basis: calc(100% - 24px);
-  }
-
-  .phone-row .text-button:first-of-type {
-    margin-left: auto;
-  }
-}
-
-.phone-copy small {
-  overflow: hidden;
-  color: #7d8a85;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .danger-text {
@@ -1053,16 +952,6 @@ dialog h3 {
   background: var(--error-bg);
 }
 
-.phone-form {
-  margin-top: 16px;
-  padding-top: 4px;
-}
-
-.phone-form h3 {
-  margin: 0 0 4px;
-  font-size: 14px;
-}
-
 .dialog-actions {
   display: flex;
   justify-content: flex-end;
@@ -1070,76 +959,9 @@ dialog h3 {
   margin-top: 20px;
 }
 
-/* 全局 AI 的名称规则：每条规则一块 */
-.rule-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
-  margin-top: 10px;
-  padding: 10px;
-  border-radius: 8px;
-  background: #edf5ee;
-}
-
-.rule-row input, .rule-row select {
-  min-width: 0;
-  padding: 6px;
-  border: 1px solid #dfe8e0;
-  border-radius: 6px;
-  font-size: 12px;
-}
-
 /* 消息转发：每条规则一块，源会话和目标各一个可搜索的勾选列表 */
 #forward-dialog {
   width: 720px;
-}
-
-.forward-rule {
-  margin-top: 14px;
-  padding: 12px 14px 14px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: #f7faf7;
-}
-
-.forward-rule.disabled {
-  opacity: 0.65;
-}
-
-.forward-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.forward-head label {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: 4px;
-  color: #4f6a5a;
-  font-size: 12px;
-}
-
-.forward-head input[data-key="name"] {
-  flex: 1;
-  min-width: 0;
-  padding: 7px 10px;
-  border: 1px solid #dfe8e0;
-  border-radius: 7px;
-  background: #fff;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.forward-stats {
-  margin-top: 6px;
-  color: #7d8a85;
-  font-size: 11px;
-}
-
-.forward-stats .problem {
-  color: var(--error-ink);
 }
 
 .picker {
@@ -1156,59 +978,6 @@ dialog h3 {
   border-bottom: 1px solid #edf2ee;
   border-radius: 8px 8px 0 0;
   background: transparent;
-}
-
-.picker-list {
-  max-height: 150px;
-  overflow: auto;
-  padding: 4px 0;
-}
-
-.picker-list label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  color: var(--ink);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.picker-list label:hover {
-  background: #f1f6f2;
-}
-
-.picker-list label.unavailable {
-  color: #a3ada3;
-  cursor: not-allowed;
-}
-
-.picker-list label span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.picker-list small {
-  flex: none;
-  margin-left: auto;
-  color: #a3ada3;
-  font-size: 10px;
-}
-
-.picker-empty {
-  padding: 8px 10px;
-  color: #a3ada3;
-  font-size: 12px;
-}
-
-.forward-rule .field-check {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 14px;
-  color: #647d6d;
-  font-size: 12px;
 }
 
 .toast {
@@ -1328,7 +1097,6 @@ dialog h3 {
 .reading-toggle input:focus-visible { outline: 2px solid #249474; outline-offset: 3px; }
 .reading-toggle input:disabled { opacity: .6; cursor: wait; }
 .reading-settings p { margin: 10px 0 0; line-height: 1.6; }
-#reading-status { margin-top: 8px; font-size: 12px; color: var(--muted, #687586); }
 
 .list-account { padding: 8px 20px 0; color: #738078; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .outgoing .message-sender { text-align: right; margin-right: 2px; }

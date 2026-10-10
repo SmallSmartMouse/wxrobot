@@ -370,14 +370,6 @@ small {
 .scope-toolbar p {
   margin: 12px 0 0;
 }
-.scope-badge {
-  background: var(--accent-soft);
-  color: var(--accent);
-  border-radius: 20px;
-  padding: 5px 12px;
-  margin-right: auto;
-  font-size: 13px;
-}
 .data-table {
   border-collapse: collapse;
   width: 100%;
@@ -616,17 +608,6 @@ details > summary .muted {
 .discovery-settings .field {
   max-width: 380px;
 }
-.manual-phone {
-  margin-top: 20px;
-  border-top: 1px solid var(--line);
-  padding-top: 16px;
-}
-.manual-phone > summary {
-  color: var(--accent);
-}
-.phone-form {
-  max-width: 640px;
-}
 .reading-settings {
   margin: 20px 0;
 }
@@ -660,18 +641,6 @@ details > summary .muted {
   padding: 20px;
   border: 1px solid var(--line);
   border-radius: 8px;
-}
-.phone-row {
-  display: flex;
-  gap: 16px;
-  padding: 16px 0;
-  align-items: center;
-}
-.phone-copy {
-  flex: 1;
-}
-.phone-copy small {
-  display: block;
 }
 .phone-list {
   overflow-x: auto;
@@ -709,25 +678,6 @@ progress {
   width: 130px;
   min-width: 100px;
   font-size: 13px;
-}
-.account-switch {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  margin: 0;
-  flex: 1;
-  padding: 0;
-  background: none;
-  border: 0;
-}
-.account-switch > span {
-  white-space: nowrap;
-  font-size: 13px;
-  color: var(--muted);
-}
-.account-switch select {
-  min-width: 160px;
-  width: 100%;
 }
 .device-picker {
   display: flex;
@@ -1148,27 +1098,8 @@ dialog.drawer {
 .field .picker input[type="search"]::placeholder {
   color: var(--muted);
 }
-.picker-list label:hover {
-  background: var(--accent-soft);
-}
-.picker-list label.unavailable {
-  color: var(--muted);
-}
 .picker > input {
   width: 100%;
-}
-.picker-list {
-  max-height: 150px;
-  overflow: auto;
-  margin-top: 8px;
-}
-.picker-list label {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  padding: 9px 3px;
-  font-size: 13px;
-  color: var(--text);
 }
 .task-detail {
   background: var(--bg);
@@ -1372,9 +1303,6 @@ dialog.drawer {
   .message-page {
     padding: 16px;
   }
-  .account-switch {
-    width: 100%;
-  }
 }
 @media (max-width: 600px) {
   .system-sidebar {
@@ -1515,11 +1443,6 @@ dialog.drawer {
   background: var(--bg);
   color: var(--text);
 }
-.account-switch select {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--line);
-}
 .filters .selected {
   background: transparent;
   color: var(--accent);
@@ -1605,15 +1528,6 @@ dialog.drawer {
 .picker > details > input {
   width: 100%;
   margin-top: 10px;
-}
-.picker-list label {
-  min-height: 36px;
-  padding: 7px 3px;
-}
-.picker-list input[type="checkbox"] {
-  width: 16px;
-  min-height: 16px;
-  margin: 0;
 }
 .picker {
   padding: 6px 10px;
@@ -2472,10 +2386,6 @@ input[role="switch"]:checked::before {
 .workspace .discovery-settings {
   padding: 18px;
   margin: 0 0 14px;
-}
-.workspace .manual-phone {
-  margin-top: 16px;
-  padding-top: 12px;
 }
 #phone-search {
   max-width: 520px;

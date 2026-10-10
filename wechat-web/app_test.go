@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -94,16 +95,16 @@ func TestMergeTaskGapAndIgnoredMonitorWindow(t *testing.T) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	c := a.conversationLocked("acc", "小王")
-	a.mergeLocked(c, snapshotJSON("a", "b"), false)
-	a.mergeLocked(c, snapshotJSON("b", "c"), false)
+	a.mergeLocked(c, snapshotJSON("a", "b"))
+	a.mergeLocked(c, snapshotJSON("b", "c"))
 	if got := texts(c); got != "a,b,c" || c.Unread != 3 || c.LastSeq != 3 {
 		t.Fatalf("aligned merge: %s unread=%d seq=%d", got, c.Unread, c.LastSeq)
 	}
-	a.mergeLocked(c, snapshotJSON("old1", "old2"), false) // 用户翻到历史位置：忽略
+	a.mergeLocked(c, snapshotJSON("old1", "old2")) // 用户翻到历史位置：忽略
 	if got := texts(c); got != "a,b,c" {
 		t.Fatalf("monitor window should be ignored: %s", got)
 	}
-	a.mergeLocked(c, snapshotJSON("x", "y"), true) // 读取任务：整窗追加并标记缺口
+	a.mergeOrAppendLocked(c, snapshotJSON("x", "y")) // 读取任务：整窗追加并标记缺口
 	if got := texts(c); got != "a,b,c,|x,y" {
 		t.Fatalf("task gap merge: %s", got)
 	}
@@ -123,40 +124,16 @@ func reopen(t *testing.T, a *App) *App {
 	return b
 }
 
-func TestLegacyStateMigration(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	legacy := `{"seen":{"e1":true},"config":{"phone_url":"http://p:8766","token":"t"},"conversations":{"x":{"id":"x","title":"群","kind":"group","body_cursor":1,
-		"messages":[{"id":"n","text":"通知","source":"android_notification"},{"id":"b","seq":1,"text":"正文","source":"chat_body"}]}}}`
-	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
-		t.Fatal(err)
-	}
-	a, err := newApp(filepath.Join(dir, "wechat.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = a.importJSON(path); err != nil {
-		t.Fatal(err)
-	}
-	b := reopen(t, a)
-	if got := texts(b.state.Conversations["x"]); got != "正文" || len(b.state.Phones) != 1 || b.state.Phones[0].URL != "http://p:8766" {
-		t.Fatalf("legacy data should be imported (notifications dropped): %s %+v", got, b.state.Phones)
-	}
-	if _, err := os.Stat(path + ".migrated"); err != nil {
-		t.Fatal("legacy file should be kept as .migrated")
-	}
-}
-
 func TestSQLiteRoundTrip(t *testing.T) {
 	a := testApp(t)
 	a.mu.Lock()
 	c := a.conversationLocked("acc", "小王")
 	c.Kind = "person"
-	a.mergeLocked(c, snapshotJSON("a", "b"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("a", "b"))
 	window := `{"messages":[{"text":"b","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming"}]}`
-	a.mergeLocked(c, json.RawMessage(window), true)
+	a.mergeOrAppendLocked(c, json.RawMessage(window))
 	// 之后补上这张图片的原图：只更新已有的那一行
-	a.mergeLocked(c, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","original_hash":"abc"}]}`), true)
+	a.mergeOrAppendLocked(c, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","original_hash":"abc"}]}`))
 	for i := 0; i < maxFinishedOperations+5; i++ {
 		id := fmt.Sprintf("op-%03d", i)
 		a.state.Operations[id] = &Operation{ID: id, ConversationID: c.ID, Kind: "read", Status: "succeeded", Created: fmt.Sprintf("2026-01-01T00:00:%03d", i)}
@@ -210,23 +187,67 @@ func (p *fakePhone) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// addTestPhone 添加一台编号 p1、登录着账号 acc、在线的手机（不启动事件循环）。调用方按需持有锁。
-func addTestPhone(a *App, url string) {
-	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "p1", URL: url, Token: strings.Repeat("t", 32), Account: "acc"})
+// call 按手机桥接口处理一个经连接发来的请求：请求交给 HTTP handler；文件按分块格式返回（测试文件很小，一块就是全部）。
+func (p handlerPhone) call(ctx context.Context, req linkRequest) (linkMessage, error) {
+	if strings.HasPrefix(req.Path, "/v1/files/") && strings.Contains(req.Path, "done=1") {
+		return linkMessage{Status: 200, Body: json.RawMessage(`{"ok":true}`)}, nil
+	}
+	var body io.Reader = http.NoBody
+	if req.Body != nil {
+		b, _ := json.Marshal(req.Body)
+		body = bytes.NewReader(b)
+	}
+	path, _, _ := strings.Cut(req.Path, "?")
+	if !strings.HasPrefix(path, "/v1/files/") {
+		path = req.Path
+	}
+	r := httptest.NewRequest(req.Method, path, body)
+	if req.Key != "" {
+		r.Header.Set("Idempotency-Key", req.Key)
+	}
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if strings.HasPrefix(req.Path, "/v1/files/") && w.Code == 200 {
+		chunk, _ := json.Marshal(map[string]any{"size": w.Body.Len(), "data": base64.StdEncoding.EncodeToString(w.Body.Bytes())})
+		return linkMessage{Status: 200, Body: chunk}, nil
+	}
+	return linkMessage{Status: w.Code, Body: w.Body.Bytes()}, nil
+}
+
+func (p handlerPhone) close() {}
+
+// handlerPhone 把 http.Handler 当作手机的连接（phoneConn），测试用。
+type handlerPhone struct{ http.Handler }
+
+// linkPhone 把 handler 设为手机 id 的连接。
+func linkPhone(a *App, id string, phone http.Handler) {
+	a.links[id] = handlerPhone{phone}
+}
+
+// addTestPhone 添加一台编号 p1、登录着账号 acc、在线的手机（不启动事件循环）；phone 不为空时作为它的连接。调用方按需持有锁。
+func addTestPhone(a *App, phone http.Handler) {
+	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "p1", DeviceID: "dev-p1", Token: strings.Repeat("t", 32), Account: "acc"})
 	a.syncPhonesLocked()
-	a.phones["p1"].connection = "在线"
+	a.phones["p1"].connection = connOnline
+	if phone != nil {
+		linkPhone(a, "p1", phone)
+	}
 }
 
 func appWithPhone(t *testing.T, phone *fakePhone) (*App, *Conversation) {
-	server := httptest.NewServer(phone)
-	t.Cleanup(server.Close)
 	a := testApp(t)
-	addTestPhone(a, server.URL)
+	addTestPhone(a, phone)
 	a.mu.Lock()
 	c := a.conversationLocked("acc", "家人群")
 	c.Kind = "group"
 	a.mu.Unlock()
 	return a, c
+}
+
+// setReadHistory 经系统设置接口切换读取模式（搜索设置保持默认），返回响应。
+func setReadHistory(a *App, readHistory bool) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(map[string]any{"discovery": defaultDiscoverySettings(), "read_history": readHistory})
+	return call(a, "POST", "/api/system-settings", string(body), "")
 }
 
 func runAll(a *App) {
@@ -328,16 +349,16 @@ func TestAISettingPrecedenceAndTrigger(t *testing.T) {
 	if s := a.aiSettingLocked(c); s.Mode != "auto" {
 		t.Fatalf("name rule not applied: %+v", s)
 	}
-	a.mergeLocked(c, snapshotJSON("旧消息 @助手"), true)
-	if a.nextAutoJobLocked() != "" {
+	a.mergeOrAppendLocked(c, snapshotJSON("旧消息 @助手"))
+	if a.nextAIJobLocked() != "" {
 		t.Fatal("messages present before the first check must not trigger")
 	}
-	a.mergeLocked(c, snapshotJSON("旧消息 @助手", "没有触发词"), true)
-	if a.nextAutoJobLocked() != "" {
+	a.mergeOrAppendLocked(c, snapshotJSON("旧消息 @助手", "没有触发词"))
+	if a.nextAIJobLocked() != "" {
 		t.Fatal("message without keyword must not trigger")
 	}
-	a.mergeLocked(c, snapshotJSON("没有触发词", "@助手 在吗"), true)
-	if a.nextAutoJobLocked() == "" {
+	a.mergeOrAppendLocked(c, snapshotJSON("没有触发词", "@助手 在吗"))
+	if a.nextAIJobLocked() == "" {
 		t.Fatal("keyword message should trigger")
 	}
 	c.AI = AISetting{Mode: "off", IntervalSeconds: 5}
@@ -358,11 +379,11 @@ func TestGenerateReplySendsOnlyIfStillAuto(t *testing.T) {
 	a := testApp(t)
 	a.state.AI = AIConfig{URL: model.URL + "/v1", Model: "m", Prompt: "p"}
 	a.mu.Lock()
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	c := a.conversationLocked("acc", "小王")
 	c.Kind = "person"
 	c.AI = AISetting{Mode: "auto", IntervalSeconds: 5}
-	a.mergeLocked(c, snapshotJSON("在吗"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("在吗"))
 	auto := a.newAIJobLocked(c.ID)
 	a.mu.Unlock()
 	a.generateReply(context.Background(), auto.ID)
@@ -402,7 +423,7 @@ func TestMediaUploadAndRead(t *testing.T) {
 
 func TestStateHidesSecrets(t *testing.T) {
 	a := testApp(t)
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	a.state.Phones[0].Token = "secret-phone-token-0123456789abcdef"
 	a.state.AI.Key = "secret-ai-key"
 	for _, path := range []string{"/api/state", "/api/ai/config"} {
@@ -417,7 +438,7 @@ func TestShallowAutoReadDeepensBeforeMarkingGap(t *testing.T) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	c := a.conversationLocked("acc", "小王")
-	a.mergeLocked(c, snapshotJSON("a", "b"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("a", "b"))
 	shallow := &Operation{ID: "s", ConversationID: c.ID, Kind: "read", Limit: shallowRead, Auto: true, Status: "running", Created: now()}
 	a.state.Operations[shallow.ID] = shallow
 	a.finishLocked(shallow, "succeeded", snapshotJSON("x", "y"), "")
@@ -453,7 +474,7 @@ func TestAutoReadStoppedEarlyAppendsWithoutDeepening(t *testing.T) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	c := a.conversationLocked("acc", "小王")
-	a.mergeLocked(c, snapshotJSON("a", "b"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("a", "b"))
 	op := &Operation{ID: "s", ConversationID: c.ID, Kind: "read", Limit: shallowRead, Auto: true, Status: "running", Created: now()}
 	a.state.Operations[op.ID] = op
 	var result map[string]any
@@ -473,7 +494,7 @@ func TestAutoReadStoppedEarlyAppendsWithoutDeepening(t *testing.T) {
 
 func TestAutoReadLimitDependsOnKnownTexts(t *testing.T) {
 	a := testApp(t)
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	a.mu.Lock()
 	fresh := a.conversationLocked("acc", "新会话")
 	fresh.NeedsRead = true
@@ -483,7 +504,7 @@ func TestAutoReadLimitDependsOnKnownTexts(t *testing.T) {
 	}
 	a.mu.Lock()
 	known := a.conversationLocked("acc", "老会话")
-	a.mergeLocked(known, snapshotJSON("a", "b"), true)
+	a.mergeOrAppendLocked(known, snapshotJSON("a", "b"))
 	known.NeedsRead = true
 	a.mu.Unlock()
 	if !a.scheduleAutoRead("p1") {
@@ -503,7 +524,7 @@ func TestSendSnapshotGapTriggersRead(t *testing.T) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	c := a.conversationLocked("acc", "小王")
-	a.mergeLocked(c, snapshotJSON("a"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("a"))
 	op := &Operation{ID: "send", ConversationID: c.ID, Kind: "send", Text: "hi", Status: "running", Created: now()}
 	a.state.Operations[op.ID] = op
 	a.finishLocked(op, "succeeded", json.RawMessage(`{"snapshot":`+string(snapshotJSON("x", "hi"))+`}`), "")
@@ -514,7 +535,7 @@ func TestSendSnapshotGapTriggersRead(t *testing.T) {
 
 func TestScheduleAutoReadPriority(t *testing.T) {
 	a := testApp(t)
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	a.mu.Lock()
 	timed := a.conversationLocked("acc", "定时")
 	timed.ReadEvery = 60
@@ -544,7 +565,7 @@ func TestAutoReadSendsKnownTail(t *testing.T) {
 	phone := &fakePhone{status: "succeeded", result: string(snapshotJSON("b", "c", "d"))}
 	a, c := appWithPhone(t, phone)
 	a.mu.Lock()
-	a.mergeLocked(c, snapshotJSON("a", "b", "c"), true)
+	a.mergeOrAppendLocked(c, snapshotJSON("a", "b", "c"))
 	a.queueReadLocked(c, shallowRead, "schedule")
 	a.mu.Unlock()
 	runAll(a)
@@ -598,11 +619,11 @@ func TestOriginalFailuresStopAfterTwoTries(t *testing.T) {
 	c := a.conversationLocked("acc", "小王")
 	c.Kind = "person"
 	window := `{"messages":[{"text":"a","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","original_error":"大图没有打开"}]}`
-	a.mergeLocked(c, json.RawMessage(window), true)
+	a.mergeOrAppendLocked(c, json.RawMessage(window))
 	if c.firstPendingOriginal() != 1 {
 		t.Fatal("image should still be pending after one failure")
 	}
-	a.mergeLocked(c, json.RawMessage(window), true)
+	a.mergeOrAppendLocked(c, json.RawMessage(window))
 	if c.firstPendingOriginal() != -1 || c.Messages[1].OriginalTries != 2 {
 		t.Fatalf("should give up after two failures: %+v", c.Messages[1])
 	}
@@ -638,10 +659,10 @@ func TestGroupSenderAndAvatarPersist(t *testing.T) {
 	avatar := tinyJPEG(t, 20, 20)
 	// 第一屏：最后一条被截断，没识别出发送人
 	first := `{"messages":[{"text":"早","direction":"incoming","sender":"张三","avatar":"` + avatar + `"},{"text":"好","direction":"unknown"}]}`
-	a.mergeLocked(c, json.RawMessage(first), true)
+	a.mergeOrAppendLocked(c, json.RawMessage(first))
 	// 第二屏：同一条消息完整显示，补上发送人；后面是另一个人的表情
 	second := `{"messages":[{"text":"好","direction":"incoming","sender":"李四"},{"text":"[表情]","kind":"sticker","direction":"incoming","sender":"李四","thumbnail":"` + avatar + `"}]}`
-	if !a.mergeLocked(c, json.RawMessage(second), false) {
+	if !a.mergeLocked(c, json.RawMessage(second)) {
 		t.Fatal("second screen should align")
 	}
 	if err := a.commitLocked(); err != nil {
@@ -668,36 +689,6 @@ func TestSameTextFromDifferentSendersIsDifferent(t *testing.T) {
 	unknown := Message{Text: "1", Direction: "incoming"}
 	if sameMessage(a, b) || !sameMessage(a, unknown) {
 		t.Fatal("different senders differ; a missing sender matches any")
-	}
-}
-
-func TestOldDatabaseGetsSenderColumn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wechat.db")
-	a, err := newApp(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 模拟旧版本的表结构：没有 sender 列
-	for _, q := range []string{"DROP TABLE messages", strings.Replace(strings.Split(schema, "CREATE TABLE IF NOT EXISTS messages")[1], "sender          TEXT    NOT NULL DEFAULT '',", "", 1)} {
-		if !strings.HasPrefix(q, "DROP") {
-			q = "CREATE TABLE messages" + q
-		}
-		if _, err = a.store.db.Exec(q); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err = a.store.db.Exec("INSERT INTO messages(conversation_id, seq, id, text, direction, time) VALUES('x', 1, 'x:1', '旧', 'incoming', '')"); err != nil {
-		t.Fatal(err)
-	}
-	a.store.db.Close()
-	b, err := newApp(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.store.db.Close()
-	var sender string
-	if err = b.store.db.QueryRow("SELECT sender FROM messages WHERE id = 'x:1'").Scan(&sender); err != nil || sender != "" {
-		t.Fatalf("sender column should be added with an empty default: %q %v", sender, err)
 	}
 }
 
@@ -777,54 +768,35 @@ func TestSystemNoticesAndWechatNotifications(t *testing.T) {
 	a.mu.Lock()
 	c := a.conversationLocked("acc", "小王")
 	c.Kind = "person"
-	// 旧版本存下的系统提示：方向未识别、没有类型
-	c.Messages = []Message{{Seq: 1, Text: "a", Direction: "incoming"}, {Seq: 2, Text: "你的账号被限制与对方聊天，轻触了解详情", Direction: "unknown"}, {Seq: 3, Text: "被截断的普通消息", Direction: "unknown"}}
-	c.LastSeq = 3
-	for seq := int64(1); seq <= 3; seq++ {
-		a.markMessage(c.ID, seq)
-	}
-	// 微信自己的系统通知不建会话；旧版本建过的空会话启动时删除
-	a.ingestLocked(&PhoneConfig{Account: "acc"}, PhoneEvent{Kind: "notification", Chat: "微信", Text: "你有1条消息未发送"})
+	a.mergeOrAppendLocked(c, json.RawMessage(`{"messages":[{"text":"a","direction":"incoming"},{"text":"你的账号被限制与对方聊天","direction":"unknown","kind":"system"},{"text":"被截断的普通消息","direction":"unknown"}]}`))
+	// 微信自己的系统通知不建会话
+	a.ingestLocked(PhoneEvent{Kind: "notification", Account: "acc", Chat: "微信", Text: "你有1条消息未发送"})
 	if len(a.state.Conversations) != 1 {
 		t.Fatal("system notification should not create a conversation")
 	}
-	junk := a.conversationLocked("acc", "微信")
+	if ts := lastTexts(c.Messages, 3); strings.Join(ts, ",") != "a,被截断的普通消息" {
+		t.Fatalf("system notices must not be stop texts: %v", ts)
+	}
+	// 新读到的系统提示不改列表预览
+	c.Preview = "before"
+	a.mergeOrAppendLocked(c, json.RawMessage(`{"messages":[{"text":"被截断的普通消息","direction":"incoming"},{"text":"x撤回了一条消息","direction":"unknown","kind":"system"}]}`))
+	if c.Preview != "before" || c.Messages[len(c.Messages)-1].Kind != "system" {
+		t.Fatalf("system notice appended without changing preview: %q", c.Preview)
+	}
 	if err := a.commitLocked(); err != nil {
 		t.Fatal(err)
 	}
 	a.mu.Unlock()
-
 	b := reopen(t, a)
-	got := b.state.Conversations[c.ID]
-	if got.Messages[1].Kind != "system" || got.Messages[2].Kind != "" {
-		t.Fatalf("legacy notice should become system, other unknown text unchanged: %+v", got.Messages)
-	}
-	if b.state.Conversations[junk.ID] != nil {
-		t.Fatal("empty 微信 conversation should be removed")
-	}
-	if ts := lastTexts(got.Messages, 3); strings.Join(ts, ",") != "a,被截断的普通消息" {
-		t.Fatalf("system notices must not be stop texts: %v", ts)
-	}
-	// 新读到的系统提示不改列表预览
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	got.Preview = "before"
-	b.mergeLocked(got, json.RawMessage(`{"messages":[{"text":"被截断的普通消息","direction":"incoming"},{"text":"x撤回了一条消息","direction":"unknown","kind":"system"}]}`), true)
-	if got.Preview != "before" || got.Messages[len(got.Messages)-1].Kind != "system" {
-		t.Fatalf("system notice appended without changing preview: %q", got.Preview)
-	}
-	reopened, _ := b.store.db.Query("SELECT kind FROM messages WHERE conversation_id = ? AND seq = 2", c.ID)
-	defer reopened.Close()
-	var kind string
-	if !reopened.Next() || reopened.Scan(&kind) != nil || kind != "system" {
-		t.Fatalf("migrated kind should be saved: %q", kind)
+	if got := b.state.Conversations[c.ID]; got.Messages[1].Kind != "system" || got.Messages[2].Kind != "" {
+		t.Fatalf("system kind should be saved: %+v", got.Messages)
 	}
 }
 
 func TestOriginalsBackfillIsBoundedAndThrottled(t *testing.T) {
 	a := testApp(t)
 	a.mu.Lock()
-	addTestPhone(a, "http://phone.test")
+	addTestPhone(a, nil)
 	c := a.conversationLocked("acc", "群")
 	c.Kind = "group"
 	// 待取原图的图片在最近 10 条之外：不再挪动停止点，也不算待取
@@ -869,11 +841,11 @@ func TestClearHistoryOnlyLocalAndNoReimport(t *testing.T) {
 	c.Kind = "person"
 	thumb := tinyJPEG(t, 10, 10)
 	shared := tinyJPEG(t, 12, 12)
-	a.mergeLocked(c, json.RawMessage(`{"messages":[{"text":"a","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"},{"text":"b","direction":"outgoing"}]}`), true)
+	a.mergeOrAppendLocked(c, json.RawMessage(`{"messages":[{"text":"a","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"},{"text":"b","direction":"outgoing"}]}`))
 	// 另一个会话里有同一张图：删除时不能删掉这个文件
 	other := a.conversationLocked("acc", "小李")
-	a.mergeLocked(other, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+shared+`"}]}`), true)
-	a.mergeLocked(c, json.RawMessage(`{"messages":[{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+shared+`"}]}`), true)
+	a.mergeOrAppendLocked(other, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+shared+`"}]}`))
+	a.mergeOrAppendLocked(c, json.RawMessage(`{"messages":[{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+shared+`"}]}`))
 	own, _ := a.mediaPath(c.Messages[1].ImageHash)
 	common, _ := a.mediaPath(other.Messages[0].ImageHash)
 	// 有读取正在执行时也可以删
@@ -917,7 +889,7 @@ func TestClearHistoryOnlyLocalAndNoReimport(t *testing.T) {
 		t.Fatalf("anchor should provide stop texts: %v", autoReadUntil(got))
 	}
 	screen := `{"messages":[{"text":"b","direction":"outgoing"},{"text":"[图片]","kind":"image","direction":"incoming"},{"text":"新","direction":"incoming"},{"text":"c","direction":"incoming"}]}`
-	if !b.mergeLocked(got, json.RawMessage(screen), false) {
+	if !b.mergeLocked(got, json.RawMessage(screen)) {
 		t.Fatal("screen should align with the anchor")
 	}
 	if texts(got) != "c" {
@@ -925,76 +897,28 @@ func TestClearHistoryOnlyLocalAndNoReimport(t *testing.T) {
 	}
 }
 
-func TestOfficialAccountsIgnoredAndRemoved(t *testing.T) {
+func TestOfficialAccountsIgnored(t *testing.T) {
 	a := testApp(t)
 	a.mu.Lock()
-	a.ingestLocked(&PhoneConfig{Account: "acc"}, PhoneEvent{Kind: "unread_chat", Chat: "公众号"})
-	if len(a.state.Conversations) != 0 {
+	a.ingestLocked(PhoneEvent{Kind: "unread_chat", Account: "acc", Chat: "公众号"})
+	a.conversationLocked("acc", "小王")
+	a.mu.Unlock()
+	if len(a.state.Conversations) != 1 {
 		t.Fatal("公众号 should be ignored")
 	}
-	// 旧版本建过的公众号会话（带消息）启动时整个删除
-	c := a.conversationLocked("acc", "公众号")
-	a.mergeLocked(c, snapshotJSON("快讯"), true)
-	if err := a.commitLocked(); err != nil {
-		t.Fatal(err)
-	}
-	a.mu.Unlock()
-	b := reopen(t, a)
-	var rows int
-	b.store.db.QueryRow("SELECT count(*) FROM messages").Scan(&rows)
-	if len(b.state.Conversations) != 0 || rows != 0 {
-		t.Fatalf("公众号 conversation and messages should be removed: %d rows=%d", len(b.state.Conversations), rows)
-	}
-	if w := call(b, "POST", "/api/conversations", `{"title":"公众号","kind":"person"}`, ""); w.Code != 400 {
+	if w := call(a, "POST", "/api/conversations", `{"account":"acc","title":"公众号","kind":"person"}`, ""); w.Code != 400 {
 		t.Fatalf("adding 公众号 manually should be rejected: %d", w.Code)
-	}
-}
-
-func TestSinglePhoneDataMigratesToFirstAccount(t *testing.T) {
-	a := testApp(t)
-	// 模拟单手机版本的数据：settings 里的 phone / cursor，会话没有账号
-	a.mu.Lock()
-	old := a.conversationLocked("", "小王")
-	a.mergeLocked(old, snapshotJSON("旧消息"), true)
-	_ = a.commitLocked()
-	a.mu.Unlock()
-	for id, data := range map[string]string{"phone": `{"phone_url":"http://p:8766","token":"` + strings.Repeat("t", 32) + `"}`, "cursor": `42`} {
-		if _, err := a.store.db.Exec("INSERT INTO settings(id, data) VALUES(?, ?)", id, data); err != nil {
-			t.Fatal(err)
-		}
-	}
-	b := reopen(t, a)
-	if len(b.state.Phones) != 1 || !b.state.Phones[0].Legacy || b.state.Phones[0].Cursor != 42 {
-		t.Fatalf("legacy phone should migrate: %+v", b.state.Phones)
-	}
-	var rows int
-	b.store.db.QueryRow("SELECT count(*) FROM settings WHERE id IN ('phone', 'cursor')").Scan(&rows)
-	if rows != 0 {
-		t.Fatal("legacy settings rows should be removed after migration")
-	}
-	// 迁移来的手机第一次上报微信号：旧会话归到这个账号，会话编号不变
-	p := b.state.Phones[0]
-	b.setPhoneStatus(p.ID, "在线", json.RawMessage(`{"online":true,"info":{"ready":true,"account":{"wechat_id":"smallmouse-"}}}`), nil)
-	got := b.state.Conversations[old.ID]
-	if got == nil || got.Account != "smallmouse-" || p.Account != "smallmouse-" || p.Legacy {
-		t.Fatalf("legacy conversations should be adopted: %+v %+v", got, p)
-	}
-	// 之后换成另一个账号：旧会话不再跟着走
-	b.setPhoneStatus(p.ID, "在线", json.RawMessage(`{"info":{"account":{"wechat_id":"other"}}}`), nil)
-	if got.Account != "smallmouse-" || p.Account != "other" {
-		t.Fatalf("only the first account adopts legacy data: %+v", got)
 	}
 }
 
 func TestOperationsRouteToTheAccountsPhone(t *testing.T) {
 	phoneA, phoneB := &fakePhone{status: "succeeded", result: `{"messages":[],"account":"A"}`}, &fakePhone{status: "succeeded", result: `{"messages":[],"account":"B"}`}
-	serverA, serverB := httptest.NewServer(phoneA), httptest.NewServer(phoneB)
-	defer serverA.Close()
-	defer serverB.Close()
 	a := testApp(t)
 	a.mu.Lock()
-	a.state.Phones = []*PhoneConfig{{ID: "pa", URL: serverA.URL, Token: strings.Repeat("t", 32), Account: "A"}, {ID: "pb", URL: serverB.URL, Token: strings.Repeat("t", 32), Account: "B"}}
+	a.state.Phones = []*PhoneConfig{{ID: "pa", Token: strings.Repeat("t", 32), Account: "A"}, {ID: "pb", Token: strings.Repeat("t", 32), Account: "B"}}
 	a.syncPhonesLocked()
+	linkPhone(a, "pa", phoneA)
+	linkPhone(a, "pb", phoneB)
 	// 同名会话在不同账号下是不同的会话
 	ca, cb, orphan := a.conversationLocked("A", "小王"), a.conversationLocked("B", "小王"), a.conversationLocked("C", "小王")
 	if ca.ID == cb.ID || ca.ID == orphan.ID {
@@ -1033,15 +957,13 @@ func TestEventsBelongToTheReportedAccount(t *testing.T) {
 	a := testApp(t)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	p := &PhoneConfig{ID: "p", Account: "A"}
-	a.ingestLocked(p, PhoneEvent{Kind: "notification", Account: "B", Chat: "小王", Text: "hi"})
-	a.ingestLocked(p, PhoneEvent{Kind: "notification", Chat: "小李", Text: "hi"}) // 旧版手机桥：用手机当前账号
-	a.ingestLocked(&PhoneConfig{ID: "q"}, PhoneEvent{Kind: "notification", Chat: "小张", Text: "hi"})
+	a.ingestLocked(PhoneEvent{Kind: "notification", Account: "B", Chat: "小王", Text: "hi"})
+	a.ingestLocked(PhoneEvent{Kind: "notification", Chat: "小张", Text: "hi"}) // 手机还没识别出账号：丢弃
 	accounts := map[string]string{}
 	for _, c := range a.state.Conversations {
 		accounts[c.Title] = c.Account
 	}
-	if accounts["小王"] != "B" || accounts["小李"] != "A" || len(accounts) != 2 {
+	if accounts["小王"] != "B" || len(accounts) != 1 {
 		t.Fatalf("events should go to the reported account; unknown account dropped: %v", accounts)
 	}
 }
@@ -1049,40 +971,35 @@ func TestEventsBelongToTheReportedAccount(t *testing.T) {
 func TestPhonesAPI(t *testing.T) {
 	a := testApp(t)
 	token := strings.Repeat("s", 32)
-	if w := call(a, "POST", "/api/phones", `{"phone_url":"192.168.0.2","token":"`+token+`"}`, ""); w.Code != 200 {
-		t.Fatalf("add: %d %s", w.Code, w.Body)
-	}
-	if w := call(a, "POST", "/api/phones", `{"phone_url":"http://192.168.0.2:8766","token":"`+token+`"}`, ""); w.Code != 409 {
-		t.Fatalf("same address twice should be rejected: %d", w.Code)
-	}
-	id := a.state.Phones[0].ID
-	if w := call(a, "POST", "/api/phones/"+id, `{"phone_url":"192.168.0.3","token":""}`, ""); w.Code != 200 || a.state.Phones[0].Token != token || a.state.Phones[0].URL != "http://192.168.0.3:8766" {
-		t.Fatalf("update should keep the token when blank: %d %+v", w.Code, a.state.Phones[0])
-	}
-	body := call(a, "GET", "/api/state", "", "").Body.String()
-	if strings.Contains(body, token) || !strings.Contains(body, `"token_set":true`) {
+	a.mu.Lock()
+	a.state.Phones = []*PhoneConfig{{ID: "p1", DeviceID: "dev", Token: token, Account: "A"}}
+	a.syncPhonesLocked()
+	a.mu.Unlock()
+	if body := call(a, "GET", "/api/state", "", "").Body.String(); strings.Contains(body, token) {
 		t.Fatalf("state must not expose phone tokens: %s", body)
+	}
+	if w := call(a, "POST", "/api/phones/p1/name", `{"name":" 前台手机 "}`, ""); w.Code != 200 || a.state.Phones[0].Name != "前台手机" {
+		t.Fatalf("rename: %d %+v", w.Code, a.state.Phones[0])
 	}
 	// 新建会话必须选一个已知账号
 	if w := call(a, "POST", "/api/conversations", `{"account":"nobody","title":"小王","kind":"person"}`, ""); w.Code != 400 {
 		t.Fatalf("unknown account should be rejected: %d", w.Code)
 	}
 	a.mu.Lock()
-	a.state.Phones[0].Account = "A"
 	c := a.conversationLocked("A", "小王")
-	a.state.Operations["busy"] = &Operation{ID: "busy", ConversationID: c.ID, Kind: "send", Status: "running", PhoneID: id, Created: now()}
+	a.state.Operations["busy"] = &Operation{ID: "busy", ConversationID: c.ID, Kind: "send", Status: "running", PhoneID: "p1", Created: now()}
 	a.mu.Unlock()
-	if w := call(a, "POST", "/api/phones/"+id+"/delete", `{}`, ""); w.Code != 409 {
+	if w := call(a, "POST", "/api/phones/p1/delete", `{}`, ""); w.Code != 409 {
 		t.Fatalf("phone with a running task must not be deleted: %d", w.Code)
 	}
 	a.mu.Lock()
 	a.state.Operations["busy"].Status = "unknown"
 	a.mu.Unlock()
-	if w := call(a, "POST", "/api/phones/"+id+"/delete", `{}`, ""); w.Code != 200 || len(a.state.Phones) != 0 || len(a.phones) != 0 {
+	if w := call(a, "POST", "/api/phones/p1/delete", `{}`, ""); w.Code != 200 || len(a.state.Phones) != 0 || len(a.phones) != 0 {
 		t.Fatalf("delete: %d", w.Code)
 	}
 	// 删除手机后账号和会话仍在，可以查看记录
-	body = call(a, "GET", "/api/state", "", "").Body.String()
+	body := call(a, "GET", "/api/state", "", "").Body.String()
 	if !strings.Contains(body, `"wechat_id":"A"`) || a.state.Conversations[c.ID] == nil {
 		t.Fatalf("account with history should remain listed: %s", body)
 	}
@@ -1145,11 +1062,11 @@ func TestForwardFiltersFormatAndOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.state.ForwardRules = []ForwardRule{rule}
-	a.mergeLocked(source, screen("张三：京东 旧消息"), true)
+	a.mergeOrAppendLocked(source, screen("张三：京东 旧消息"))
 	if a.forwardLocked() {
 		t.Fatal("messages present before the first check must not be forwarded")
 	}
-	a.mergeLocked(source, screen("张三：京东 旧消息", "张三：京东 好价 {sender}", "王五：京东 别人发的", "李四：淘宝 广告", "我：京东 自己发的", "李四：淘宝 好价"), false)
+	a.mergeLocked(source, screen("张三：京东 旧消息", "张三：京东 好价 {sender}", "王五：京东 别人发的", "李四：淘宝 广告", "我：京东 自己发的", "李四：淘宝 好价"))
 	if !a.forwardLocked() {
 		t.Fatal("matching messages should be forwarded")
 	}
@@ -1161,13 +1078,13 @@ func TestForwardFiltersFormatAndOrder(t *testing.T) {
 		t.Fatal("same messages must not be forwarded twice")
 	}
 	// 与之前记录没能衔接的批次可能是重复的，不转发
-	a.mergeLocked(source, screen("张三：京东 缺口后"), true)
+	a.mergeOrAppendLocked(source, screen("张三：京东 缺口后"))
 	if a.forwardLocked() {
 		t.Fatal("gap batch must not be forwarded")
 	}
 	// 关闭规则后的新消息不转发，重新开启后也不补发
 	a.state.ForwardRules[0].Enabled = false
-	a.mergeLocked(source, screen("张三：京东 缺口后", "张三：京东 关闭期间"), false)
+	a.mergeLocked(source, screen("张三：京东 缺口后", "张三：京东 关闭期间"))
 	a.forwardLocked()
 	a.state.ForwardRules[0].Enabled = true
 	if a.forwardLocked() {
@@ -1187,8 +1104,8 @@ func TestForwardDedupAcrossSourcesAndRegex(t *testing.T) {
 	}
 	a.state.ForwardRules = []ForwardRule{rule}
 	a.forwardLocked()
-	a.mergeLocked(source, screen("甲：纸巾 9元", "甲：没有价格"), true)
-	a.mergeLocked(other, screen("乙：纸巾 9元", "乙：牙膏 5元"), true)
+	a.mergeOrAppendLocked(source, screen("甲：纸巾 9元", "甲：没有价格"))
+	a.mergeOrAppendLocked(other, screen("乙：纸巾 9元", "乙：牙膏 5元"))
 	a.forwardLocked()
 	if got := strings.Join(forwards(a, target.ID), "|"); got != "纸巾 9元|牙膏 5元" {
 		t.Fatalf("dedup/regex: %s", got)
@@ -1202,7 +1119,7 @@ func TestForwardImageWaitsForOriginal(t *testing.T) {
 	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{target.ID}, Images: true}}
 	a.forwardLocked()
 	thumb := tinyJPEG(t, 10, 10)
-	a.mergeLocked(source, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"},{"text":"图后文字","direction":"incoming"}],"captured_at":"`+now()+`"}`), true)
+	a.mergeOrAppendLocked(source, json.RawMessage(`{"messages":[{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"},{"text":"图后文字","direction":"incoming"}],"captured_at":"`+now()+`"}`))
 	if a.forwardLocked() {
 		t.Fatal("image should wait for its original, and keep later messages in order")
 	}
@@ -1212,7 +1129,7 @@ func TestForwardImageWaitsForOriginal(t *testing.T) {
 		t.Fatalf("forwarded: %s", got)
 	}
 	// 等原图超时：用缩略图转发
-	a.mergeLocked(source, json.RawMessage(`{"messages":[{"text":"图后文字","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"}],"captured_at":"`+stamp(time.Now().Add(-imageWaitLimit))+`"}`), false)
+	a.mergeLocked(source, json.RawMessage(`{"messages":[{"text":"图后文字","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","thumbnail":"`+thumb+`"}],"captured_at":"`+stamp(time.Now().Add(-imageWaitLimit))+`"}`))
 	a.forwardLocked()
 	if got := forwards(a, target.ID); len(got) != 3 || got[2] != "img:"+source.Messages[2].ImageHash {
 		t.Fatalf("thumbnail after timeout: %v", got)
@@ -1227,7 +1144,7 @@ func TestForwardSendsThroughTargetPhone(t *testing.T) {
 	target.Kind = "person"
 	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{target.ID}}}
 	a.forwardLocked()
-	a.mergeLocked(source, screen("张三：转给小王"), true)
+	a.mergeOrAppendLocked(source, screen("张三：转给小王"))
 	a.forwardLocked()
 	a.mu.Unlock()
 	runAll(a)
@@ -1239,7 +1156,7 @@ func TestForwardSendsThroughTargetPhone(t *testing.T) {
 	defer a.mu.Unlock()
 	a.state.ForwardRules = append(a.state.ForwardRules, ForwardRule{ID: "r2", Enabled: true, Sources: []string{target.ID}, Targets: []string{source.ID}})
 	a.forwardLocked()
-	a.mergeLocked(target, screen("我：转给小王"), true)
+	a.mergeOrAppendLocked(target, screen("我：转给小王"))
 	if a.forwardLocked() {
 		t.Fatal("outgoing messages must not be forwarded back")
 	}
@@ -1255,7 +1172,7 @@ func TestForwardBacklogAndMissingPhone(t *testing.T) {
 	for i := 0; i < maxForwardBacklog+5; i++ {
 		lines = append(lines, fmt.Sprintf("甲：第%d条", i))
 	}
-	a.mergeLocked(source, screen(lines...), true)
+	a.mergeOrAppendLocked(source, screen(lines...))
 	a.forwardLocked()
 	if n := len(forwards(a, target.ID)); n != maxForwardBacklog || a.forwardStatus["r1"].Problem == "" {
 		t.Fatalf("backlog should cap at %d: %d %+v", maxForwardBacklog, n, a.forwardStatus["r1"])
@@ -1263,7 +1180,7 @@ func TestForwardBacklogAndMissingPhone(t *testing.T) {
 	other := a.conversationLocked("另一个号", "外部群")
 	other.Kind = "group"
 	a.state.ForwardRules[0].Targets = []string{other.ID}
-	a.mergeLocked(source, screen("甲：第24条", "甲：新的"), false)
+	a.mergeLocked(source, screen("甲：第24条", "甲：新的"))
 	a.forwardLocked()
 	if len(forwards(a, other.ID)) != 0 || !strings.Contains(a.forwardStatus["r1"].Problem, "没有连接的手机") {
 		t.Fatalf("no phone for the target account: %+v", a.forwardStatus["r1"])
@@ -1272,22 +1189,22 @@ func TestForwardBacklogAndMissingPhone(t *testing.T) {
 
 func TestForwardAPI(t *testing.T) {
 	a, source, target := forwardApp(t)
-	post := func(rules string) *httptest.ResponseRecorder {
-		return call(a, "POST", "/api/forward", `{"rules":`+rules+`}`, "")
+	post := func(rule string) *httptest.ResponseRecorder {
+		return call(a, "POST", "/api/forward/rule", rule, "")
 	}
-	if w := post(`[{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + source.ID + `"]}]`); w.Code != 400 {
+	if w := post(`{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + source.ID + `"]}`); w.Code != 400 {
 		t.Fatalf("target equal to source: %d", w.Code)
 	}
 	a.mu.Lock()
 	unknown := a.conversationLocked("acc", "没分类")
 	a.mu.Unlock()
-	if w := post(`[{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + unknown.ID + `"]}]`); w.Code != 400 || !strings.Contains(w.Body.String(), "类型") {
+	if w := post(`{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + unknown.ID + `"]}`); w.Code != 400 || !strings.Contains(w.Body.String(), "类型") {
 		t.Fatalf("target without kind: %d %s", w.Code, w.Body)
 	}
-	if w := post(`[{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + target.ID + `"],"regex":"("}]`); w.Code != 400 {
+	if w := post(`{"enabled":true,"sources":["` + source.ID + `"],"targets":["` + target.ID + `"],"regex":"("}`); w.Code != 400 {
 		t.Fatalf("bad regex: %d", w.Code)
 	}
-	if w := post(`[{"name":"线报","enabled":true,"sources":["` + source.ID + `"],"targets":["` + target.ID + `"],"regex":"元$","include":["京东，淘宝"]}]`); w.Code != 200 {
+	if w := post(`{"name":"线报","enabled":true,"sources":["` + source.ID + `"],"targets":["` + target.ID + `"],"regex":"元$","include":["京东，淘宝"]}`); w.Code != 200 {
 		t.Fatalf("save: %d %s", w.Code, w.Body)
 	}
 	w := call(a, "GET", "/api/forward", "", "")
@@ -1314,11 +1231,11 @@ func TestForwardDedupOnlyAfterForwarded(t *testing.T) {
 	offline.Kind = "group"
 	a.state.ForwardRules = []ForwardRule{{ID: "r1", Enabled: true, Sources: []string{source.ID}, Targets: []string{offline.ID}, DedupMinutes: 30}}
 	a.forwardLocked()
-	a.mergeLocked(source, screen("甲：好价"), true)
+	a.mergeOrAppendLocked(source, screen("甲：好价"))
 	a.forwardLocked()
 	// 目标账号的手机连上之后，相同内容再出现时应该能转发
-	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "p2", URL: "http://phone2.test", Token: strings.Repeat("t", 32), Account: "另一个号"})
-	a.mergeLocked(source, screen("甲：好价", "乙：好价"), false)
+	a.state.Phones = append(a.state.Phones, &PhoneConfig{ID: "p2", Token: strings.Repeat("t", 32), Account: "另一个号"})
+	a.mergeLocked(source, screen("甲：好价", "乙：好价"))
 	a.forwardLocked()
 	if got := forwards(a, offline.ID); len(got) != 1 || got[0] != "好价" {
 		t.Fatalf("message not forwarded earlier must not be treated as a duplicate: %v", got)

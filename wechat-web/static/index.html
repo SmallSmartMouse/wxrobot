@@ -8,151 +8,293 @@
   <link rel="stylesheet" href="/workspace.css">
 </head>
 <body>
+<!-- 页面结构都在这里；脚本只填数据、绑定事件。<span data-icon="名称"> 在启动时换成图标。 -->
 <div class="app">
-  <!-- 系统侧边栏：可折叠为只显示图标的窄条，折叠状态记在浏览器本地 -->
+  <!-- 导航：按使用频率分组：消息 | 自动处理（AI 回复、转发）| 设备与诊断 -->
   <aside id="system-sidebar" class="system-sidebar" aria-label="系统">
-    <button id="system-toggle" class="system-toggle" aria-expanded="true" title="折叠侧边栏">
-      <span class="system-icon" aria-hidden="true">☰</span><span class="system-label">系统</span>
-    </button>
+    <div class="workspace-brand"><span data-icon="chat"></span><strong>微信消息台</strong></div>
     <nav class="system-nav">
-      <a id="diag-link" class="system-item" href="/debug.html" title="诊断">
-        <span class="system-icon" aria-hidden="true">诊</span><span class="system-label">诊断</span>
-        <span id="diag-badge" class="alert-badge" hidden></span>
-      </a>
-      <button id="settings" class="system-item" title="设备">
-        <span class="system-icon" aria-hidden="true">⚙</span><span class="system-label">设备</span>
-      </button>
-      <button id="ai-settings" class="system-item" title="AI 回复">
-        <span class="system-icon" aria-hidden="true">AI</span><span class="system-label">AI 回复</span>
-      </button>
-      <button id="forward-settings" class="system-item" title="转发">
-        <span class="system-icon" aria-hidden="true">转</span><span class="system-label">转发</span>
-      </button>
+      <button type="button" id="messages-nav" class="system-item" data-nav="messages" title="消息"><span data-icon="chat"></span><span class="system-label">消息</span></button>
+      <button type="button" id="ai-settings" class="system-item" data-nav="ai" title="AI 回复"><span data-icon="ai"></span><span class="system-label">AI 回复</span></button>
+      <button type="button" id="forward-settings" class="system-item" data-nav="forward" title="转发"><span data-icon="forward"></span><span class="system-label">转发</span></button>
+      <button type="button" id="settings" class="system-item nav-group-start" data-nav="system" title="设备"><span data-icon="settings"></span><span class="system-label">设备</span></button>
+      <button type="button" id="diag-link" class="system-item" data-nav="diagnostics" title="诊断"><span data-icon="diagnostic"></span><span class="system-label">诊断</span><span id="diag-badge" class="alert-badge" hidden></span></button>
     </nav>
+    <button type="button" id="system-toggle" class="collapse-nav" aria-expanded="true" title="折叠侧边栏"><span data-icon="menu"></span><span class="system-label">收起导航</span></button>
   </aside>
 
-  <aside class="sidebar">
-    <header class="brand">
-      <span class="logo">聊</span>
-      <strong>微信消息台</strong>
-    </header>
-    <label class="account-switch" title="切换微信账号：每个账号的会话和聊天记录分开保存">
-      <span>账号</span>
-      <select id="account-select" aria-label="切换微信账号"></select>
-    </label>
-    <button id="connection-card" class="connection-card" title="手机连接">
-      <span id="status-dot" class="dot"></span>
-      <strong id="connection">连接中</strong>
-      <small id="phone-address"></small>
-    </button>
-    <div class="search-row">
-      <div class="search-box"><span>⌕</span><input id="search" placeholder="搜索联系人或群聊" autocomplete="off"></div>
-      <button id="new-chat" class="icon-button" title="新建会话">＋</button>
-    </div>
-    <div id="list-account" class="list-account"></div>
-    <nav class="filters">
-      <button class="selected" data-filter="all">全部</button>
-      <button data-filter="person">联系人</button>
-      <button data-filter="group">群聊</button>
-      <button data-filter="unread">未读</button>
-    </nav>
-    <div id="conversations" class="conversation-list"></div>
-  </aside>
-
-  <main class="chat-panel">
-    <div id="welcome" class="welcome">
-      <div class="welcome-mark">☏</div>
-      <h1>把手机里的对话<br>带到你的桌面</h1>
-      <p>选择一个会话，或添加微信昵称、群名称。<br>新收到的消息会自动出现在这里。</p>
-      <button id="welcome-new" class="primary">开始对话 <span>↗</span></button>
-    </div>
-
-    <section id="chat" class="chat" hidden>
-      <header class="chat-header">
-        <button id="back" class="icon-button mobile-only">‹</button>
-        <span id="chat-avatar" class="avatar"></span>
-        <div class="chat-title">
-          <h1 id="chat-title"></h1>
-          <div id="chat-note" class="chat-note"></div>
-          <details id="read-gap-note" class="read-gap-note" hidden><summary id="read-gap-summary">读取有提示</summary><p id="read-gap-detail" role="status"></p></details>
-        </div>
-        <div class="read-control">
-          <button id="read" class="text-button" title="从手机读取最近的消息">↻ 读取</button>
-          <input id="limit" type="number" min="1" max="100" value="20" aria-label="读取条数">
-          <span>条</span>
-        </div>
-        <button id="chat-settings" class="text-button">会话设置</button>
-        <button id="export" class="text-button" title="导出为 JSON">导出</button>
-      </header>
-      <div class="messages-wrap">
-        <div id="messages" class="messages"></div>
-        <button id="new-messages" class="new-messages" hidden></button>
+  <div class="workspace">
+    <header class="workspace-top">
+      <button type="button" id="mobile-nav" class="mobile-nav" title="展开导航"><span data-icon="menu"></span></button>
+      <strong id="page-label">微信消息台</strong>
+      <div class="top-actions">
+        <button type="button" id="task-toggle" class="secondary"><span data-icon="task"></span><span>任务</span><span id="task-count" class="badge" hidden></span></button>
+        <button type="button" id="theme-toggle" class="secondary" aria-expanded="false"><span data-icon="sun"></span><span>外观</span></button>
       </div>
-      <div id="operation-note" class="operation-note" hidden></div>
-      <div class="composer">
-        <textarea id="message" placeholder="输入消息，Enter 发送，Shift + Enter 换行" maxlength="2000" rows="2"></textarea>
-        <div class="composer-bottom">
-          <input id="image-file" type="file" accept="image/png,image/jpeg" hidden>
-          <button id="send-image" class="text-button">＋ 图片</button>
-          <span id="char-count">0 / 2000</span>
-          <button id="send" class="primary">发送 <span>↑</span></button>
+      <div id="theme-panel" class="theme-popover" hidden>
+        <h3>外观设置</h3>
+        <p class="muted">显示模式</p>
+        <div class="segmented">
+          <button type="button" data-mode="light">浅色</button>
+          <button type="button" data-mode="dark">深色</button>
+          <button type="button" data-mode="system">跟随系统</button>
         </div>
+        <p class="muted">主题色</p>
+        <div class="theme-colors">
+          <button type="button" class="swatch swatch-green" data-color="green" aria-label="绿色主题">绿</button>
+          <button type="button" class="swatch swatch-blue" data-color="blue" aria-label="蓝色主题">蓝</button>
+          <button type="button" class="swatch swatch-purple" data-color="purple" aria-label="紫色主题">紫</button>
+          <button type="button" class="swatch swatch-orange" data-color="orange" aria-label="橙色主题">橙</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 消息：账号与执行设备、会话列表、聊天 -->
+    <section id="page-messages" class="message-page" data-page="messages">
+      <div class="account-context">
+        <div class="account-picker">
+          <span class="muted">微信号</span>
+          <details id="account-menu" class="account-menu">
+            <summary id="account-trigger">选择微信号</summary>
+            <div class="account-popover">
+              <input id="account-search" type="search" placeholder="搜索昵称或微信号" aria-label="搜索微信号">
+              <label class="compact-check"><input id="account-online" type="checkbox">仅可用</label>
+              <select id="account-select" class="account-options" size="5" aria-label="切换微信账号"></select>
+            </div>
+          </details>
+        </div>
+        <div class="device-picker">
+          <span>执行设备</span>
+          <details id="device-menu" class="device-menu">
+            <summary id="device-trigger">自动选择</summary>
+            <div id="device-options" class="device-options" role="group" aria-label="选择执行设备"></div>
+          </details>
+          <strong id="single-device" hidden></strong>
+        </div>
+        <button id="connection-card" class="connection-card" title="手机连接">
+          <span id="status-dot" class="dot"></span>
+          <strong id="connection">连接中</strong>
+          <small id="phone-address"></small>
+        </button>
+      </div>
+      <div id="device-problem" class="info-strip warning" role="status" hidden></div>
+      <div class="message-body">
+        <aside class="sidebar">
+          <div class="search-row">
+            <div class="search-box"><span data-icon="search"></span><input id="search" placeholder="搜索联系人或群聊" autocomplete="off"></div>
+            <button id="new-chat" class="icon-button" title="新建会话">＋</button>
+          </div>
+          <div id="list-account" class="list-account"></div>
+          <nav class="filters">
+            <button class="selected" data-filter="all">全部</button>
+            <button data-filter="person">联系人</button>
+            <button data-filter="group">群聊</button>
+            <button data-filter="unread">未读</button>
+          </nav>
+          <div id="conversations" class="conversation-list"></div>
+        </aside>
+
+        <main class="chat-panel">
+          <div id="welcome" class="welcome">
+            <div class="welcome-mark">☏</div>
+            <h1>把手机里的对话<br>带到你的桌面</h1>
+            <p>选择一个会话，或添加微信昵称、群名称。<br>新收到的消息会自动出现在这里。</p>
+            <button id="welcome-new" class="primary">开始对话 <span>↗</span></button>
+          </div>
+
+          <section id="chat" class="chat" hidden>
+            <header class="chat-header">
+              <button id="back" class="icon-button mobile-only">‹</button>
+              <span id="chat-avatar" class="avatar"></span>
+              <div class="chat-title">
+                <div class="chat-heading">
+                  <h1 id="chat-title"></h1>
+                  <details id="read-gap-note" class="read-gap-note" hidden><summary id="read-gap-summary">读取有提示</summary><p id="read-gap-detail" role="status"></p></details>
+                </div>
+                <div id="chat-note" class="chat-note"></div>
+              </div>
+              <div class="read-control">
+                <button id="read" class="text-button" title="从手机读取最近的消息">↻ 读取</button>
+                <input id="limit" type="number" min="1" max="100" value="20" aria-label="读取条数">
+                <span>条</span>
+              </div>
+              <button id="chat-settings" class="text-button"><span data-icon="settings"></span>会话设置</button>
+              <button id="export" class="icon-button export-button" title="导出为 JSON" aria-label="导出会话"><span data-icon="download"></span></button>
+            </header>
+            <div class="messages-wrap">
+              <div id="messages" class="messages"></div>
+              <button id="new-messages" class="new-messages" hidden></button>
+            </div>
+            <div id="operation-note" class="operation-note" hidden></div>
+            <div class="composer">
+              <div class="composer-row">
+                <button id="send-image" class="secondary image-button" title="发送图片" aria-label="发送图片"><span data-icon="image"></span></button>
+                <textarea id="message" placeholder="输入消息…" maxlength="2000" rows="2" aria-label="消息内容" title="Enter 发送，Shift + Enter 换行"></textarea>
+                <button id="send" class="primary">发送</button>
+              </div>
+              <div class="composer-bottom">
+                <input id="image-file" type="file" accept="image/png,image/jpeg" hidden>
+                <span id="sender-target" class="sender-target"></span>
+                <span id="char-count">0 / 2000</span>
+              </div>
+            </div>
+          </section>
+        </main>
       </div>
     </section>
-  </main>
-</div>
 
-<!-- 手机连接：可以连接多台手机，每台手机登录一个微信账号 -->
-<dialog id="settings-dialog">
-  <div class="dialog-heading"><h2>手机连接</h2><button type="button" class="icon-button close-dialog">×</button></div>
-  <p class="muted">自动寻找手机。首次在这里输入手机显示的验证码，并在手机确认授权；以后会自动重连。</p>
-  <section class="reading-settings" aria-labelledby="reading-title">
-    <label class="reading-toggle" for="read-history"><span><strong id="reading-title">读取最近历史消息</strong></span><input id="read-history" type="checkbox" role="switch" aria-describedby="reading-hint"></label>
-    <p id="reading-hint" class="muted"></p>
-    <div id="reading-status" role="status" aria-live="polite"></div>
-  </section>
-  <details id="discovery-settings" class="discovery-settings">
-    <summary>搜索范围与频率 <span id="discovery-summary" class="muted"></span></summary>
-    <form id="discovery-form">
-      <label class="discovery-toggle"><input id="discovery-enabled" type="checkbox"> 定时自动搜索</label>
-      <label class="discovery-toggle"><input id="discovery-local" type="checkbox"> 搜索电脑所在的本地网络</label>
-      <label class="field">搜索间隔<select id="discovery-interval"><option value="10">10 秒</option><option value="30">30 秒（推荐）</option><option value="60">1 分钟</option><option value="120">2 分钟</option><option value="300">5 分钟</option></select></label>
-      <h3>跨网段搜索</h3>
-      <p class="muted">添加手机所在的网段。电脑会向范围内的地址发送 UDP 发现请求，需要网络允许两端互通。</p>
-      <div class="network-add">
-        <input id="network-address" aria-label="网段地址" placeholder="例如 172.25.145.0" autocomplete="off" spellcheck="false">
-        <select id="network-prefix" aria-label="网段大小"><option value="24">/24 · 256 个地址</option><option value="23">/23 · 512 个地址</option><option value="22">/22 · 1,024 个地址</option><option value="32">/32 · 单个地址</option></select>
-        <button type="button" id="network-add" class="secondary">添加</button>
+    <!-- 设备：已接入的手机、发现与配对、自动发现设置、消息读取模式 -->
+    <section id="settings-dialog" class="management-page" data-page="system" hidden>
+      <div class="page-heading">
+        <h2>设备</h2>
+        <button type="button" id="phone-discover" class="primary">搜索设备</button>
       </div>
-      <div id="network-list" class="network-list"></div>
-      <div class="network-budget"><span id="network-count">0 / 4,096 个地址</span><span class="muted">每个网段最多 1,024 · 最多 8 个网段</span></div>
-      <progress id="network-budget" max="4096" value="0" aria-label="搜索范围用量"></progress>
-      <div id="discovery-form-error" class="form-error" role="alert"></div>
-      <div class="dialog-actions"><button id="discovery-save" class="primary" type="submit">保存搜索设置</button></div>
-    </form>
-  </details>
-  <div class="dialog-heading"><h3>附近的手机</h3><button type="button" id="phone-discover" class="secondary">重新搜索</button></div>
-  <p id="discovery-status" class="muted" role="status"></p>
-  <div id="phone-pairings" class="pairing-list" aria-live="polite"></div>
-  <div id="discovered-phones" class="phone-list"></div>
-  <div id="phone-list" class="phone-list"></div>
-  <details id="manual-phone" class="manual-phone"><summary>旧版手机 / 手动连接</summary>
-  <form id="settings-form" class="phone-form">
-    <h3 id="phone-form-title">手动添加手机</h3>
-    <label class="field">手机 IP 或地址
-      <input id="phone-url" placeholder="192.168.0.186 或 http://192.168.0.186:8766" required>
-    </label>
-    <label class="field">手机 Token
-      <input id="phone-token" type="password" autocomplete="new-password">
-    </label>
-    <div id="settings-error" class="form-error"></div>
-    <div class="dialog-actions">
-      <button type="button" id="phone-cancel-edit" class="secondary" hidden>取消修改</button>
-      <button type="submit" id="phone-save" class="primary">保存</button>
-    </div>
-  </form>
-  </details>
-</dialog>
+      <p class="page-description">管理多台设备及其当前微信号。首次连接需在手机确认授权。</p>
+      <section class="panel">
+        <div class="toolbar">
+          <div class="search-box device-search"><span data-icon="search"></span><input id="phone-search" type="search" placeholder="搜索设备名称、编号或微信号" aria-label="搜索设备名称、编号或微信号"></div>
+          <label>状态：<select id="phone-filter" aria-label="设备状态">
+            <option value="all">全部状态</option>
+            <option value="available">可用</option>
+            <option value="offline">离线</option>
+            <option value="busy">忙碌</option>
+          </select></label>
+        </div>
+        <h3>已接入设备</h3>
+        <div id="phone-list" class="phone-list"></div>
+        <div id="settings-error" class="form-error"></div>
+      </section>
+      <section id="nearby-panel" class="panel">
+        <h3>发现与授权</h3>
+        <p id="discovery-status" class="muted" role="status"></p>
+        <div id="phone-pairings" class="pairing-list" aria-live="polite"></div>
+      </section>
+      <section id="discovery-settings" class="discovery-settings panel">
+        <h2>自动发现</h2>
+        <form id="discovery-form">
+          <div class="discovery-grid">
+            <div>
+              <label class="discovery-toggle"><strong>自动搜索</strong><input id="discovery-enabled" type="checkbox" role="switch"><small>自动在本地网络中搜索可连接的微信设备。</small></label>
+              <label class="discovery-toggle"><strong>本地网络</strong><input id="discovery-local" type="checkbox" role="switch"><small>允许通过本地网络发现设备。</small></label>
+            </div>
+            <div>
+              <label class="field">搜索间隔<select id="discovery-interval"><option value="10">10 秒</option><option value="30">30 秒（推荐）</option><option value="60">1 分钟</option><option value="120">2 分钟</option><option value="300">5 分钟</option></select></label>
+              <details class="network-advanced">
+                <summary>跨网段搜索</summary>
+                <p class="muted">添加手机所在的网段。电脑会向范围内的地址发送 UDP 发现请求，需要网络允许两端互通。</p>
+                <div class="network-add">
+                  <input id="network-address" aria-label="网段地址" placeholder="例如 172.25.145.0" autocomplete="off" spellcheck="false">
+                  <select id="network-prefix" aria-label="网段大小"><option value="24">/24 · 256 个地址</option><option value="23">/23 · 512 个地址</option><option value="22">/22 · 1,024 个地址</option><option value="32">/32 · 单个地址</option></select>
+                  <button type="button" id="network-add" class="secondary">添加</button>
+                </div>
+                <div id="network-list" class="network-list"></div>
+                <div class="network-budget"><span id="network-count">0 / 4,096 个地址</span><span class="muted">每个网段最多 1,024 · 最多 8 个网段</span></div>
+                <progress id="network-budget" max="4096" value="0" aria-label="搜索范围用量"></progress>
+                <div id="discovery-form-error" class="form-error" role="alert"></div>
+              </details>
+            </div>
+          </div>
+        </form>
+      </section>
+      <section class="reading-settings panel" aria-labelledby="reading-title">
+        <h2>消息读取</h2>
+        <label class="reading-toggle" for="read-history"><span><strong id="reading-title">读取最近历史消息</strong></span><input id="read-history" type="checkbox" role="switch" aria-describedby="reading-hint"></label>
+        <p id="reading-hint" class="muted"></p>
+      </section>
+      <div class="save-bar">
+        <span id="system-save-state">已保存</span>
+        <button type="button" id="system-discard" class="secondary" hidden>放弃修改</button>
+        <button id="discovery-save" class="primary" type="submit" form="discovery-form" disabled>保存设置</button>
+      </div>
+    </section>
+
+    <!-- AI 回复：全局或按微信号的模型、角色和名称规则 -->
+    <section id="ai-dialog" class="management-page" data-page="ai" hidden>
+      <div class="page-heading"><h1>AI 回复</h1></div>
+      <p class="page-description">回复策略归属微信号，切换设备保持一致。</p>
+      <div class="panel scope-toolbar">
+        <div class="scope-controls">
+          <strong>规则作用范围</strong>
+          <div class="segmented" aria-label="规则作用范围">
+            <button type="button" id="ai-scope-global" class="selected" aria-pressed="true">全局默认</button>
+            <button type="button" id="ai-scope-account" aria-pressed="false">微信号配置</button>
+          </div>
+          <select id="ai-scope" aria-label="微信号配置"><option value="">全局默认</option></select>
+        </div>
+        <p class="muted">优先级：会话设置 → 微信号规则 → 全局规则</p>
+      </div>
+      <form id="ai-form">
+        <div class="ai-columns">
+          <section class="panel">
+            <h2>模型与角色</h2>
+            <label id="ai-inherit-row" class="switch-row"><span>使用全局模型</span><input id="ai-inherit" type="checkbox" role="switch"></label>
+            <label class="field model-field"><span>接口地址</span><input id="ai-url" placeholder="https://api.example.com/v1" required></label>
+            <label class="field model-field"><span>模型名称</span><input id="ai-model" required placeholder="模型名称"></label>
+            <label id="ai-key-row" class="field model-field"><span>API 密钥</span><input id="ai-key" type="password" autocomplete="new-password"><small class="muted">密钥不回显，留空保留已保存的值。</small></label>
+            <div class="field prompt-field">
+              <div class="field-header">
+                <label for="ai-prompt">角色提示词</label>
+                <label id="ai-prompt-inherit-row" class="inherit-control"><span>跟随全局</span><input id="ai-prompt-inherit" type="checkbox"></label>
+              </div>
+              <textarea id="ai-prompt" rows="5" placeholder="描述助手的角色和回复风格"></textarea>
+            </div>
+            <label id="ai-vision-inherit-row" class="inherit-control vision-inheritance"><span>图片设置跟随全局</span><input id="ai-vision-inherit" type="checkbox"></label>
+            <label class="switch-row"><span>发送聊天图片<small>将聊天图片缩略图提供给模型。</small></span><input id="ai-vision" type="checkbox" role="switch"></label>
+          </section>
+          <section class="panel">
+            <div class="section-heading"><h2>名称回复规则</h2><button id="ai-rule-add" type="button" class="secondary">＋ 添加规则</button></div>
+            <p class="muted">从上到下首条匹配生效；未匹配时继续跟随上一级规则。</p>
+            <div id="ai-rules"></div>
+            <p class="muted">群聊自动回复需设置触发词。</p>
+          </section>
+        </div>
+        <div id="ai-error" class="form-error" role="alert"></div>
+        <div class="save-bar">
+          <span id="ai-save-state">已保存</span>
+          <div><button id="ai-discard" type="button" class="secondary" hidden>放弃修改</button><button id="ai-save" type="submit" class="primary" disabled>保存设置</button></div>
+        </div>
+      </form>
+    </section>
+
+    <!-- 转发：源会话的来信按过滤条件转发到其他群或联系人 -->
+    <section id="forward-dialog" class="management-page" data-page="forward" hidden>
+      <div class="page-heading">
+        <div><h1>转发</h1><p class="page-description">按微信号配置来源与目标，设备按策略执行。</p></div>
+        <button id="forward-add" class="primary">＋ 添加规则</button>
+      </div>
+      <p class="page-footnote">仅转发保存后读到的新来信。源群需允许通知或开启定时读取。</p>
+      <div id="forward-error" class="form-error" role="alert"></div>
+      <section class="panel"><div id="forward-rules"></div></section>
+    </section>
+
+    <!-- 诊断：按微信号与设备查看任务执行情况 -->
+    <section id="page-diagnostics" class="management-page" data-page="diagnostics" hidden>
+      <div class="page-heading"><div><h1>诊断</h1><p class="page-description">按微信号与设备查看任务执行情况。</p></div></div>
+      <div class="panel toolbar">
+        <label>微信号<select id="diag-account"><option value="">全部微信号</option></select></label>
+        <label>设备<select id="diag-phone"><option value="">全部设备</option></select></label>
+        <div class="toolbar diagnostic-refresh">
+          <label class="compact-check"><input type="checkbox" id="diag-auto" role="switch" checked>自动刷新</label>
+          <button class="secondary" id="diag-refresh" aria-label="刷新诊断" title="刷新诊断"><span data-icon="refresh"></span></button>
+        </div>
+        <small id="diag-status" class="muted">最近 100 个任务，筛选仅作用于已加载数据</small>
+      </div>
+      <div id="diag-error" class="form-error" role="alert"></div>
+      <div id="diag-warning" class="info-strip warning" hidden></div>
+      <section id="diag-device-health" class="panel" aria-label="当前设备状态"></section>
+      <section class="panel">
+        <nav class="tabs" aria-label="诊断分类">
+          <button data-diag-filter="issues" class="selected">需要关注</button>
+          <button data-diag-filter="all">全部</button>
+          <button data-diag-filter="ai">AI 任务</button>
+        </nav>
+        <div id="diag-tasks"></div>
+      </section>
+      <details class="panel" id="diag-events"><summary>设备异常与降级</summary><div id="diag-event-list"></div></details>
+      <details class="panel"><summary>服务日志 <small id="diag-log-note" class="muted"></small></summary><pre id="diag-log"></pre></details>
+    </section>
+  </div>
+</div>
 
 <dialog id="new-dialog">
   <form id="new-form">
@@ -171,12 +313,6 @@
     </div>
   </form>
 </dialog>
-
-<!-- 全局 AI 设置：模型 + 名称规则 -->
-<section id="ai-dialog" hidden></section>
-
-<!-- 消息转发：源会话的来信按过滤条件转发到其他群或联系人 -->
-<section id="forward-dialog" hidden></section>
 
 <!-- 当前会话的设置：类型、自动读取、图片、AI 回复 -->
 <dialog id="chat-settings-dialog">
@@ -236,6 +372,101 @@
 </dialog>
 
 <div id="toast" class="toast" hidden></div>
+
+<!-- 右侧抽屉：任务列表、设备详情 -->
+<dialog id="workspace-drawer" class="drawer">
+  <div class="drawer-heading"><h2 id="drawer-title"></h2><button type="button" class="icon-button" id="drawer-close" aria-label="关闭">×</button></div>
+  <div id="drawer-body"></div>
+</dialog>
+
+<!-- AI 名称回复规则 -->
+<dialog id="ai-rule-editor" class="drawer">
+  <form id="ai-rule-form">
+    <div class="drawer-heading"><h2>回复规则</h2><button type="button" class="icon-button" id="ai-rule-close" aria-label="关闭">×</button></div>
+    <label class="field">会话类型<select id="rule-kind"><option value="person">联系人</option><option value="group">群聊</option></select></label>
+    <label class="field">匹配方式<select id="rule-matcher"><option value="wildcard">通配符</option><option value="regex">正则表达式</option></select></label>
+    <label class="field">名称表达式<input id="rule-pattern" required placeholder="例如 客服*"><small>* 匹配任意字符，? 匹配单个字符。</small></label>
+    <label class="field">回复模式<select id="rule-mode"><option value="off">关闭</option><option value="auto">自动回复</option></select></label>
+    <label class="field">触发词<input id="rule-keyword" placeholder="群聊自动回复时必填"></label>
+    <label class="field">最短间隔（秒）<input id="rule-interval" type="number" min="5" max="86400" required value="30"></label>
+    <div id="rule-error" class="form-error"></div>
+    <div class="drawer-actions"><button type="submit" class="primary">完成</button></div>
+  </form>
+</dialog>
+
+<!-- 转发规则编辑 -->
+<dialog id="forward-editor" class="drawer" aria-labelledby="forward-editor-title">
+  <form id="forward-form" novalidate>
+    <div class="drawer-heading">
+      <div><h2 id="forward-editor-title">编辑转发规则</h2><p class="muted">选择即时更新草稿，保存后生效</p></div>
+      <button type="button" id="forward-close" class="icon-button" aria-label="关闭规则编辑">×</button>
+    </div>
+    <div class="forward-editor-body" id="f-body">
+      <div class="forward-basic">
+        <label for="f-name">规则名称</label><input id="f-name" maxlength="40" placeholder="例如 客服通知">
+        <label class="forward-enable">启用<input id="f-enabled" type="checkbox" role="switch"></label>
+      </div>
+      <section class="forward-group" id="f-sources-group">
+        <div class="forward-section-heading"><h3>来源会话 <small id="f-sources-count"></small></h3><button type="button" class="text-button" data-picker="sources" aria-expanded="false" aria-controls="f-sources-picker">＋ 选择会话</button></div>
+        <div id="f-sources" class="forward-selected"></div>
+        <div id="f-sources-picker" class="forward-picker" hidden>
+          <div class="forward-filters"><input type="search" data-search="sources" placeholder="搜索会话或微信号" aria-label="搜索来源会话"><select data-account="sources" aria-label="筛选来源微信号"></select></div>
+          <div id="f-sources-choices" class="forward-choices"></div>
+          <div class="forward-selection-note"><span>勾选即加入草稿，点击其他区域收起</span><button type="button" class="text-button" data-collapse="sources">收起</button></div>
+        </div>
+        <div id="f-sources-error" class="forward-field-error" role="alert" hidden></div>
+        <p class="forward-hint">仅转发之后读到的新来信；来源需开启通知或定时读取。</p>
+      </section>
+      <section class="forward-group" id="f-targets-group">
+        <div class="forward-section-heading"><h3>目标会话 <small id="f-targets-count"></small></h3><button type="button" class="text-button" data-picker="targets" aria-expanded="false" aria-controls="f-targets-picker">＋ 选择会话</button></div>
+        <div id="f-targets" class="forward-selected"></div>
+        <div id="f-targets-picker" class="forward-picker" hidden>
+          <div class="forward-filters"><input type="search" data-search="targets" placeholder="搜索会话或微信号" aria-label="搜索目标会话"><select data-account="targets" aria-label="筛选目标微信号"></select></div>
+          <div id="f-targets-choices" class="forward-choices"></div>
+          <div class="forward-selection-note"><span>来源会话和类型未识别的会话不可作为目标</span><button type="button" class="text-button" data-collapse="targets">收起</button></div>
+        </div>
+        <div id="f-targets-error" class="forward-field-error" role="alert" hidden></div>
+      </section>
+      <section class="forward-group">
+        <h3>转发条件</h3>
+        <label class="field" for="f-include">包含任一关键词</label>
+        <div class="forward-tags"><span id="f-tags"></span><input id="f-include" placeholder="留空不限，输入后按回车添加" aria-label="添加包含关键词"></div>
+        <p id="f-keyword-note" class="forward-hint"></p>
+        <label class="forward-images"><input id="f-images" type="checkbox">同时转发图片</label>
+        <p id="f-image-note" class="forward-image-note" hidden>图片不检查关键词和正则，仅按发送人过滤。</p>
+      </section>
+      <details id="f-advanced">
+        <summary>更多条件与消息格式 <span id="f-advanced-summary" class="muted"></span></summary>
+        <div class="forward-advanced-grid">
+          <label class="field">排除任一关键词<input id="f-exclude" placeholder="逗号分隔，留空不限"></label>
+          <label class="field">相同文字去重（分钟）<input id="f-dedup" type="number" min="0" max="1440" value="30"></label>
+        </div>
+        <label class="field">只转发这些发送人<input id="f-senders" placeholder="完整群昵称，逗号分隔；留空不限"></label>
+        <label class="field">还须匹配正则表达式<input id="f-regex" placeholder="留空不限，保存时校验"></label>
+        <div class="forward-format"><span>文字格式</span><label><input type="radio" name="f-format" value="original" checked>原文</label><label><input type="radio" name="f-format" value="custom">自定义</label></div>
+        <div id="f-custom-format" hidden>
+          <label class="field">格式内容<textarea id="f-template" rows="2" maxlength="200" placeholder="[{chat}] {sender}：{text}"></textarea></label>
+          <p class="forward-hint">支持 {text}、{sender}、{chat}；必须保留 {text}。</p>
+          <div id="f-format-preview"></div>
+          <p class="forward-hint">示例文字预览，不发送消息。</p>
+        </div>
+        <p class="forward-hint">同规则跨来源按相同文字去重；图片不去重，跳过的消息不自动补发。</p>
+      </details>
+      <div id="f-error" class="form-error" role="alert"></div>
+    </div>
+    <div class="forward-editor-footer">
+      <p id="f-summary"></p>
+      <div class="forward-footer-actions"><span id="f-dirty" class="muted">已保存</span><button type="button" id="f-cancel" class="secondary">取消</button><button id="f-save" type="submit" class="primary">保存规则</button></div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="forward-discard" aria-labelledby="forward-discard-title">
+  <h3 id="forward-discard-title">放弃未保存的修改？</h3>
+  <p class="muted">当前修改尚未生效，放弃后恢复上次保存的规则。</p>
+  <div class="forward-confirm-actions"><button type="button" id="f-keep" class="secondary">继续编辑</button><button type="button" id="f-discard" class="primary">放弃修改</button></div>
+</dialog>
+
 <script type="module" src="/app.js"></script>
 </body>
 </html>

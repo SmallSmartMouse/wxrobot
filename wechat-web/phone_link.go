@@ -1,5 +1,12 @@
 package main
 
+// 手机主动连接：手机收到电脑的发现请求后，向电脑的接入端口建立 WSS 加密连接，电脑的任务请求都经这条连接发送。
+//
+//   - 已授权的手机：用配对时保存的凭证对电脑的随机挑战签名，验证通过即可使用，重连不需要发现请求。
+//   - 新手机配对：必须由近期的发现请求引来。手机先承诺随机秘密，电脑再提供新的随机挑战，最后手机揭示秘密；
+//     双方据此算出同一个 6 位验证码（绑定电脑证书和本次会话，不在网络上发送）。网页输入验证码、
+//     手机点击允许，两边都确认后电脑保存新凭证并发给手机。
+
 import (
 	"context"
 	"crypto/ecdsa"
@@ -11,7 +18,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -23,7 +29,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +38,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	pairingTTL         = 3 * time.Minute // 验证码有效期
+	maxPairingAttempts = 5               // 网页最多尝试验证码的次数
+)
+
+// linkMessage 是连接上收发的一条消息（握手、配对、请求的响应共用）。
 type linkMessage struct {
 	Type           string          `json:"type"`
 	ID             string          `json:"id,omitempty"`
@@ -42,12 +53,12 @@ type linkMessage struct {
 	Commit         string          `json:"commit,omitempty"`
 	Secret         string          `json:"secret,omitempty"`
 	Proof          string          `json:"proof,omitempty"`
-	Port           int             `json:"api_port,omitempty"`
 	Approved       bool            `json:"approved,omitempty"`
 	Status         int             `json:"status,omitempty"`
 	Body           json.RawMessage `json:"body,omitempty"`
 }
 
+// phoneLink 是认证通过的手机连接，实现 phoneConn：请求带编号发出，手机的响应按编号交回等待的请求。
 type phoneLink struct {
 	ws      *websocket.Conn
 	ctx     context.Context
@@ -56,42 +67,64 @@ type phoneLink struct {
 	pending map[string]chan linkMessage
 }
 
+// phonePairing 是一次等待确认的新手机配对。
 type phonePairing struct {
-	ID, DeviceID, Name, URL, Code string
-	Expires                       time.Time
-	WebApproved, PhoneApproved    bool
-	Attempts                      int
-	Changed                       chan struct{}
-	Cancel                        context.CancelFunc
+	ID, DeviceID, Name, Address, Code string
+	Expires                           time.Time
+	WebApproved, PhoneApproved        bool
+	Attempts                          int
+	Changed                           chan struct{}
+	Cancel                            context.CancelFunc
 }
 
-// 长期证书固定电脑身份；手机授权后固定此指纹，IP 变化不改变身份。
+// ---------- 接入端口 ----------
+
+// startPhoneListener 启动手机接入端口（TLS，只提供 /link）。服务退出时关闭端口，断开所有连接和配对。
+func (a *App) startPhoneListener(ctx context.Context, address string) error {
+	cert, fingerprint, err := loadPhoneCertificate(filepath.Dir(a.path))
+	if err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp4", address)
+	if err != nil {
+		return fmt.Errorf("手机接入端口不可用：%w", err)
+	}
+	a.linkCert = fingerprint
+	a.linkPort = listener.Addr().(*net.TCPAddr).Port
+	mux := http.NewServeMux()
+	mux.HandleFunc("/link", a.acceptPhoneLink)
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}}
+	go func() {
+		<-ctx.Done()
+		server.Close()
+		a.closeAllLinks()
+	}()
+	go func() { _ = server.Serve(tls.NewListener(listener, server.TLSConfig)) }()
+	return nil
+}
+
+// closeAllLinks 断开所有手机连接，取消所有配对。
+func (a *App) closeAllLinks() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, l := range a.links {
+		l.close()
+	}
+	for _, p := range a.pairings {
+		p.Cancel()
+	}
+}
+
+// loadPhoneCertificate 读取电脑的长期证书，没有就生成一张。手机授权后固定此指纹，IP 变化不改变电脑身份。
 func loadPhoneCertificate(dir string) (tls.Certificate, string, error) {
 	path := filepath.Join(dir, "phone-link.pem")
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		key, e := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if e != nil {
-			return tls.Certificate{}, "", e
+		if b, err = newCertificatePEM(); err == nil {
+			err = os.WriteFile(path, b, 0600)
 		}
-		serial, e := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-		if e != nil {
-			return tls.Certificate{}, "", e
-		}
-		template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "WeChat phone link"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(20, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
-		der, e := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-		if e != nil {
-			return tls.Certificate{}, "", e
-		}
-		private, e := x509.MarshalPKCS8PrivateKey(key)
-		if e != nil {
-			return tls.Certificate{}, "", e
-		}
-		b = append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private})...)
-		if e = os.WriteFile(path, b, 0600); e != nil {
-			return tls.Certificate{}, "", e
-		}
-	} else if err != nil {
+	}
+	if err != nil {
 		return tls.Certificate{}, "", err
 	}
 	cert, err := tls.X509KeyPair(b, b)
@@ -102,90 +135,30 @@ func loadPhoneCertificate(dir string) (tls.Certificate, string, error) {
 	return cert, hex.EncodeToString(digest[:]), nil
 }
 
-func (a *App) startPhoneListener(ctx context.Context, address string) error {
-	cert, fingerprint, err := loadPhoneCertificate(filepath.Dir(a.path))
+// newCertificatePEM 生成 20 年有效的自签证书（P-256），返回证书和私钥的 PEM。
+func newCertificatePEM() ([]byte, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	listener, err := net.Listen("tcp4", address)
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return fmt.Errorf("手机接入端口不可用：%w", err)
+		return nil, err
 	}
-	a.linkFingerprint = fingerprint
-	a.linkPort = listener.Addr().(*net.TCPAddr).Port
-	mux := http.NewServeMux()
-	mux.HandleFunc("/link", a.acceptPhoneLink)
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}}
-	go func() {
-		<-ctx.Done()
-		server.Close()
-		a.mu.Lock()
-		for _, l := range a.links {
-			l.cancel()
-		}
-		for _, p := range a.pairings {
-			p.Cancel()
-		}
-		a.mu.Unlock()
-	}()
-	go func() { _ = server.Serve(tls.NewListener(listener, server.TLSConfig)) }()
-	return nil
-}
-
-func linkProof(token, server, session, nonce, device string) string {
-	mac := hmac.New(sha256.New, []byte(token))
-	fmt.Fprintf(mac, "wxrobot-auth-v2\n%s\n%s\n%s\n%s", server, session, nonce, device)
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-// 手机先承诺随机秘密，电脑再提供新的随机挑战，最后揭示秘密。
-// 验证码绑定此连接的证书身份和完整会话；代码本身不在网络上发送。
-func pairingCode(server, session, device, secret, nonce string) string {
-	digest := sha256.Sum256([]byte(strings.Join([]string{"wxrobot-pair-v2", server, session, device, secret, nonce}, "\n")))
-	return fmt.Sprintf("%06d", binary.BigEndian.Uint32(digest[:4])%1000000)
-}
-
-func (l *phoneLink) send(value any) error {
-	ctx, cancel := context.WithTimeout(l.ctx, 15*time.Second)
-	defer cancel()
-	return wsjson.Write(ctx, l.ws, value)
-}
-
-// linkSession 是一次手机接入：连接本身、手机发来的消息，以及握手过程中确定的信息。
-type linkSession struct {
-	*phoneLink
-	incoming       chan linkMessage
-	hello          linkMessage
-	address        string // 手机 HTTP 接口地址：连接来源 IP + hello 里的端口
-	server         string // 电脑证书指纹
-	session, nonce string // 电脑下发的挑战
-}
-
-// read 等手机的下一条消息；超时或连接断开返回 false。
-func (s *linkSession) read(timeout time.Duration) (linkMessage, bool) {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case m := <-s.incoming:
-		return m, true
-	case <-s.ctx.Done():
-	case <-timer.C:
+	template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "WeChat phone link"}, NotBefore: time.Now().Add(-time.Hour),
+		NotAfter: time.Now().AddDate(20, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return nil, err
 	}
-	return linkMessage{}, false
+	private, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private})...), nil
 }
 
-// proofMatches 手机用 token 对这次挑战的签名是否正确。
-func (s *linkSession) proofMatches(token, proof string) bool {
-	return subtle.ConstantTimeCompare([]byte(proof), []byte(linkProof(token, s.server, s.session, s.nonce, s.hello.DeviceID))) == 1
-}
-
-// validHello 检查手机的第一条消息：设备编号、名称和接口端口。
-func validHello(m linkMessage) bool {
-	return m.Type == "hello" && m.DeviceID != "" && len(m.DeviceID) <= 128 && !strings.ContainsAny(m.DeviceID, "\r\n") &&
-		len(m.Name) <= 128 && m.Port >= 1 && m.Port <= 65535
-}
-
-// acceptPhoneLink 接受手机主动建立的 WSS 连接：限流、握手（已授权的认证，新手机配对），然后转发任务请求。
+// acceptPhoneLink 接受手机主动建立的 WSS 连接：限流、握手（已授权的认证，新手机配对），然后作为手机的请求通道。
 func (a *App) acceptPhoneLink(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" || r.Header.Get("Origin") != "" {
 		http.Error(w, "phone client required", 403)
@@ -235,6 +208,18 @@ func (a *App) admitLinkAttempt(ip string) bool {
 	return true
 }
 
+// ---------- 握手 ----------
+
+// linkSession 是一次手机接入：连接本身、手机发来的消息，以及握手过程中确定的信息。
+type linkSession struct {
+	*phoneLink
+	incoming       chan linkMessage
+	hello          linkMessage
+	address        string // 手机的 IP
+	server         string // 电脑证书指纹
+	session, nonce string // 电脑下发的挑战
+}
+
 // startLinkSession 开始读取手机消息；连接断开或服务退出时取消会话并关闭连接。
 func (a *App) startLinkSession(ws *websocket.Conn, ip string) *linkSession {
 	ctx, cancel := context.WithCancel(a.ctx)
@@ -242,8 +227,8 @@ func (a *App) startLinkSession(ws *websocket.Conn, ip string) *linkSession {
 	s := &linkSession{
 		phoneLink: &phoneLink{ws: ws, ctx: ctx, cancel: cancel, pending: map[string]chan linkMessage{}},
 		incoming:  make(chan linkMessage, 4),
-		server:    a.linkFingerprint,
-		address:   ip, // 收到 hello 后补上端口
+		server:    a.linkCert,
+		address:   ip,
 	}
 	go func() {
 		defer cancel()
@@ -270,19 +255,8 @@ func (a *App) handshakeLink(s *linkSession) (string, bool) {
 		return "", false
 	}
 	s.hello = hello
-	s.address = "http://" + net.JoinHostPort(s.address, strconv.Itoa(hello.Port))
-	a.mu.Lock()
-	validNonce := time.Now().Before(a.discoveryNonces[hello.DiscoveryNonce])
-	var known *PhoneConfig
-	for _, p := range a.state.Phones {
-		if p.DeviceID == hello.DeviceID && p.Transport == "reverse" {
-			cp := *p
-			known = &cp
-			break
-		}
-	}
-	a.mu.Unlock()
-	if known == nil && !validNonce {
+	known, invited := a.linkCandidate(hello)
+	if known == nil && !invited {
 		return "", false
 	}
 	s.session, s.nonce = randomID(), randomID()+randomID()
@@ -299,44 +273,126 @@ func (a *App) handshakeLink(s *linkSession) (string, bool) {
 			return "", false
 		}
 		return known.ID, true
-	case response.Type == "reveal" && validNonce:
+	case response.Type == "reveal" && invited:
 		return a.pairLink(s, response.Secret)
 	}
 	return "", false
 }
 
+// linkCandidate 认出接入的手机：已授权的手机记录（副本），以及它是否由近期的发现请求引来。
+func (a *App) linkCandidate(hello linkMessage) (*PhoneConfig, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	invited := time.Now().Before(a.discoveryNonces[hello.DiscoveryNonce])
+	if p := a.phoneByDeviceLocked(hello.DeviceID); p != nil {
+		known := *p
+		return &known, invited
+	}
+	return nil, invited
+}
+
+// phoneByDeviceLocked 按设备编号找已授权的手机，没有返回 nil。
+func (a *App) phoneByDeviceLocked(deviceID string) *PhoneConfig {
+	for _, p := range a.state.Phones {
+		if p.DeviceID == deviceID {
+			return p
+		}
+	}
+	return nil
+}
+
+// validHello 检查手机的第一条消息：设备编号和名称。
+func validHello(m linkMessage) bool {
+	return m.Type == "hello" && m.DeviceID != "" && len(m.DeviceID) <= 128 && !strings.ContainsAny(m.DeviceID, "\r\n") && len(m.Name) <= 128
+}
+
+// read 等手机的下一条消息；超时或连接断开返回 false。
+func (s *linkSession) read(timeout time.Duration) (linkMessage, bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case m := <-s.incoming:
+		return m, true
+	case <-s.ctx.Done():
+	case <-timer.C:
+	}
+	return linkMessage{}, false
+}
+
+// proofMatches 手机用 token 对这次挑战的签名是否正确。
+func (s *linkSession) proofMatches(token, proof string) bool {
+	return subtle.ConstantTimeCompare([]byte(proof), []byte(linkProof(token, s.server, s.session, s.nonce, s.hello.DeviceID))) == 1
+}
+
+// linkProof 用凭证对挑战签名：电脑身份、会话、随机数和设备编号都在签名范围内，不能重放到别的会话。
+func linkProof(token, server, session, nonce, device string) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	fmt.Fprintf(mac, "wxrobot-auth-v2\n%s\n%s\n%s\n%s", server, session, nonce, device)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// ---------- 配对 ----------
+
 // pairLink 新手机配对：核对手机先承诺的秘密，显示验证码，等网页验证和手机允许都完成后保存授权，
 // 再等手机用新凭证认证。返回新的（或沿用的）手机编号。
 func (a *App) pairLink(s *linkSession, secret string) (string, bool) {
-	secretBytes, err := hex.DecodeString(secret)
-	digest := sha256.Sum256([]byte(secret))
-	if err != nil || len(secretBytes) != 32 || subtle.ConstantTimeCompare([]byte(s.hello.Commit), []byte(hex.EncodeToString(digest[:]))) != 1 {
+	if !s.revealMatchesCommit(secret) {
 		return "", false
 	}
 	p := &phonePairing{
-		ID: s.session, DeviceID: s.hello.DeviceID, Name: s.hello.Name, URL: s.address,
+		ID: s.session, DeviceID: s.hello.DeviceID, Name: s.hello.Name, Address: s.address,
 		Code:    pairingCode(s.server, s.session, s.hello.DeviceID, secret, s.nonce),
-		Expires: time.Now().Add(3 * time.Minute), Changed: make(chan struct{}, 1), Cancel: s.cancel,
+		Expires: time.Now().Add(pairingTTL), Changed: make(chan struct{}, 1), Cancel: s.cancel,
 	}
 	if !a.addPairing(p) {
 		return "", false
 	}
-	defer func() { a.mu.Lock(); delete(a.pairings, p.ID); a.notifyLocked(); a.mu.Unlock() }()
-	if s.send(gin.H{"type": "pairing", "expires_in": 180}) != nil {
+	defer a.removePairing(p)
+	if s.send(gin.H{"type": "pairing", "expires_in": int(pairingTTL.Seconds())}) != nil || !a.awaitPairingApproval(s, p) {
 		return "", false
 	}
+	cfg, err := a.authorizePairing(p)
+	if err != nil {
+		_ = s.send(gin.H{"type": "error", "message": err.Error()})
+		return "", false
+	}
+	if s.send(gin.H{"type": "paired", "token": cfg.Token}) != nil {
+		return "", false
+	}
+	ack, ok := s.read(15 * time.Second)
+	if !ok || ack.Type != "auth" || !s.proofMatches(cfg.Token, ack.Proof) {
+		return "", false
+	}
+	return cfg.ID, true
+}
+
+// revealMatchesCommit 手机揭示的秘密是 32 字节，且和它在 hello 里的承诺（秘密的 SHA-256）一致。
+func (s *linkSession) revealMatchesCommit(secret string) bool {
+	secretBytes, err := hex.DecodeString(secret)
+	digest := sha256.Sum256([]byte(secret))
+	return err == nil && len(secretBytes) == 32 && subtle.ConstantTimeCompare([]byte(s.hello.Commit), []byte(hex.EncodeToString(digest[:]))) == 1
+}
+
+// pairingCode 双方各自算出的 6 位验证码：绑定电脑证书、会话、设备、手机秘密和电脑挑战。
+func pairingCode(server, session, device, secret, nonce string) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{"wxrobot-pair-v2", server, session, device, secret, nonce}, "\n")))
+	return fmt.Sprintf("%06d", binary.BigEndian.Uint32(digest[:4])%1000000)
+}
+
+// awaitPairingApproval 等网页验证和手机允许都完成；手机拒绝、断开或验证码过期时返回 false。
+func (a *App) awaitPairingApproval(s *linkSession, p *phonePairing) bool {
 	timer := time.NewTimer(time.Until(p.Expires))
 	defer timer.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
-			return "", false
+			return false
 		case <-timer.C:
 			_ = s.send(gin.H{"type": "expired"})
-			return "", false
+			return false
 		case m := <-s.incoming:
 			if m.Type != "approve" || !m.Approved {
-				return "", false
+				return false
 			}
 			a.mu.Lock()
 			p.PhoneApproved = true
@@ -345,24 +401,11 @@ func (a *App) pairLink(s *linkSession, secret string) (string, bool) {
 		case <-p.Changed:
 		}
 		a.mu.Lock()
-		if !p.WebApproved || !p.PhoneApproved {
-			a.mu.Unlock()
-			continue
-		}
-		cfg, err := a.authorizePairingLocked(p)
+		approved := p.WebApproved && p.PhoneApproved
 		a.mu.Unlock()
-		if err != nil {
-			_ = s.send(gin.H{"type": "error", "message": err.Error()})
-			return "", false
+		if approved {
+			return true
 		}
-		if s.send(gin.H{"type": "paired", "token": cfg.Token}) != nil {
-			return "", false
-		}
-		ack, ok := s.read(15 * time.Second)
-		if !ok || ack.Type != "auth" || !s.proofMatches(cfg.Token, ack.Proof) {
-			return "", false
-		}
-		return cfg.ID, true
 	}
 }
 
@@ -383,9 +426,20 @@ func (a *App) addPairing(p *phonePairing) bool {
 	return true
 }
 
-// authorizePairingLocked 两边都确认后保存授权：沿用已有的手机记录或新建一条，生成新凭证。返回保存后的配置副本。
-func (a *App) authorizePairingLocked(p *phonePairing) (PhoneConfig, error) {
-	cfg := a.findPairingPhoneLocked(p)
+// removePairing 配对结束（成功或失败），网页上不再显示。
+func (a *App) removePairing(p *phonePairing) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.pairings, p.ID)
+	a.notifyLocked()
+}
+
+// authorizePairing 两边都确认后保存授权：同一设备沿用已有的手机记录（编号、账号和事件游标不变），否则新建；
+// 生成新凭证。返回保存后的配置副本。
+func (a *App) authorizePairing(p *phonePairing) (PhoneConfig, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg := a.phoneByDeviceLocked(p.DeviceID)
 	if cfg != nil && a.phoneBusyLocked(cfg.ID) {
 		return PhoneConfig{}, errors.New("手机仍有进行中的任务，请稍后配对")
 	}
@@ -395,7 +449,7 @@ func (a *App) authorizePairingLocked(p *phonePairing) (PhoneConfig, error) {
 		a.state.Phones = append(a.state.Phones, cfg)
 	}
 	old := *cfg
-	cfg.DeviceID, cfg.URL, cfg.Transport, cfg.Token = p.DeviceID, p.URL, "reverse", randomID()+randomID()
+	cfg.DeviceID, cfg.Address, cfg.Token = p.DeviceID, p.Address, randomID()+randomID()
 	if a.commitLocked() != nil {
 		*cfg = old
 		if created {
@@ -407,39 +461,14 @@ func (a *App) authorizePairingLocked(p *phonePairing) (PhoneConfig, error) {
 	return *cfg, nil
 }
 
-// serveLink 认证之后：更新手机地址，把这条连接作为手机的任务通道（替换旧连接），转发手机的响应直到断开。
+// ---------- 认证后的连接 ----------
+
+// serveLink 认证之后：记下手机地址，把这条连接作为手机的请求通道（替换旧连接），转交手机的响应直到断开。
 func (a *App) serveLink(s *linkSession, phoneID string) {
-	a.mu.Lock()
-	cfg := a.phoneLocked(phoneID)
-	if cfg == nil {
-		a.mu.Unlock()
+	if !a.attachLink(s, phoneID) {
 		return
 	}
-	cfg.URL = s.address
-	if a.commitLocked() != nil {
-		a.mu.Unlock()
-		return
-	}
-	old := a.links[phoneID]
-	a.links[phoneID] = s.phoneLink
-	a.phones[phoneID].connection = "连接中"
-	a.phones[phoneID].err = ""
-	a.notifyLocked()
-	a.mu.Unlock()
-	if old != nil {
-		old.cancel()
-	}
-	defer func() {
-		a.mu.Lock()
-		if a.links[phoneID] == s.phoneLink {
-			delete(a.links, phoneID)
-			if rt := a.phones[phoneID]; rt != nil {
-				rt.connection = "等待手机重连"
-			}
-			a.notifyLocked()
-		}
-		a.mu.Unlock()
-	}()
+	defer a.detachLink(s.phoneLink, phoneID)
 	if s.send(gin.H{"type": "ready"}) != nil {
 		return
 	}
@@ -455,7 +484,94 @@ func (a *App) serveLink(s *linkSession, phoneID string) {
 	}
 }
 
-// deliver 把手机的响应交给等待它的请求（reverseRequest）；请求已超时放弃时丢弃。
+// attachLink 把认证通过的连接设为手机的请求通道，断开它之前的连接。手机已删除或保存失败时返回 false。
+func (a *App) attachLink(s *linkSession, phoneID string) bool {
+	a.mu.Lock()
+	cfg := a.phoneLocked(phoneID)
+	if cfg == nil {
+		a.mu.Unlock()
+		return false
+	}
+	cfg.Address = s.address
+	if a.commitLocked() != nil {
+		a.mu.Unlock()
+		return false
+	}
+	old := a.links[phoneID]
+	a.links[phoneID] = s.phoneLink
+	a.phones[phoneID].connection, a.phones[phoneID].err = connConnecting, ""
+	a.notifyLocked()
+	a.mu.Unlock()
+	if old != nil {
+		old.close()
+	}
+	return true
+}
+
+// detachLink 连接断开：仍是手机当前的连接时移除，等手机重连。
+func (a *App) detachLink(l *phoneLink, phoneID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.links[phoneID] != phoneConn(l) {
+		return
+	}
+	delete(a.links, phoneID)
+	if rt := a.phones[phoneID]; rt != nil {
+		rt.connection = connWaitingLink
+	}
+	a.notifyLocked()
+}
+
+// send 写一条消息，最多等 15 秒。
+func (l *phoneLink) send(value any) error {
+	ctx, cancel := context.WithTimeout(l.ctx, 15*time.Second)
+	defer cancel()
+	return wsjson.Write(ctx, l.ws, value)
+}
+
+// call 发送一个请求并等待手机的响应。同时等待的请求最多 32 个。
+func (l *phoneLink) call(ctx context.Context, req linkRequest) (linkMessage, error) {
+	id := randomID()
+	ch := make(chan linkMessage, 1)
+	if !l.expect(id, ch) {
+		return linkMessage{}, errors.New("手机请求过多，请稍后重试")
+	}
+	defer l.forget(id)
+	if err := l.send(gin.H{"type": "request", "id": id, "method": req.Method, "path": req.Path, "body": req.Body, "key": req.Key}); err != nil {
+		return linkMessage{}, errors.New("手机连接已中断")
+	}
+	select {
+	case <-ctx.Done():
+		return linkMessage{}, ctx.Err()
+	case <-l.ctx.Done():
+		return linkMessage{}, errors.New("手机连接已中断")
+	case result := <-ch:
+		return result, nil
+	}
+}
+
+// close 断开连接。
+func (l *phoneLink) close() { l.cancel() }
+
+// expect 登记一个等待响应的请求；已有 32 个在等时返回 false。
+func (l *phoneLink) expect(id string, ch chan linkMessage) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.pending) >= 32 {
+		return false
+	}
+	l.pending[id] = ch
+	return true
+}
+
+// forget 请求结束，不再等它的响应。
+func (l *phoneLink) forget(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.pending, id)
+}
+
+// deliver 把手机的响应交给等待它的请求；请求已超时放弃时丢弃。
 func (l *phoneLink) deliver(m linkMessage) {
 	l.mu.Lock()
 	ch := l.pending[m.ID]
@@ -468,33 +584,21 @@ func (l *phoneLink) deliver(m linkMessage) {
 	}
 }
 
-// findPairingPhoneLocked 找配对设备已有的手机记录：设备编号相同；或地址相同且那条记录还没有设备编号
-// （手动添加的同一台手机升级为主动连接）。地址相同但设备编号不同的是另一台手机（例如 IP 被重新分配），
-// 不能沿用它的账号和事件游标，返回 nil 新建记录。
-func (a *App) findPairingPhoneLocked(p *phonePairing) *PhoneConfig {
-	for _, cfg := range a.state.Phones {
-		if cfg.DeviceID == p.DeviceID {
-			return cfg
-		}
-	}
-	for _, cfg := range a.state.Phones {
-		if cfg.URL == p.URL && cfg.DeviceID == "" {
-			return cfg
-		}
-	}
-	return nil
-}
+// ---------- 网页接口 ----------
 
+// pairingViewsLocked 网页上待确认的配对（不含验证码）。
 func (a *App) pairingViewsLocked() []gin.H {
 	result := []gin.H{}
 	for _, p := range a.pairings {
 		if time.Now().Before(p.Expires) {
-			result = append(result, gin.H{"id": p.ID, "device_id": p.DeviceID, "name": p.Name, "phone_url": p.URL, "expires_at": stamp(p.Expires), "web_confirmed": p.WebApproved, "phone_confirmed": p.PhoneApproved, "attempts_left": 5 - p.Attempts})
+			result = append(result, gin.H{"id": p.ID, "device_id": p.DeviceID, "name": p.Name, "address": p.Address, "expires_at": stamp(p.Expires),
+				"web_confirmed": p.WebApproved, "phone_confirmed": p.PhoneApproved, "attempts_left": maxPairingAttempts - p.Attempts})
 		}
 	}
 	return result
 }
 
+// verifyPhonePairing 网页输入手机显示的验证码；错误次数用完时取消配对。
 func (a *App) verifyPhonePairing(c *gin.Context) {
 	var body struct {
 		Code string `json:"code"`
@@ -509,17 +613,17 @@ func (a *App) verifyPhonePairing(c *gin.Context) {
 		fail(c, 409, "配对已过期，请在手机重新发起连接")
 		return
 	}
-	if p.Attempts >= 5 {
+	if p.Attempts >= maxPairingAttempts {
 		fail(c, 429, "验证码错误次数过多，请重新配对")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(body.Code)), []byte(p.Code)) != 1 {
 		p.Attempts++
-		if p.Attempts >= 5 {
+		if p.Attempts >= maxPairingAttempts {
 			p.Cancel()
 		}
 		a.notifyLocked()
-		fail(c, 400, fmt.Sprintf("验证码不正确，还可尝试 %d 次", 5-p.Attempts))
+		fail(c, 400, fmt.Sprintf("验证码不正确，还可尝试 %d 次", maxPairingAttempts-p.Attempts))
 		return
 	}
 	p.WebApproved = true
@@ -528,6 +632,7 @@ func (a *App) verifyPhonePairing(c *gin.Context) {
 	c.JSON(200, gin.H{"ok": true, "phone_confirmed": p.PhoneApproved})
 }
 
+// cancelPhonePairing 网页取消配对。
 func (a *App) cancelPhonePairing(c *gin.Context) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -537,76 +642,4 @@ func (a *App) cancelPhonePairing(c *gin.Context) {
 		a.notifyLocked()
 	}
 	c.JSON(200, gin.H{"ok": true})
-}
-
-func (a *App) reverseRequest(ctx context.Context, cfg PhoneConfig, method, path string, body any, key string) (linkMessage, error) {
-	a.mu.Lock()
-	l := a.links[cfg.ID]
-	a.mu.Unlock()
-	if l == nil {
-		return linkMessage{}, errors.New("等待手机主动连接")
-	}
-	ctx, cancel := context.WithTimeout(ctx, 35*time.Second)
-	defer cancel()
-	id := randomID()
-	ch := make(chan linkMessage, 1)
-	l.mu.Lock()
-	if len(l.pending) >= 32 {
-		l.mu.Unlock()
-		return linkMessage{}, errors.New("手机请求过多，请稍后重试")
-	}
-	l.pending[id] = ch
-	l.mu.Unlock()
-	defer func() { l.mu.Lock(); delete(l.pending, id); l.mu.Unlock() }()
-	if err := l.send(gin.H{"type": "request", "id": id, "method": method, "path": path, "body": body, "key": key}); err != nil {
-		return linkMessage{}, errors.New("手机连接已中断")
-	}
-	select {
-	case <-ctx.Done():
-		return linkMessage{}, ctx.Err()
-	case <-l.ctx.Done():
-		return linkMessage{}, errors.New("手机连接已中断")
-	case result := <-ch:
-		if result.Status < 200 || result.Status >= 300 {
-			var fault struct {
-				Error struct{ Message string } `json:"error"`
-			}
-			_ = json.Unmarshal(result.Body, &fault)
-			if fault.Error.Message == "" {
-				fault.Error.Message = "手机请求失败"
-			}
-			return result, &phoneError{result.Status, fault.Error.Message}
-		}
-		return result, nil
-	}
-}
-
-func (a *App) reverseDownload(ctx context.Context, cfg PhoneConfig, path string) ([]byte, error) {
-	var data []byte
-	for offset := 0; ; {
-		m, err := a.reverseRequest(ctx, cfg, "GET", fmt.Sprintf("%s?offset=%d", path, offset), nil, "")
-		if err != nil {
-			return nil, err
-		}
-		var part struct {
-			Data string `json:"data"`
-			Size int    `json:"size"`
-		}
-		if json.Unmarshal(m.Body, &part) != nil || part.Size < 0 || part.Size > 40<<20 {
-			return nil, errors.New("原图大小无效")
-		}
-		chunk, err := base64.StdEncoding.DecodeString(part.Data)
-		if err != nil || len(chunk) > 256<<10 || offset+len(chunk) > part.Size {
-			return nil, errors.New("原图分块无效")
-		}
-		data = append(data, chunk...)
-		offset += len(chunk)
-		if offset == part.Size {
-			_, _ = a.reverseRequest(ctx, cfg, "GET", path+"?done=1", nil, "")
-			return data, nil
-		}
-		if len(chunk) == 0 {
-			return nil, errors.New("原图传输中断")
-		}
-	}
 }
