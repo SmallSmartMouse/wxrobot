@@ -39,8 +39,21 @@ import (
 )
 
 const (
-	pairingTTL         = 3 * time.Minute // 验证码有效期
-	maxPairingAttempts = 5               // 网页最多尝试验证码的次数
+	pairingTTL          = 3 * time.Minute  // 验证码有效期：够人在手机和网页之间操作，又不让验证码长期有效
+	maxPairingAttempts  = 5                // 网页最多尝试验证码的次数：6 位验证码，5 次猜中的概率可以忽略
+	maxPairings         = 8                // 同时等待确认的配对上限
+	maxLinkSessions     = 32               // 进行中的连接和配对合计上限，防止局域网里的设备占满服务
+	maxPendingRequests  = 32               // 一条连接上同时等待响应的请求上限
+	linkAttemptGap      = time.Second      // 同一来源两次连接的最短间隔
+	linkAttemptMemory   = 5 * time.Minute  // 连接来源记录的保留时间
+	maxLinkMessageBytes = 16 << 20         // 一条连接消息的上限：发送图片时最大
+	helloTimeout        = 10 * time.Second // 连上后等手机第一条消息的上限
+	replyTimeout        = 15 * time.Second // 握手中等手机回应（认证、确认凭证）的上限
+	linkWriteTimeout    = 15 * time.Second // 写一条消息的上限
+	maxDeviceIDLength   = 128              // 设备编号和名称的长度上限
+	pairingSecretBytes  = 32               // 手机配对时承诺的随机秘密长度
+	certValidYears      = 20               // 电脑证书的有效期：证书指纹就是电脑身份，不希望过期后要重新配对所有手机
+	certSerialBits      = 128              // 证书序列号的随机位数
 )
 
 // linkMessage 是连接上收发的一条消息（握手、配对、请求的响应共用）。
@@ -93,7 +106,7 @@ func (a *App) startPhoneListener(ctx context.Context, address string) error {
 	a.linkPort = listener.Addr().(*net.TCPAddr).Port
 	mux := http.NewServeMux()
 	mux.HandleFunc("/link", a.acceptPhoneLink)
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: readHeaderTimeout, TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}}
 	go func() {
 		<-ctx.Done()
 		server.Close()
@@ -135,18 +148,18 @@ func loadPhoneCertificate(dir string) (tls.Certificate, string, error) {
 	return cert, hex.EncodeToString(digest[:]), nil
 }
 
-// newCertificatePEM 生成 20 年有效的自签证书（P-256），返回证书和私钥的 PEM。
+// newCertificatePEM 生成长期有效的自签证书（P-256），返回证书和私钥的 PEM。
 func newCertificatePEM() ([]byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), certSerialBits))
 	if err != nil {
 		return nil, err
 	}
 	template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "WeChat phone link"}, NotBefore: time.Now().Add(-time.Hour),
-		NotAfter: time.Now().AddDate(20, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
+		NotAfter: time.Now().AddDate(certValidYears, 0, 0), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		return nil, err
@@ -184,7 +197,7 @@ func (a *App) acceptPhoneLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.CloseNow()
-	ws.SetReadLimit(16 << 20)
+	ws.SetReadLimit(maxLinkMessageBytes)
 	s := a.startLinkSession(ws, ip)
 	defer s.cancel()
 	if phoneID, ok := a.handshakeLink(s); ok {
@@ -192,16 +205,16 @@ func (a *App) acceptPhoneLink(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// admitLinkAttempt 限制连接数量和频率：同一来源每秒最多一次，进行中的连接和配对合计最多 32 个。
+// admitLinkAttempt 限制连接数量和频率：同一来源的间隔、进行中的连接和配对合计数量。
 func (a *App) admitLinkAttempt(ip string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.links)+len(a.pairings) >= 32 || time.Since(a.linkAttempts[ip]) < time.Second {
+	if len(a.links)+len(a.pairings) >= maxLinkSessions || time.Since(a.linkAttempts[ip]) < linkAttemptGap {
 		return false
 	}
 	a.linkAttempts[ip] = time.Now()
 	for peer, t := range a.linkAttempts {
-		if time.Since(t) > 5*time.Minute {
+		if time.Since(t) > linkAttemptMemory {
 			delete(a.linkAttempts, peer)
 		}
 	}
@@ -226,7 +239,7 @@ func (a *App) startLinkSession(ws *websocket.Conn, ip string) *linkSession {
 	context.AfterFunc(ctx, func() { ws.CloseNow() })
 	s := &linkSession{
 		phoneLink: &phoneLink{ws: ws, ctx: ctx, cancel: cancel, pending: map[string]chan linkMessage{}},
-		incoming:  make(chan linkMessage, 4),
+		incoming:  make(chan linkMessage, 4), // 握手期间消息很少，留一点余量即可
 		server:    a.linkCert,
 		address:   ip,
 	}
@@ -250,7 +263,7 @@ func (a *App) startLinkSession(ws *websocket.Conn, ip string) *linkSession {
 // handshakeLink 完成握手，返回手机编号。已授权的手机用凭证认证，重连不需要发现口令（关闭自动搜索、服务重启后也能连回来）；
 // 新配对必须由近期的发现请求引来，局域网里的其他设备不能凭空发起配对。
 func (a *App) handshakeLink(s *linkSession) (string, bool) {
-	hello, ok := s.read(10 * time.Second)
+	hello, ok := s.read(helloTimeout)
 	if !ok || !validHello(hello) {
 		return "", false
 	}
@@ -263,7 +276,7 @@ func (a *App) handshakeLink(s *linkSession) (string, bool) {
 	if s.send(gin.H{"type": "challenge", "session_id": s.session, "nonce": s.nonce, "server_id": s.server}) != nil {
 		return "", false
 	}
-	response, ok := s.read(15 * time.Second)
+	response, ok := s.read(replyTimeout)
 	switch {
 	case !ok:
 		return "", false
@@ -303,7 +316,7 @@ func (a *App) phoneByDeviceLocked(deviceID string) *PhoneConfig {
 
 // validHello 检查手机的第一条消息：设备编号和名称。
 func validHello(m linkMessage) bool {
-	return m.Type == "hello" && m.DeviceID != "" && len(m.DeviceID) <= 128 && !strings.ContainsAny(m.DeviceID, "\r\n") && len(m.Name) <= 128
+	return m.Type == "hello" && m.DeviceID != "" && len(m.DeviceID) <= maxDeviceIDLength && !strings.ContainsAny(m.DeviceID, "\r\n") && len(m.Name) <= maxDeviceIDLength
 }
 
 // read 等手机的下一条消息；超时或连接断开返回 false。
@@ -359,18 +372,18 @@ func (a *App) pairLink(s *linkSession, secret string) (string, bool) {
 	if s.send(gin.H{"type": "paired", "token": cfg.Token}) != nil {
 		return "", false
 	}
-	ack, ok := s.read(15 * time.Second)
+	ack, ok := s.read(replyTimeout)
 	if !ok || ack.Type != "auth" || !s.proofMatches(cfg.Token, ack.Proof) {
 		return "", false
 	}
 	return cfg.ID, true
 }
 
-// revealMatchesCommit 手机揭示的秘密是 32 字节，且和它在 hello 里的承诺（秘密的 SHA-256）一致。
+// revealMatchesCommit 手机揭示的秘密长度正确，且和它在 hello 里的承诺（秘密的 SHA-256）一致。
 func (s *linkSession) revealMatchesCommit(secret string) bool {
 	secretBytes, err := hex.DecodeString(secret)
 	digest := sha256.Sum256([]byte(secret))
-	return err == nil && len(secretBytes) == 32 && subtle.ConstantTimeCompare([]byte(s.hello.Commit), []byte(hex.EncodeToString(digest[:]))) == 1
+	return err == nil && len(secretBytes) == pairingSecretBytes && subtle.ConstantTimeCompare([]byte(s.hello.Commit), []byte(hex.EncodeToString(digest[:]))) == 1
 }
 
 // pairingCode 双方各自算出的 6 位验证码：绑定电脑证书、会话、设备、手机秘密和电脑挑战。
@@ -394,22 +407,31 @@ func (a *App) awaitPairingApproval(s *linkSession, p *phonePairing) bool {
 			if m.Type != "approve" || !m.Approved {
 				return false
 			}
-			a.mu.Lock()
-			p.PhoneApproved = true
-			a.notifyLocked()
-			a.mu.Unlock()
+			a.approveOnPhone(p)
 		case <-p.Changed:
 		}
-		a.mu.Lock()
-		approved := p.WebApproved && p.PhoneApproved
-		a.mu.Unlock()
-		if approved {
+		if a.pairingApproved(p) {
 			return true
 		}
 	}
 }
 
-// addPairing 登记待确认的配对，网页上显示验证码输入框。同一设备同时只能有一个配对，最多 8 个。
+// approveOnPhone 手机点了“允许这台电脑”，网页上显示已确认。
+func (a *App) approveOnPhone(p *phonePairing) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	p.PhoneApproved = true
+	a.notifyLocked()
+}
+
+// pairingApproved 网页验证和手机允许是否都已完成。
+func (a *App) pairingApproved(p *phonePairing) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return p.WebApproved && p.PhoneApproved
+}
+
+// addPairing 登记待确认的配对，网页上显示验证码输入框。同一设备同时只能有一个配对，总数有上限。
 func (a *App) addPairing(p *phonePairing) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -418,7 +440,7 @@ func (a *App) addPairing(p *phonePairing) bool {
 			return false
 		}
 	}
-	if len(a.pairings) >= 8 {
+	if len(a.pairings) >= maxPairings {
 		return false
 	}
 	a.pairings[p.ID] = p
@@ -445,7 +467,7 @@ func (a *App) authorizePairing(p *phonePairing) (PhoneConfig, error) {
 	}
 	created := cfg == nil
 	if created {
-		cfg = &PhoneConfig{ID: randomID()[:12]}
+		cfg = &PhoneConfig{ID: shortID()}
 		a.state.Phones = append(a.state.Phones, cfg)
 	}
 	old := *cfg
@@ -486,26 +508,30 @@ func (a *App) serveLink(s *linkSession, phoneID string) {
 
 // attachLink 把认证通过的连接设为手机的请求通道，断开它之前的连接。手机已删除或保存失败时返回 false。
 func (a *App) attachLink(s *linkSession, phoneID string) bool {
+	old, ok := a.replaceLink(s, phoneID)
+	if old != nil {
+		old.close()
+	}
+	return ok
+}
+
+// replaceLink 记下手机的新地址，把连接设为手机的请求通道，返回被替换的旧连接。
+func (a *App) replaceLink(s *linkSession, phoneID string) (phoneConn, bool) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	cfg := a.phoneLocked(phoneID)
 	if cfg == nil {
-		a.mu.Unlock()
-		return false
+		return nil, false
 	}
 	cfg.Address = s.address
 	if a.commitLocked() != nil {
-		a.mu.Unlock()
-		return false
+		return nil, false
 	}
 	old := a.links[phoneID]
 	a.links[phoneID] = s.phoneLink
 	a.phones[phoneID].connection, a.phones[phoneID].err = connConnecting, ""
 	a.notifyLocked()
-	a.mu.Unlock()
-	if old != nil {
-		old.close()
-	}
-	return true
+	return old, true
 }
 
 // detachLink 连接断开：仍是手机当前的连接时移除，等手机重连。
@@ -522,14 +548,14 @@ func (a *App) detachLink(l *phoneLink, phoneID string) {
 	a.notifyLocked()
 }
 
-// send 写一条消息，最多等 15 秒。
+// send 写一条消息，最多等 linkWriteTimeout。
 func (l *phoneLink) send(value any) error {
-	ctx, cancel := context.WithTimeout(l.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(l.ctx, linkWriteTimeout)
 	defer cancel()
 	return wsjson.Write(ctx, l.ws, value)
 }
 
-// call 发送一个请求并等待手机的响应。同时等待的请求最多 32 个。
+// call 发送一个请求并等待手机的响应。同时等待的请求数有上限。
 func (l *phoneLink) call(ctx context.Context, req linkRequest) (linkMessage, error) {
 	id := randomID()
 	ch := make(chan linkMessage, 1)
@@ -553,11 +579,11 @@ func (l *phoneLink) call(ctx context.Context, req linkRequest) (linkMessage, err
 // close 断开连接。
 func (l *phoneLink) close() { l.cancel() }
 
-// expect 登记一个等待响应的请求；已有 32 个在等时返回 false。
+// expect 登记一个等待响应的请求；等待的请求已满时返回 false。
 func (l *phoneLink) expect(id string, ch chan linkMessage) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.pending) >= 32 {
+	if len(l.pending) >= maxPendingRequests {
 		return false
 	}
 	l.pending[id] = ch

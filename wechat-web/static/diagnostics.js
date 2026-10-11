@@ -1,15 +1,18 @@
-// 诊断页：按微信号与设备查看当前设备状态、最近 100 个任务（需要关注 / 全部 / AI 任务）、设备上报的异常和服务日志。
+// 诊断页：按微信号与设备查看当前设备状态、最近手机任务和 AI 记录（按任务类型与显示范围筛选）、设备上报的异常和服务日志。
 // 数据来自 /api/debug；手机或模型返回的内容都用 textContent 显示，不会作为 HTML 执行。
 import { deviceProblems, deviceStatus, deviceWarnings } from "./device-status.js";
 import { $, el, button, api, app, accountLabel, timeLabel, storage } from "./common.js";
 import { registerPage, phoneName, operationAccount } from "./workspace.js";
 
+const AUTO_REFRESH_MS = 5000; // 停在诊断页时的自动刷新间隔
+const TASK_COLUMNS = ["时间", "操作与来源", "微信号 / 会话", "实际设备", "状态", "操作"];
 const STATUS = { queued: "排队中", running: "执行中", succeeded: "已完成", failed: "失败", unknown: "结果未知" };
-const AI_STATUS = { running: "生成中", sent: "已生成并排队发送", failed: "失败" };
+const AI_STATUS = { running: "生成中", sent: "已生成并排队发送", failed: "失败", draft: "已生成草稿", send_queued: "已生成并排队发送" };
 
 let data = null; // GET /api/debug 的最新结果
 let loading = false;
-let filter = "issues"; // issues | all | ai
+let filter = "issues"; // issues | all
+let taskType = "all"; // all | read | send | ai
 const opened = new Set(); // 展开详情的任务
 
 // ---------- 数据 ----------
@@ -27,7 +30,7 @@ async function refresh() {
     $("diag-log").textContent = data.log || "暂无日志";
     $("diag-log-note").textContent = data.log_error || "最后 64 KB";
     $("diag-error").textContent = "";
-    $("diag-status").textContent = "最近 100 个任务 · 更新于 " + new Date().toLocaleTimeString();
+    $("diag-status").textContent = "最近 100 个手机任务、50 条 AI 记录 · 更新于 " + new Date().toLocaleTimeString();
     storage.set("diag-seen-at", Date.now());
   } catch (e) {
     $("diag-error").textContent = e.message;
@@ -41,6 +44,8 @@ async function refresh() {
 function applyRequestedFocus() {
   if (app.diagnosticTask) {
     opened.add(app.diagnosticTask);
+    taskType = "all";
+    $("diag-task-type").value = taskType;
     setFilter("all");
     app.diagnosticTask = null;
   }
@@ -79,7 +84,7 @@ function phonesInScope(phones) {
 
 function setFilter(value) {
   filter = value;
-  for (const b of document.querySelectorAll("[data-diag-filter]")) b.classList.toggle("selected", b.dataset.diagFilter === filter);
+  $("diag-task-scope").value = filter;
 }
 
 // ---------- 渲染 ----------
@@ -92,8 +97,7 @@ function render() {
   const unknown = ops.filter((o) => o.status === "unknown").length;
   $("diag-warning").hidden = !unknown;
   $("diag-warning").textContent = unknown + " 条发送结果待核对，请先查看手机，避免重复发送。";
-  if (filter === "ai") renderAIJobs();
-  else renderTasks(ops);
+  renderTaskLists(ops);
   renderEvents();
 }
 
@@ -117,41 +121,82 @@ function deviceHealthRow(p) {
   return row;
 }
 
-// renderAIJobs AI 任务：会话、时间、状态，以及回复内容或失败原因。
-function renderAIJobs() {
+// needsAttention 成功但有降级警告的任务也需要关注。
+function needsAttention(task) {
+  return ["failed", "unknown"].includes(task.status) || !!task.warnings?.length;
+}
+
+// aiOperation AI 生成记录关联的手机发送任务。
+function aiOperation(job) {
+  return data.operations.find((op) => op.id === job.operation_id);
+}
+
+// renderTaskLists 类型与关注范围分别筛选；全部类型同时展示手机任务和 AI 生成记录。
+function renderTaskLists(ops) {
+  const phoneTasks = ops.filter((op) => (taskType === "all" || taskType === op.kind)
+    && (filter === "all" || needsAttention(op) || opened.has(op.id)));
+  const aiJobs = (data.ai_jobs || []).filter((job) => {
+    const op = aiOperation(job);
+    return ["all", "ai"].includes(taskType)
+      && inScope({ conversation_id: job.conversation_id, phone_id: op?.phone_id })
+      && (filter === "all" || needsAttention(job) || (op && needsAttention(op)));
+  });
   const box = $("diag-tasks");
   box.replaceChildren();
-  for (const j of data.ai_jobs || []) {
-    const op = data.operations.find((o) => o.id === j.operation_id);
-    if (!inScope({ conversation_id: j.conversation_id, phone_id: op?.phone_id })) continue;
+  if (phoneTasks.length) {
+    box.append(el("h2", "手机读取与发送"));
+    renderTasks(phoneTasks);
+  }
+  if (aiJobs.length) {
+    box.append(el("h2", "AI 回复"));
+    renderAIJobs(aiJobs);
+  }
+  if (!phoneTasks.length && !aiJobs.length)
+    box.append(el("div", filter === "issues" ? "当前范围内没有需要关注的任务" : "暂无匹配任务", "empty-list"));
+}
+
+// renderAIJobs 显示生成结果和关联发送结果，避免把生成成功误认为发送成功。
+function renderAIJobs(jobs) {
+  const box = $("diag-tasks");
+  for (const j of jobs) {
+    const op = aiOperation(j);
     const row = el("div", undefined, "task-card");
     row.append(
       el("strong", data.conversations[j.conversation_id] || "会话"),
       el("small", timeLabel(j.created) + " · " + (AI_STATUS[j.status] || j.status)),
       el("p", j.error || j.reply || "正在生成回复…"),
     );
+    if (op) {
+      row.append(el("p", "发送结果：" + (STATUS[op.status] || op.status), statusClass(op.status)));
+      if (op.error) row.append(el("p", op.error, "danger-text"));
+      for (const warning of op.warnings || []) row.append(el("p", warning.message, "warning"));
+      row.append(button("查看发送详情", "text-button", () => {
+        opened.add(op.id);
+        taskType = "all";
+        $("diag-task-type").value = taskType;
+        render();
+      }));
+    } else if (j.status === "sent") {
+      row.append(el("p", "发送任务不在当前加载的记录中，无法确认发送结果。", "muted"));
+    }
     box.append(row);
   }
-  if (!box.children.length) box.append(el("div", "暂无匹配的 AI 任务", "empty-list"));
 }
 
-// renderTasks 任务表格：“需要关注”只列失败、结果未知、有降级和已展开的任务；展开的任务下面显示详情。
+// renderTasks 展示筛选后的手机任务；展开的任务下面显示详情。
 function renderTasks(ops) {
   const table = el("table", undefined, "data-table");
   const head = el("thead"),
     tr = el("tr");
-  for (const t of ["时间", "操作与来源", "微信号 / 会话", "实际设备", "状态", "操作"]) tr.append(el("th", t));
+  for (const t of TASK_COLUMNS) tr.append(el("th", t));
   head.append(tr);
   const body = el("tbody");
-  const shown = ops.filter((o) => filter === "all" || ["failed", "unknown"].includes(o.status) || o.warnings?.length || opened.has(o.id));
-  for (const op of shown) {
+  for (const op of ops) {
     body.append(taskRow(op));
     if (opened.has(op.id)) body.append(taskDetailRow(op));
   }
   table.append(head, body);
-  $("diag-tasks").replaceChildren(table);
-  if (!body.children.length)
-    $("diag-tasks").append(el("div", filter === "issues" ? "当前范围内没有需要关注的任务" : "暂无匹配任务", "empty-list"));
+  $("diag-tasks").append(table);
 }
 
 // source 任务的来源：转发、AI 回复、自动读取或手动。
@@ -202,7 +247,7 @@ function taskDetailRow(op) {
   for (const w of op.warnings || []) detail.append(el("p", w.message, "warning"));
   detail.append(taskSteps(op), el("small", "任务 " + op.id, "muted"));
   const cell = el("td");
-  cell.colSpan = 6;
+  cell.colSpan = TASK_COLUMNS.length;
   cell.append(detail);
   const row = el("tr");
   row.append(cell);
@@ -274,12 +319,15 @@ $("diag-account").onchange = () => {
 };
 $("diag-phone").onchange = render;
 $("diag-refresh").onclick = refresh;
-for (const b of document.querySelectorAll("[data-diag-filter]"))
-  b.onclick = () => {
-    setFilter(b.dataset.diagFilter);
-    render();
-  };
-// 停在诊断页且开启自动刷新时，每 5 秒刷新一次
+$("diag-task-type").onchange = () => {
+  taskType = $("diag-task-type").value;
+  render();
+};
+$("diag-task-scope").onchange = () => {
+  setFilter($("diag-task-scope").value);
+  render();
+};
+// 停在诊断页且开启自动刷新时，定时刷新
 setInterval(() => {
   if (app.page === "diagnostics" && $("diag-auto").checked) void refresh();
-}, 5000);
+}, AUTO_REFRESH_MS);

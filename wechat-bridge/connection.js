@@ -6,6 +6,27 @@
 // options：config（device_id、discovery_port）、base（数据目录）、handle（处理电脑经连接发来的请求，返回 [状态码, 响应体]）、
 //          log、diagnostic（记录诊断事件）、onReady（连上电脑后调用）。
 module.exports = function (options) {
+    // LINK_HOLD_MS 连接断开后仍为原电脑保留手机的时长：够它重启服务、短暂断网后连回来（重连从 5 秒起），
+    // 又不至于让换电脑的人等太久。
+    var LINK_HOLD_MS = 30000;
+    var HANDSHAKE_TIMEOUT_MS = 190000; // 握手和配对（验证码 3 分钟）的上限
+    var UNTRUSTED_FORGET_MS = 120000; // 未授权的电脑这么久没有广播就忘掉
+    var PEER_RETURN_MS = 120000; // 已授权的电脑停止广播这么久后再出现，视为重新上线，马上重连
+    var TRUSTED_RETRY_MS = 5000; // 已授权的电脑连不上时第一次重连的等待，之后每次加倍
+    var TRUSTED_RETRY_MAX_MS = 5 * 60000; // 最长 5 分钟一次：长期连不上的不刷屏
+    var DECLINED_RETRY_MS = 60000; // 未授权的电脑被拒绝或配对超时后，再次弹框的等待，之后每次加倍
+    var DECLINED_RETRY_MAX_MS = 30 * 60000; // 最长 30 分钟：别的电脑的广播不会反复弹出配对框
+    var MAX_PEERS = 8; // 同时记下的电脑数上限
+    var MAX_CONCURRENT_REQUESTS = 16; // 同时处理的电脑请求数上限（事件长轮询会占住一个线程）
+    var CONNECT_TIMEOUT_SECONDS = 5; // 建立连接的超时
+    var PING_SECONDS = 15; // 连接保活间隔：及时发现断开的连接
+    var MAINTAIN_INTERVAL_MS = 1000; // 连接线程检查各电脑状态的间隔
+    var FAILURE_LOG_INTERVAL_MS = 60000; // 发现请求处理失败时，诊断最多每分钟记一次
+    var MAX_PACKET_BYTES = 2048; // 发现请求的最大长度
+    var DEFAULT_DISCOVERY_PORT = 39000; // 与电脑端的默认值一致
+    var SECRET_BYTES = 32; // 配对时承诺的随机秘密长度
+    var MAX_DEVICE_ID_LENGTH = 128; // 设备编号的长度上限，与电脑端一致
+
     var config = options.config, base = options.base;
     var discoverySocket = null;
     var path = base + "trusted-computers.json";
@@ -13,12 +34,7 @@ module.exports = function (options) {
     var holder = { id: "", releasedAt: 0 }; // 占用这台手机的电脑；releasedAt 为 0 表示仍连着，否则是断开的时间
     var mutex = new java.util.concurrent.locks.ReentrantLock();
     var random = new java.security.SecureRandom();
-    var requests = new java.util.concurrent.Semaphore(16);
-    // LINK_HOLD_MS 连接断开后仍为原电脑保留手机的时长：够它重启服务、短暂断网后连回来（重连从 5 秒起），
-    // 又不至于让换电脑的人等太久。
-    var LINK_HOLD_MS = 30000;
-    var HANDSHAKE_TIMEOUT_MS = 190000; // 握手和配对（验证码 3 分钟）的上限
-    var UNTRUSTED_FORGET_MS = 120000; // 未授权的电脑这么久没有广播就忘掉
+    var requests = new java.util.concurrent.Semaphore(MAX_CONCURRENT_REQUESTS);
 
     loadTrusted();
 
@@ -44,7 +60,7 @@ module.exports = function (options) {
     }
     function hash(value) { return hex(java.security.MessageDigest.getInstance("SHA-256").digest(utf8(value))); }
     function secret() {
-        var bytes = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, 32);
+        var bytes = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, SECRET_BYTES);
         random.nextBytes(bytes); return hex(bytes);
     }
     function hmacHex(key, text) {
@@ -76,11 +92,11 @@ module.exports = function (options) {
     function retryDelay(peer, rejected) {
         if (trusted[peer.id]) {
             peer.failures = (peer.failures || 0) + 1;
-            return Math.min(5000 * Math.pow(2, peer.failures - 1), 5 * 60000);
+            return Math.min(TRUSTED_RETRY_MS * Math.pow(2, peer.failures - 1), TRUSTED_RETRY_MAX_MS);
         }
-        if (!rejected) return 5000;
+        if (!rejected) return TRUSTED_RETRY_MS;
         peer.declines = (peer.declines || 0) + 1;
-        return Math.min(60000 * Math.pow(2, peer.declines - 1), 30 * 60000);
+        return Math.min(DECLINED_RETRY_MS * Math.pow(2, peer.declines - 1), DECLINED_RETRY_MAX_MS);
     }
     // heldByOther 手机是否正被另一台电脑占用：已和别的电脑建立连接，或那条连接断开还不到 30 秒。
     // 占用期间不理会其他电脑的发现广播、不去连接它们，也就不会弹出配对框打断正在工作的电脑。
@@ -280,8 +296,8 @@ module.exports = function (options) {
         peer.client = new okhttp3.OkHttpClient.Builder()
             .sslSocketFactory(tls.getSocketFactory(), trust)
             .hostnameVerifier(new JavaAdapter(javax.net.ssl.HostnameVerifier, { verify: function () { return true; } }))
-            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-            .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS).build();
+            .connectTimeout(CONNECT_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+            .pingInterval(PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS).build();
         var request = new okhttp3.Request.Builder().url("wss://" + peer.host + ":" + peer.port + "/link").build();
         peer.ws = peer.client.newWebSocket(request, new JavaAdapter(okhttp3.WebSocketListener, {
             onOpen: function (ws) {
@@ -300,7 +316,7 @@ module.exports = function (options) {
                 if (!trusted[peer.id] || !peer.failures) options.log("电脑连接暂时中断：" + error + (trusted[peer.id] ? "；之后逐步放慢重试，最长 5 分钟一次" : ""));
                 disconnect(peer, !trusted[peer.id]);
             },
-            onClosing: function (ws) { ws.close(1000, "closed"); },
+            onClosing: function (ws) { ws.close(1000 /* WebSocket 正常关闭 */, "closed"); },
             onClosed: function (ws) { if (peer.ws === ws) disconnect(peer, !trusted[peer.id]); }
         }));
     }
@@ -311,12 +327,12 @@ module.exports = function (options) {
             if (heldByOther(packet.server_id)) return;
             var peer = peers[packet.server_id];
             if (!peer) {
-                if (Object.keys(peers).length >= 8 || (!trusted[packet.server_id] && pending)) return;
+                if (Object.keys(peers).length >= MAX_PEERS || (!trusted[packet.server_id] && pending)) return;
                 peer = peers[packet.server_id] = { id: packet.server_id, phase: "closed", next: 0 };
             }
             // 已授权电脑换了地址或停了一阵后重新广播（例如开机）：不必等放慢后的间隔，马上重连。
             // 一直在广播却连不上的电脑（例如防火墙挡住接入端口）不会因广播而加快重试。
-            var returned = String(source) !== peer.host || packet.link_port !== peer.port || Date.now() - (peer.seen || 0) > 120000;
+            var returned = String(source) !== peer.host || packet.link_port !== peer.port || Date.now() - (peer.seen || 0) > PEER_RETURN_MS;
             if (trusted[packet.server_id] && returned && peer.failures) {
                 peer.failures = 0;
                 if (peer.phase === "closed") peer.next = 0;
@@ -331,7 +347,7 @@ module.exports = function (options) {
             locked(function () {
                 for (var id in peers) maintainPeer(peers[id]);
             });
-            sleep(1000);
+            sleep(MAINTAIN_INTERVAL_MS);
         }
     });
     // maintainPeer 在锁内调用：处理一台电脑的连接状态。
@@ -348,7 +364,7 @@ module.exports = function (options) {
 
     // listen 接收发现请求，直到 socket 关闭。只接受 IPv4 来源。
     function listen(socket) {
-        var buffer = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, 2048);
+        var buffer = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, MAX_PACKET_BYTES);
         var lastFailure = 0;
         while (!socket.isClosed()) {
             try {
@@ -360,7 +376,7 @@ module.exports = function (options) {
                 if (request) discover(request, String(packet.getAddress().getHostAddress()));
             } catch (e) {
                 if (socket.isClosed()) return;
-                if (Date.now() - lastFailure > 60000) {
+                if (Date.now() - lastFailure > FAILURE_LOG_INTERVAL_MS) {
                     lastFailure = Date.now();
                     options.diagnostic("warning", "DISCOVERY_FAILED", "局域网发现请求处理失败：" + e, { source: "discovery" });
                 }
@@ -379,11 +395,11 @@ module.exports = function (options) {
     // startDiscovery 打开 UDP 发现端口（config.discovery_port，默认 39000，0 为关闭）。失败时只记日志：
     // 已授权的电脑仍会按保存的地址重连。
     function startDiscovery() {
-        var port = config.discovery_port == null ? 39000 : Number(config.discovery_port);
+        var port = config.discovery_port == null ? DEFAULT_DISCOVERY_PORT : Number(config.discovery_port);
         if (port === 0) return;
         try {
             if (port < 1 || port > 65535 || port % 1 !== 0) throw Error("discovery_port 必须为 0 到 65535");
-            if (String(config.device_id).length > 128 || /[\r\n]/.test(String(config.device_id))) throw Error("device_id 格式无效");
+            if (String(config.device_id).length > MAX_DEVICE_ID_LENGTH || /[\r\n]/.test(String(config.device_id))) throw Error("device_id 格式无效");
             discoverySocket = new java.net.DatagramSocket(port, java.net.InetAddress.getByName("0.0.0.0"));
             discoverySocket.setBroadcast(true);
             var socket = discoverySocket;

@@ -1,11 +1,12 @@
 // 消息页：会话列表、当前聊天（标题、提示、按钮、消息列表）、输入框和发送，以及添加会话、会话设置对话框。
-import { $, el, api, toast, handleForm, storage, accountName, accountLabel, timeLabel, emojify, KINDS, app } from "./common.js";
+import { $, el, api, toast, handleForm, storage, accountName, accountLabel, timeLabel, emojify, badgeText, KINDS, app, MAX_MESSAGE_LENGTH, MAX_READ_LIMIT, DEFAULT_REPLY_INTERVAL } from "./common.js";
 import { deviceProblems } from "./device-status.js";
 import { navigate } from "./workspace.js";
 import { currentAccount, phoneOf, chosenDevice } from "./accounts.js";
 import { renderMessages, resetMessageList, conversationAvatar, STATUS } from "./message-list.js";
 import { noteOperation } from "./operation-toasts.js";
 
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 上传图片的上限：再大微信也会压缩
 const READ_EVERY = { 60: "每 1 分钟", 300: "每 5 分钟", 900: "每 15 分钟", 1800: "每 30 分钟", 3600: "每 1 小时" };
 
 let active = null; // 当前会话 ID
@@ -59,7 +60,7 @@ function conversationRow(c) {
   top.append(el("strong", emojify(c.title)), el("time", timeLabel(c.updated)));
   const bottom = el("div", undefined, "conversation-bottom");
   bottom.append(el("small", c.preview ? emojify(c.preview) : KINDS[c.kind]));
-  if (c.unread) bottom.append(el("span", c.unread > 99 ? "99+" : String(c.unread), "badge"));
+  if (c.unread) bottom.append(el("span", badgeText(c.unread), "badge"));
   const text = el("div", undefined, "conversation-copy");
   text.append(top, bottom);
   item.append(conversationAvatar(c), text);
@@ -245,7 +246,7 @@ function clearSentDraft(chatId, text) {
 // sendImageFile 发送图片：读成 Base64 上传保存，再用返回的图片哈希建立发送任务。
 // 上传期间切换了会话或设备时不发送，免得发错地方。
 async function sendImageFile(file) {
-  if (file.size > 8 * 1024 * 1024) return toast("图片最多 8 MB");
+  if (file.size > MAX_IMAGE_BYTES) return toast("图片最多 " + MAX_IMAGE_BYTES / 1024 / 1024 + " MB");
   const imageChat = active,
     imageDevice = chosenDevice();
   try {
@@ -273,13 +274,13 @@ function exportConversation() {
   link.href = URL.createObjectURL(blob);
   link.download = conversation.title.replace(/[\\/:*?"<>|]/g, "_") + ".json";
   link.click();
-  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000); // 等浏览器开始下载后再释放
 }
 
 // updateComposer 保存草稿，更新字数统计和发送按钮状态。
 function updateComposer() {
   saveDraft();
-  $("char-count").textContent = Array.from($("message").value).length + " / 2000";
+  $("char-count").textContent = Array.from($("message").value).length + " / " + MAX_MESSAGE_LENGTH;
   if (conversation) renderChat();
 }
 
@@ -305,7 +306,7 @@ function openChatSettings() {
   $("set-read-every").value = String(c.read_every_seconds || 0);
   $("set-originals").value = c.originals || "on";
   $("set-ai-mode").value = c.ai.mode || "inherit";
-  $("set-ai-interval").value = c.ai.interval_seconds || c.ai_effective?.interval_seconds || 30;
+  $("set-ai-interval").value = c.ai.interval_seconds || c.ai_effective?.interval_seconds || DEFAULT_REPLY_INTERVAL;
   $("set-ai-keyword").value = c.ai.keyword || "";
   $("chat-settings-error").textContent = "";
   $("chat-settings-dialog").showModal();
@@ -347,7 +348,7 @@ async function clearHistory() {
 
 $("read").onclick = () => {
   const limit = Number($("limit").value);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100) return toast("读取数量必须为 1–100");
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_READ_LIMIT) return toast("读取数量必须为 1–" + MAX_READ_LIMIT);
   submit("read", { limit });
 };
 $("send").onclick = () => submit("send", { text: $("message").value });

@@ -1,24 +1,4 @@
 /* 微信消息台。两栏布局：左侧会话栏（系统入口在顶部），右侧聊天区。 */
-:root {
-  --green: #167b59;
-  --green-dark: #106b4c;
-  --mint: #edf6f1;
-  --ink: #263c36;
-  --muted: #82908b;
-  --faint: #a3aea7;
-  --line: #e7ece9;
-  --bg: #f5f7f5;
-  --panel: #fcfdfc;
-  --chat-bg: #f7f9f6;
-  --warn-bg: #fbf3e6;
-  --warn-ink: #9a6b2f;
-  --error-bg: #fbeceb;
-  --error-ink: #b2483e;
-}
-
-* {
-  box-sizing: border-box;
-}
 
 body {
   margin: 0;
@@ -28,20 +8,9 @@ body {
   font-size: 14px;
 }
 
-button, input, textarea, select {
-  font: inherit;
-}
-
 button {
-  cursor: pointer;
-  border: 0;
   background: none;
   color: inherit;
-}
-
-button:disabled {
-  cursor: not-allowed;
-  opacity: .45;
 }
 
 button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
@@ -49,16 +18,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   outline-offset: 2px;
 }
 
-[hidden] {
-  display: none !important;
-}
-
 .app {
-  display: flex;
-  max-width: 1600px;
-  height: 100dvh;
   min-height: 560px;
-  margin: auto;
   background: #fff;
 }
 
@@ -71,7 +32,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   min-width: 32px;
   height: 32px;
   border-radius: 8px;
-  color: #7d8f84;
   font-size: 18px;
   text-decoration: none;
 }
@@ -82,11 +42,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .text-button {
-  padding: 7px 10px;
   border-radius: 7px;
-  color: var(--green);
   font-size: 12px;
-  white-space: nowrap;
 }
 
 .text-button:hover {
@@ -98,16 +55,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   align-items: center;
   justify-content: center;
   gap: 14px;
-  padding: 10px 20px;
   border-radius: 9px;
-  background: var(--green);
-  color: #fff;
   font-size: 12px;
-  font-weight: 600;
-}
-
-.primary:hover {
-  background: var(--green-dark);
 }
 
 .primary span {
@@ -115,10 +64,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .secondary {
-  padding: 10px 18px;
-  border: 1px solid #dde7df;
   border-radius: 9px;
-  color: #6f8577;
   font-size: 12px;
 }
 
@@ -129,13 +75,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 /* ---------- 系统侧边栏 ---------- */
 
 .system-sidebar {
-  display: flex;
   flex: 0 0 auto;
-  flex-direction: column;
-  width: 148px;
-  padding: 14px 8px;
-  border-right: 1px solid #dfe8e1;
-  background: #edf4ef;
   transition: width .18s ease;
 }
 
@@ -159,9 +99,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .system-nav {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
   margin-top: 14px;
 }
 
@@ -171,9 +108,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 /* 折叠后只显示图标 */
-.system-sidebar.collapsed {
-  width: 56px;
-}
 
 .system-sidebar.collapsed .system-label {
   display: none;
@@ -189,12 +123,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 /* ---------- 会话栏 ---------- */
 
 .sidebar {
-  display: flex;
-  flex-direction: column;
   flex-shrink: 0;
-  width: 320px;
-  background: var(--panel);
-  border-right: 1px solid var(--line);
 }
 
 /* 诊断入口上的红点：新的异常或降级数量 */
@@ -207,7 +136,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   height: 16px;
   padding: 0 4px;
   border-radius: 8px;
-  background: var(--error-ink);
   color: #fff;
   font-size: 10px;
   font-weight: 600;
@@ -216,19 +144,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .connection-card {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 16px 12px;
-  padding: 9px 12px;
-  border: 1px solid #dceae0;
   border-radius: 10px;
-  background: var(--mint);
   text-align: left;
 }
 
 .connection-card strong {
-  font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
 }
@@ -237,44 +157,22 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   min-width: 0;
   margin-left: auto;
   overflow: hidden;
-  color: #788f80;
   font-size: 11px;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dot {
-  flex-shrink: 0;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #adb9b2;
 }
 
 .dot.online {
-  background: #21a47b;
   box-shadow: 0 0 0 3px #d6ecdf;
 }
 
-.dot.error {
-  background: #db996c;
-}
-
 .search-row {
-  display: flex;
   align-items: center;
-  gap: 6px;
   margin: 0 12px 10px 16px;
 }
 
 .search-box {
-  display: flex;
   flex: 1;
-  align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  border-radius: 9px;
-  background: #f0f3f0;
   color: #94a299;
 }
 
@@ -284,78 +182,32 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .search-box input {
-  width: 100%;
-  border: 0;
   outline: none;
-  background: none;
   font-size: 12px;
 }
 
 .filters {
   display: flex;
-  gap: 4px;
   margin: 0 14px 8px;
 }
 
 .filters button {
-  padding: 6px 11px;
   border-radius: 7px;
   color: #8b968e;
-  font-size: 12px;
   white-space: nowrap;
 }
 
 .filters .selected {
-  background: #eaf2ed;
-  color: var(--green);
   font-weight: 600;
-}
-
-.conversation-list {
-  flex: 1;
-  overflow: auto;
-  padding: 2px 10px 10px;
 }
 
 .conversation-item {
-  display: flex;
-  gap: 11px;
-  width: 100%;
   margin-bottom: 2px;
-  padding: 11px 10px;
-  border-radius: 10px;
-  text-align: left;
-}
-
-.conversation-item:hover {
-  background: #f1f5f1;
-}
-
-.conversation-item.active {
-  background: #e6f1ea;
 }
 
 .avatar {
-  display: grid;
   place-items: center;
-  width: 40px;
-  min-width: 40px;
-  height: 40px;
-  border-radius: 12px;
-  background: #e3eee7;
-  color: #4c7c62;
   font-size: 16px;
-  font-weight: 600;
-}
-
-.avatar.group {
-  background: #e8eaf3;
-  color: #757b9d;
-}
-
-.conversation-copy {
-  flex: 1;
-  min-width: 0;
 }
 
 .conversation-top {
@@ -367,17 +219,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .conversation-top strong {
-  overflow: hidden;
-  font-size: 13px;
   font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .conversation-top time {
   flex-shrink: 0;
-  color: var(--faint);
-  font-size: 10px;
 }
 
 .conversation-bottom {
@@ -388,11 +234,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 .conversation-bottom small {
   flex: 1;
-  overflow: hidden;
   color: #8d9a92;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .badge {
@@ -406,21 +248,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .empty-list {
-  padding: 35px 12px;
-  color: #98a59c;
   font-size: 12px;
-  line-height: 1.8;
-  text-align: center;
-  white-space: pre-line;
 }
 
 /* ---------- 聊天区 ---------- */
-
-.chat-panel {
-  flex: 1;
-  min-width: 0;
-  background: var(--chat-bg);
-}
 
 .welcome {
   display: flex;
@@ -429,7 +260,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   justify-content: center;
   height: 100%;
   background: radial-gradient(ellipse at 50% 45%, #eaf3e9 0, transparent 57%);
-  text-align: center;
 }
 
 .welcome-mark {
@@ -437,55 +267,29 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   place-items: center;
   width: 80px;
   height: 80px;
-  margin-bottom: 26px;
   border: 1px solid #d7e4d6;
   border-radius: 24px;
   background: #e1ece0;
-  color: #6c8d72;
-  font-size: 36px;
   transform: rotate(-6deg);
 }
 
 .welcome h1 {
   margin: 14px 0;
-  font-size: 30px;
   font-weight: 550;
-  letter-spacing: 1px;
-  line-height: 1.55;
 }
 
 .welcome p {
   margin: 0 0 24px;
   color: #8c9a8e;
   font-size: 13px;
-  line-height: 1.9;
-}
-
-.chat {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-
-.chat-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 14px 20px 14px 24px;
-  border-bottom: 1px solid var(--line);
-  background: #fff;
 }
 
 .chat-title {
-  flex: 1;
-  min-width: 0;
   margin-left: 4px;
 }
 
 .chat-title h1 {
-  margin: 0 0 4px;
   overflow: hidden;
-  font-size: 16px;
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -494,8 +298,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 /* 设置摘要：群聊 · 手机已连接 · 定时每 5 分钟 · 仅缩略图 · AI 关闭 */
 .chat-note {
   overflow: hidden;
-  color: #8a9b8d;
-  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -509,17 +311,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   color: var(--warn-ink);
 }
 
-.read-control {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: #8b9a8d;
-  font-size: 11px;
-}
-
 .read-control input {
-  width: 44px;
-  padding: 4px;
   border: 1px solid #dfe7dd;
   border-radius: 5px;
   color: #68796b;
@@ -528,18 +320,13 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .messages-wrap {
-  position: relative;
   display: flex;
-  flex: 1;
   flex-direction: column;
-  min-height: 0;
 }
 
 .messages {
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  padding: 16px 32px 24px;
 }
 
 .new-messages {
@@ -557,9 +344,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 .day-divider {
   margin: 14px 0 18px;
-  color: var(--faint);
-  font-size: 11px;
-  text-align: center;
 }
 
 .gap-note {
@@ -605,8 +389,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .message-sender {
   margin: 0 0 3px 2px;
   overflow: hidden;
-  color: #7d8a85;
-  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -619,12 +401,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .bubble {
   padding: 10px 14px;
   overflow-wrap: anywhere;
-  border: 1px solid #e7ede4;
-  border-radius: 3px 13px 13px 13px;
-  background: #fff;
-  box-shadow: 0 2px 4px #253e2010;
   font-size: 13px;
-  line-height: 1.7;
   white-space: pre-wrap;
 }
 
@@ -665,9 +442,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 5px;
   color: #9faa9e;
-  font-size: 10px;
 }
 
 .outgoing .message-meta {
@@ -675,15 +450,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 
 .messages-empty {
-  display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
   height: 100%;
-  color: #98a897;
   font-size: 12px;
   line-height: 2;
-  text-align: center;
 }
 
 .messages-empty strong {
@@ -698,11 +469,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 20px 8px 32px;
-  border-top: 1px solid #e6ece4;
-  background: #eef5ef;
-  color: #5f7a68;
-  font-size: 12px;
   line-height: 1.6;
 }
 
@@ -736,22 +502,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   opacity: .7;
 }
 
-.composer {
-  padding: 12px 24px 14px 32px;
-  border-top: 1px solid var(--line);
-  background: #fff;
-}
-
 .composer textarea {
-  width: 100%;
-  min-height: 44px;
-  border: none;
   outline: none;
   background: none;
   color: var(--ink);
   font-size: 13px;
   line-height: 1.7;
-  resize: none;
 }
 
 .composer textarea::placeholder {
@@ -759,14 +515,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   font-size: 12px;
 }
 
-.composer-bottom {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
 #char-count {
-  margin-left: auto;
   color: #a3ada3;
   font-size: 10px;
 }
@@ -780,18 +529,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 dialog {
   width: 460px;
   max-width: calc(100% - 30px);
-  max-height: 90vh;
-  overflow: auto;
-  padding: 24px 26px;
-  border: 0;
-  border-radius: 16px;
-  box-shadow: 0 30px 100px #142a2540;
-  color: var(--ink);
-}
-
-dialog::backdrop {
-  background: #1a352d45;
-  backdrop-filter: blur(4px);
 }
 
 .dialog-heading {
@@ -813,28 +550,22 @@ dialog h3 {
 
 .muted {
   margin: 6px 0 0;
-  color: #8a9a8f;
   font-size: 12px;
   line-height: 1.7;
 }
 
 .field {
-  display: block;
   margin-top: 14px;
-  color: #647d6d;
-  font-size: 12px;
 }
 
 .field input, .field select, .field textarea {
   display: block;
   width: 100%;
-  margin-top: 6px;
   padding: 10px 12px;
   border: 1px solid #dfe8e0;
   border-radius: 8px;
   background: #fbfcfa;
   color: var(--ink);
-  font-size: 12px;
 }
 
 .field textarea {
@@ -871,7 +602,6 @@ dialog h3 {
   margin-top: 12px;
   color: var(--error-ink);
   font-size: 12px;
-  line-height: 1.6;
 }
 
 .danger-zone {
@@ -917,20 +647,39 @@ dialog h3 {
 .discovery-settings { margin: 18px 0; padding: 14px; border: 1px solid #dce9e1; border-radius: 12px; background: #f7faf8; }
 .discovery-settings summary { cursor: pointer; font-size: 14px; font-weight: 600; }
 .discovery-settings summary span { display: block; padding: 5px 0 0 16px; font-size: 12px; font-weight: 400; }
-.discovery-toggle { display: flex; align-items: center; gap: 9px; margin: 14px 0; font-size: 13px; }
+.discovery-toggle {
+  margin: 14px 0;
+  font-size: 13px;
+}
 .discovery-toggle input { width: auto; margin: 0; accent-color: #287a54; }
 .network-add { display: flex; gap: 8px; flex-wrap: wrap; }
 .network-add input, .network-add select { padding: 10px 12px; border: 1px solid #dfe8e0; border-radius: 8px; background: #fbfcfa; color: var(--ink); font: inherit; font-size: 12px; }
 .network-add input:focus, .network-add select:focus { outline: 2px solid #8bbda4; outline-offset: 1px; }
-.network-add input { flex: 1 1 170px; min-width: 0; }
+.network-add input {
+  min-width: 0;
+}
 .network-add select { flex: 1 1 140px; width: auto; }
 .network-list { margin: 10px 0; }
-.network-range { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #e1ebe4; }
+.network-range {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .network-range span { flex: 1; font-size: 13px; }
-.network-range small { display: block; color: #78857e; font-size: 11px; margin-top: 3px; overflow-wrap: anywhere; }
-.network-budget { display: flex; gap: 8px; justify-content: space-between; flex-wrap: wrap; font-size: 11px; }
+.network-range small {
+  color: #78857e;
+  font-size: 11px;
+  margin-top: 3px;
+}
+.network-budget {
+  flex-wrap: wrap;
+  font-size: 11px;
+}
 #network-budget { width: 100%; height: 6px; accent-color: #287a54; }
-.pairing-card { margin: 12px 0; padding: 16px; border: 1px solid #bad6c6; border-radius: 12px; background: #f5faf7; }
+.pairing-card {
+  margin: 12px 0;
+  background: #f5faf7;
+}
 .pairing-card h3 { margin: 0 0 6px; }
 .pairing-card p { font-size: 12px; line-height: 1.6; color: #61786b; }
 .pairing-code { font-size: 24px; letter-spacing: .35em; text-align: center; font-variant-numeric: tabular-nums; }
@@ -966,34 +715,15 @@ dialog h3 {
 
 .picker {
   margin-top: 6px;
-  border: 1px solid #dfe8e0;
-  border-radius: 8px;
-  background: #fff;
-}
-
-.field .picker input[type="search"] {
-  margin: 0;
-  padding: 7px 10px;
-  border: 0;
-  border-bottom: 1px solid #edf2ee;
-  border-radius: 8px 8px 0 0;
-  background: transparent;
 }
 
 .toast {
   position: fixed;
   bottom: 24px;
   left: 50%;
-  z-index: 20;
-  max-width: 90vw;
   padding: 12px 22px;
-  border-radius: 10px;
-  background: #2b453b;
-  box-shadow: 0 7px 25px #142c2720;
-  color: #fff;
   font-size: 12px;
   line-height: 1.7;
-  transform: translateX(-50%);
 }
 
 /* ---------- 屏幕尺寸 ---------- */
@@ -1087,8 +817,16 @@ dialog h3 {
   }
 }
 
-.reading-settings { margin: 16px 0; padding: 16px; border: 1px solid var(--line, #e2e7ed); border-radius: 12px; }
-.reading-toggle { display: flex; align-items: center; justify-content: space-between; gap: 20px; cursor: pointer; }
+.reading-settings {
+  padding: 16px;
+  border: 1px solid var(--line, #e2e7ed);
+  border-radius: 12px;
+}
+.reading-toggle {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
 .reading-toggle small { display: block; color: var(--muted, #687586); margin-top: 5px; }
 .reading-toggle input { appearance: none; flex: 0 0 42px; width: 42px; height: 24px; padding: 3px; border: 0; border-radius: 20px; background: #a5afba; cursor: pointer; transition: background .15s; }
 .reading-toggle input::before { content: ""; display: block; width: 18px; height: 18px; border-radius: 50%; background: white; transition: transform .15s; }
@@ -1098,7 +836,11 @@ dialog h3 {
 .reading-toggle input:disabled { opacity: .6; cursor: wait; }
 .reading-settings p { margin: 10px 0 0; line-height: 1.6; }
 
-.list-account { padding: 8px 20px 0; color: #738078; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list-account {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .outgoing .message-sender { text-align: right; margin-right: 2px; }
 
 .read-gap-note { color: #9b641c; font-size: 12px; margin-top: 5px; line-height: 1.5; }

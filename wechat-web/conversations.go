@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strings"
 
@@ -65,8 +66,12 @@ var unsupportedChats = map[string]bool{"公众号": true, "订阅号消息": tru
 // wechatSystemTitle 微信自己的系统通知（“你有1条消息未发送”等）的标题，不是会话名称。
 const wechatSystemTitle = "微信"
 
-// anchorSize 删除聊天记录时留作衔接点的消息条数。
-const anchorSize = 5
+const (
+	anchorSize    = 5     // 删除聊天记录时留作衔接点的消息条数
+	maxTitleRunes = 128   // 会话名称最多的字数：与手机桥的限制一致
+	minReadEvery  = 60    // 秒：定时读取的最短间隔，避免手机被一个会话占满
+	maxReadEvery  = 86400 // 秒：最长一天
+)
 
 // validKind 检查会话类型是否合法。
 func validKind(kind string) bool {
@@ -107,7 +112,7 @@ func (a *App) conversationLocked(account, title string) *Conversation {
 	}
 	// 会话编号由账号和名称的哈希得出
 	h := sha256.Sum256([]byte(account + "\x00" + title))
-	c := &Conversation{ID: hex.EncodeToString(h[:12]), Account: account, Title: title, Kind: kindUnknown, Updated: now(), Messages: []Message{}}
+	c := &Conversation{ID: hex.EncodeToString(h[:shortIDLength/2]), Account: account, Title: title, Kind: kindUnknown, Updated: now(), Messages: []Message{}}
 	a.state.Conversations[c.ID] = c
 	return c
 }
@@ -177,7 +182,7 @@ func (a *App) createConversation(c *gin.Context) {
 		return
 	}
 	title := strings.TrimSpace(body.Title)
-	if title == "" || len([]rune(title)) > 128 || strings.ContainsAny(title, "\r\n\x00") || !validKind(body.Kind) {
+	if title == "" || len([]rune(title)) > maxTitleRunes || strings.ContainsAny(title, "\r\n\x00") || !validKind(body.Kind) {
 		fail(c, 400, "请输入完整微信昵称或群名称，并选择会话类型")
 		return
 	}
@@ -242,8 +247,8 @@ func (a *App) setReadSchedule(c *gin.Context) {
 	if !bind(c, &body) {
 		return
 	}
-	if body.Seconds != 0 && (body.Seconds < 60 || body.Seconds > 86400) {
-		fail(c, 400, "定时读取间隔为 60–86400 秒，0 为关闭")
+	if body.Seconds != 0 && (body.Seconds < minReadEvery || body.Seconds > maxReadEvery) {
+		fail(c, 400, fmt.Sprintf("定时读取间隔为 %d–%d 秒，0 为关闭", minReadEvery, maxReadEvery))
 		return
 	}
 	a.updateConversation(c, func(conv *Conversation) { conv.ReadEvery = body.Seconds })

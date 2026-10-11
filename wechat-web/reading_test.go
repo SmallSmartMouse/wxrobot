@@ -88,18 +88,62 @@ func TestLiveSnapshotsIgnoreHistoryAndRecoverWithoutDeepRead(t *testing.T) {
 	}
 }
 
-func TestLiveModeDoesNotScheduleHistoricalOriginals(t *testing.T) {
+// 仅新增模式也补取最近消息里没取到的原图：停止点设在待取图片前面的那条文字，排在新消息读取之后。
+func TestLiveModeBackfillsRecentOriginals(t *testing.T) {
+	var until any
 	a := testApp(t)
-	addTestPhone(a, nil)
+	addTestPhone(a, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			until = body["until"]
+		}
+		w.Write([]byte(`{"id":"phone-task","status":"succeeded","result":{"messages":[]}}`))
+	}))
 	a.state.NewMessagesOnly = true
 	c := a.conversationLocked("acc", "小王")
+	c.Messages = []Message{{Text: "a", Direction: "incoming", Seq: 1}, {Text: "b", Direction: "incoming", Seq: 2}, imageMsg(""), {Text: "c", Direction: "incoming", Seq: 4}}
+	c.Messages[2].Seq = 3
+	c.LastSeq = 4
+	c.LiveAnchor, c.LiveReady = liveAnchorOf(c.Messages), true
 	c.OriginalsDue = true
-	if a.scheduleAutoRead("p1") {
-		t.Fatal("historical originals scheduled")
+	other := a.conversationLocked("acc", "小李")
+	other.NeedsRead = true
+	if !a.scheduleAutoRead("p1") || other.NeedsRead || !c.OriginalsDue {
+		t.Fatal("new message read should go first")
 	}
-	c.NeedsRead = true
-	if !a.scheduleAutoRead("p1") {
-		t.Fatal("new message trigger ignored")
+	if !a.scheduleAutoRead("p1") || c.OriginalsDue {
+		t.Fatal("originals backfill should be scheduled in live mode")
+	}
+	for _, op := range a.state.Operations {
+		if op.ConversationID == c.ID {
+			a.runOperation(context.Background(), "p1", op.ID)
+		}
+	}
+	if got, _ := json.Marshal(until); string(got) != `["b"]` {
+		t.Fatalf("until should be the text before the pending image: %s", got)
+	}
+}
+
+// 补取没有进展（图片没能定位，最早待取的位置没变）时不再安排补取，避免每分钟重复读取。
+func TestOriginalsBackfillStopsWithoutProgress(t *testing.T) {
+	a := testApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.NewMessagesOnly = true
+	c := a.conversationLocked("acc", "小王")
+	c.Kind = "person"
+	a.mergeLatestLocked(c, latestJSON("a"))
+	skipped := `{"at_latest":true,"messages":[{"text":"a","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","original_skipped":"没能在屏幕上定位这张图片"}]}`
+	op := &Operation{ID: "live", ConversationID: c.ID, Kind: "read", NewMessagesOnly: true, Auto: true, Limit: 30}
+	a.mergeLiveReadLocked(op, c, json.RawMessage(skipped))
+	if !c.OriginalsDue || c.firstPendingOriginal() < 0 {
+		t.Fatalf("new image should be due for originals: %+v", c.Messages)
+	}
+	c.OriginalsDue = false
+	a.mergeLiveReadLocked(op, c, json.RawMessage(skipped))
+	if c.OriginalsDue {
+		t.Fatal("no progress: must not schedule another backfill")
 	}
 }
 

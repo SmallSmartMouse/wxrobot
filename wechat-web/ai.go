@@ -35,7 +35,7 @@ const (
 	aiMaxTokens     = 600
 	aiHistorySize   = 20   // 作为上下文的最近消息条数
 	aiMaxInputRunes = 4000 // 上下文中单条消息最多的字数
-	maxReplyRunes   = 2000 // 发送接口的上限
+	maxMessageRunes = 2000 // 一条消息最多的字数：手机桥发送接口的上限
 )
 
 // replyFormatRule 格式限制独立于用户提示词，避免输出不能直接发送到微信的附件或矢量代码。
@@ -246,7 +246,7 @@ func (a *App) replyProblemLocked(c *Conversation, reply string, err error) strin
 	switch {
 	case err != nil:
 		return "AI 接口请求失败或超时，请检查地址、模型、密钥和额度"
-	case reply == "" || len([]rune(reply)) > maxReplyRunes:
+	case reply == "" || len([]rune(reply)) > maxMessageRunes:
 		return "AI 回复为空或超过 2000 字"
 	case strings.Contains(lower, "<svg") || strings.Contains(lower, "data:image/svg") || strings.Contains(lower, "```svg"):
 		return "AI 返回了矢量图内容，无法作为文字发送"

@@ -25,7 +25,11 @@ import (
 //go:embed static/*
 var assets embed.FS
 
-const dbPath = ".state/wechat.db"
+const (
+	dbPath            = ".state/wechat.db"
+	readHeaderTimeout = 5 * time.Second // 请求头必须在这之内读完，防止慢速连接占住服务
+	shutdownTimeout   = 5 * time.Second // 退出时等进行中的请求完成的上限
+)
 
 // main 读取配置、锁定数据目录、载入数据，然后启动后台循环和网页服务，直到收到退出信号。
 func main() {
@@ -77,10 +81,7 @@ func (a *App) start(ctx context.Context, config serverConfig) {
 		a.linkError = err.Error()
 		log.Printf("手机接入端口启动失败：%v", err)
 	}
-	a.mu.Lock()
-	a.running = true
-	a.syncPhonesLocked()
-	a.mu.Unlock()
+	a.startPhoneWorkers()
 	go a.aiLoop(ctx)
 	go a.forwardLoop(ctx)
 	if a.discoveryPort != 0 {
@@ -88,12 +89,20 @@ func (a *App) start(ctx context.Context, config serverConfig) {
 	}
 }
 
-// serveWeb 提供网页服务，直到 ctx 取消；退出时最多等 5 秒让进行中的请求完成。
+// startPhoneWorkers 标记服务已启动，为每台手机启动事件循环和 worker；之后新添加的手机也立即启动。
+func (a *App) startPhoneWorkers() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.running = true
+	a.syncPhonesLocked()
+}
+
+// serveWeb 提供网页服务，直到 ctx 取消；退出时等进行中的请求完成（最多 shutdownTimeout）。
 func serveWeb(ctx context.Context, address string, handler http.Handler) error {
-	server := &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: readHeaderTimeout}
 	go func() {
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()

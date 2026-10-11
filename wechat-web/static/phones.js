@@ -4,6 +4,10 @@ import { $, el, button, api, toast, accountLabel, accountName, app } from "./com
 import { deviceProblems, deviceStatus, deviceWarnings } from "./device-status.js";
 import { registerPage, openDrawer, phoneName, navigate, markDirty, icon } from "./workspace.js";
 
+const MAX_PHONE_NAME = 40; // 设备名称最多的字数，与服务端一致
+const CODE_LENGTH = 6; // 配对验证码的位数
+const COUNTDOWN_MS = 1000; // 配对倒计时的更新间隔
+
 let systemDirty = false;
 let discoveryDraft = null; // 编辑中的搜索设置，保存前不生效
 
@@ -119,7 +123,7 @@ app.showPhone = showPhone;
 function renameRow(p) {
   const name = el("input");
   name.value = p.name || "";
-  name.maxLength = 40;
+  name.maxLength = MAX_PHONE_NAME;
   name.placeholder = phoneName(p);
   name.setAttribute("aria-label", "设备别名");
   const rename = button("保存名称", "secondary", async () => {
@@ -196,10 +200,10 @@ function pairingCard(p) {
   const card = el("form", undefined, "pairing-card");
   card.dataset.id = p.id;
   const input = el("input", undefined, "pairing-code");
-  Object.assign(input, { type: "text", inputMode: "numeric", autocomplete: "one-time-code", maxLength: 6, pattern: "[0-9]{6}", required: true, placeholder: "000000" });
+  Object.assign(input, { type: "text", inputMode: "numeric", autocomplete: "one-time-code", maxLength: CODE_LENGTH, pattern: `[0-9]{${CODE_LENGTH}}`, required: true, placeholder: "000000" });
   input.setAttribute("aria-label", "手机验证码");
-  input.oninput = () => (input.value = input.value.replace(/[^0-9]/g, "").slice(0, 6));
-  const label = el("label", "输入手机上显示的 6 位验证码", "field");
+  input.oninput = () => (input.value = input.value.replace(/[^0-9]/g, "").slice(0, CODE_LENGTH));
+  const label = el("label", `输入手机上显示的 ${CODE_LENGTH} 位验证码`, "field");
   label.append(input);
   const checks = el("p", "", "pairing-checks");
   checks.dataset.role = "checks";
@@ -279,7 +283,7 @@ function renderNetworkRanges() {
   });
   $("network-list").replaceChildren(...rows);
   if (!rows.length) $("network-list").append(el("p", "尚未添加跨网段范围", "muted"));
-  $("network-count").textContent = `${count.toLocaleString()} / 4,096 个地址`;
+  $("network-count").textContent = `${count.toLocaleString()} / ${app.state.discovery.max_addresses.toLocaleString()} 个地址`;
   $("network-budget").value = count;
 }
 
@@ -387,4 +391,4 @@ $("system-discard").onclick = discardSystemSettings;
 // 配对倒计时每秒更新
 setInterval(() => {
   if (app.state && app.page === "system") renderPairings();
-}, 1000);
+}, COUNTDOWN_MS);

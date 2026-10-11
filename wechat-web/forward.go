@@ -11,6 +11,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"sort"
@@ -20,10 +21,13 @@ import (
 )
 
 const (
-	maxForwardRules   = 50
+	maxForwardRules   = 50              // 规则上限：每条来信都要逐条检查
 	maxForwardBacklog = 20              // 目标会话排队中的转发超过这么多条时，新的不再转发（手机一条条发，避免越积越多）
 	imageWaitLimit    = 3 * time.Minute // 图片等原图最多等这么久，之后用已有的缩略图转发
-	maxDedupMinutes   = 1440
+	maxDedupMinutes   = 1440            // 去重时间最长一天
+	maxRuleNameRunes  = 40              // 规则名称最多的字数
+	maxFilterItems    = 100             // 发送人、包含词、排除词各自的上限：每条来信都要逐个比较
+	maxTemplateRunes  = 200             // 转发格式最多的字数
 )
 
 // ForwardRule 是一条转发规则。过滤条件都为空时，源会话的所有来信（文字；开启图片时含图片）都转发。
@@ -72,8 +76,8 @@ func (r *ForwardRule) validate(conversations map[string]*Conversation) error {
 	r.Regex = strings.TrimSpace(r.Regex)
 	r.Template = strings.TrimSpace(r.Template)
 	switch {
-	case utf8.RuneCountInString(r.Name) > 40:
-		return errors.New("规则名称最多 40 字")
+	case utf8.RuneCountInString(r.Name) > maxRuleNameRunes:
+		return fmt.Errorf("规则名称最多 %d 字", maxRuleNameRunes)
 	case len(r.Sources) == 0 || len(r.Targets) == 0:
 		return errors.New("请选择源会话和转发目标")
 	}
@@ -81,14 +85,14 @@ func (r *ForwardRule) validate(conversations map[string]*Conversation) error {
 		return err
 	}
 	switch {
-	case len(r.Senders) > 100 || len(r.Include) > 100 || len(r.Exclude) > 100:
-		return errors.New("发送人和关键词各最多 100 个")
+	case len(r.Senders) > maxFilterItems || len(r.Include) > maxFilterItems || len(r.Exclude) > maxFilterItems:
+		return fmt.Errorf("发送人和关键词各最多 %d 个", maxFilterItems)
 	case r.compile() != nil:
 		return errors.New("正则表达式无效：" + r.Regex)
 	case r.DedupMinutes < 0 || r.DedupMinutes > maxDedupMinutes:
-		return errors.New("去重时间为 0–1440 分钟")
-	case r.Template != "" && (!strings.Contains(r.Template, "{text}") || utf8.RuneCountInString(r.Template) > 200):
-		return errors.New("转发格式必须包含 {text}，最多 200 字")
+		return fmt.Errorf("去重时间为 0–%d 分钟", maxDedupMinutes)
+	case r.Template != "" && (!strings.Contains(r.Template, "{text}") || utf8.RuneCountInString(r.Template) > maxTemplateRunes):
+		return fmt.Errorf("转发格式必须包含 {text}，最多 %d 字", maxTemplateRunes)
 	}
 	return nil
 }
@@ -159,7 +163,7 @@ func (r *ForwardRule) format(c *Conversation, m Message) string {
 		// 一次替换完，原文里的 {sender} 等字样不会被再次替换
 		text = strings.NewReplacer("{text}", m.Text, "{sender}", m.Sender, "{chat}", c.Title).Replace(r.Template)
 	}
-	return truncateRunes(text, maxReplyRunes)
+	return truncateRunes(text, maxMessageRunes)
 }
 
 // dedupKey 去重用的键：同一规则里相同的原文；图片每次截图字节不同，不去重，返回空。
@@ -170,6 +174,7 @@ func (r *ForwardRule) dedupKey(m Message) string {
 	return r.ID + "\x00" + m.Text
 }
 
+// containsAny 文字是否包含 words 中的任意一个。
 func containsAny(text string, words []string) bool {
 	for _, w := range words {
 		if strings.Contains(text, w) {
@@ -189,7 +194,7 @@ func forwardable(m Message) bool {
 // 已不在补取范围内），或已经等了 imageWaitLimit。index 是消息在 c.Messages 中的位置。
 func imageReady(c *Conversation, index int) bool {
 	m := c.Messages[index]
-	if m.OriginalHash != "" || !c.wantsOriginals() || m.OriginalTries >= 2 || index < len(c.Messages)-originalWindow {
+	if m.OriginalHash != "" || !c.wantsOriginals() || m.OriginalTries >= maxOriginalTries || index < len(c.Messages)-originalWindow {
 		return true
 	}
 	observed := parseStamp(m.Time)
@@ -201,12 +206,17 @@ func imageReady(c *Conversation, index int) bool {
 // forwardLoop 每秒检查一次源会话的新来信，按规则建立转发任务。
 func (a *App) forwardLoop(ctx context.Context) {
 	for pause(ctx, time.Second) {
-		a.mu.Lock()
-		if a.forwardLocked() {
-			_ = a.commitLocked()
-			a.wakeWorker()
-		}
-		a.mu.Unlock()
+		a.forwardNewMessages()
+	}
+}
+
+// forwardNewMessages 处理一轮新来信；建立了转发任务就保存并唤醒 worker 发送。
+func (a *App) forwardNewMessages() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.forwardLocked() {
+		_ = a.commitLocked()
+		a.wakeWorker()
 	}
 }
 

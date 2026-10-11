@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
@@ -19,6 +20,16 @@ import (
 )
 
 // 图片统一存为 JPEG，文件名是内容的 SHA-256，网页通过 /api/media/{hash} 访问。
+
+const (
+	maxThumbnailBytes  = 400000 // 手机截取的缩略图最大字节数（Base64 解码后）
+	maxThumbnailWidth  = 1080   // 缩略图不会超过手机屏幕的尺寸
+	maxThumbnailHeight = 1920
+	maxUploadSide      = 4096     // 网页上传图片的最大边长：再大微信也会压缩，只是白占空间
+	uploadQuality      = 92       // 上传图片转 JPEG 的质量
+	originalQuality    = 95       // 原图（PNG/GIF）转 JPEG 的质量：尽量保留清晰度
+	mediaCacheSeconds  = 31536000 // 图片在浏览器缓存一年：文件名是内容哈希，内容不会变
+)
 
 // mediaPath 返回图片文件路径；hash 必须是 64 位十六进制（防止路径穿越），否则返回 false。
 func (a *App) mediaPath(hash string) (string, bool) {
@@ -46,11 +57,11 @@ func (a *App) storeJPEG(data []byte) (string, error) {
 // saveThumbnail 保存手机截取的聊天图片缩略图，返回哈希或错误说明。
 func (a *App) saveThumbnail(b64 string) (hash, problem string) {
 	data, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil || len(data) > 400000 {
+	if err != nil || len(data) > maxThumbnailBytes {
 		return "", "图片编码无效或过大"
 	}
 	// 只检查 JPEG 头和尺寸（不超过手机屏幕），不重新编码
-	if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > 1080 || cfg.Height > 1920 {
+	if cfg, err := jpeg.DecodeConfig(bytes.NewReader(data)); err != nil || cfg.Width > maxThumbnailWidth || cfg.Height > maxThumbnailHeight {
 		return "", "图片格式或尺寸无效"
 	}
 	if hash, err = a.storeJPEG(data); err != nil {
@@ -74,8 +85,8 @@ func (a *App) saveImage(encoded string) (string, error) {
 	}
 	// 先只读头部检查格式和尺寸，避免解码超大图片
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil || (format != "png" && format != "jpeg") || cfg.Width > 4096 || cfg.Height > 4096 {
-		return "", errors.New("只支持 4096×4096 以内的 PNG 或 JPEG 图片")
+	if err != nil || (format != "png" && format != "jpeg") || cfg.Width > maxUploadSide || cfg.Height > maxUploadSide {
+		return "", fmt.Errorf("只支持 %d×%d 以内的 PNG 或 JPEG 图片", maxUploadSide, maxUploadSide)
 	}
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
@@ -83,7 +94,7 @@ func (a *App) saveImage(encoded string) (string, error) {
 	}
 	// 统一转成 JPEG 保存
 	var buf bytes.Buffer
-	if err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 92}); err != nil {
+	if err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: uploadQuality}); err != nil {
 		return "", errors.New("图片转换失败")
 	}
 	hash, err := a.storeJPEG(buf.Bytes())
@@ -105,7 +116,7 @@ func (a *App) saveOriginal(data []byte) (string, error) {
 			return "", errors.New("原图已损坏")
 		}
 		var buf bytes.Buffer
-		if err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
+		if err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: originalQuality}); err != nil {
 			return "", errors.New("原图转换失败")
 		}
 		return a.storeJPEG(buf.Bytes())
@@ -155,7 +166,7 @@ func (a *App) uploadMedia(c *gin.Context) {
 	c.JSON(200, gin.H{"image_hash": hash})
 }
 
-// getMedia 返回图片文件。文件名是内容哈希，内容不会变，允许浏览器长期缓存，避免刷新时重复加载图片。
+// getMedia 返回图片文件，允许浏览器长期缓存，避免刷新时重复加载图片。
 func (a *App) getMedia(c *gin.Context) {
 	path, ok := a.mediaPath(c.Param("hash"))
 	if !ok {
@@ -163,6 +174,6 @@ func (a *App) getMedia(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "image/jpeg")
-	c.Header("Cache-Control", "private, max-age=31536000, immutable")
+	c.Header("Cache-Control", fmt.Sprintf("private, max-age=%d, immutable", mediaCacheSeconds))
 	c.File(path)
 }

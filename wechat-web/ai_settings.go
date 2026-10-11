@@ -5,11 +5,18 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+)
+
+const (
+	minReplyInterval = 5     // 秒：同一会话两次生成的最短间隔下限，避免对方连发时连续回复刷屏
+	maxReplyInterval = 86400 // 秒：最长一天
+	maxAIRules       = 100   // 名称规则上限：每个会话每秒都要逐条匹配，规则过多会拖慢检查
 )
 
 // AccountAIConfig 是一个微信号的覆盖设置，只保存明确覆盖的部分：Prompt、Vision 为 nil 时跟随全局。
@@ -45,8 +52,8 @@ func (s AISetting) validate(kind string) error {
 	if s.Mode != aiOff && s.Mode != aiAuto {
 		return errors.New("回复方式必须为 off 或 auto")
 	}
-	if s.IntervalSeconds < 5 || s.IntervalSeconds > 86400 {
-		return errors.New("回复周期必须为 5–86400 秒")
+	if s.IntervalSeconds < minReplyInterval || s.IntervalSeconds > maxReplyInterval {
+		return fmt.Errorf("回复周期必须为 %d–%d 秒", minReplyInterval, maxReplyInterval)
 	}
 	if s.Mode == aiAuto && kind == kindUnknown {
 		return errors.New("自动回复前请先设置会话类型")
@@ -69,8 +76,8 @@ func normalizeModel(cfg *AIConfig) error {
 
 // validateAIRules 检查名称规则：最多 100 条；类型、表达式必填，回复方式和间隔合法，正则能编译。
 func validateAIRules(rules []AIRule) error {
-	if len(rules) > 100 {
-		return errors.New("最多 100 条名称规则")
+	if len(rules) > maxAIRules {
+		return fmt.Errorf("最多 %d 条名称规则", maxAIRules)
 	}
 	for _, rule := range rules {
 		if err := rule.validate(rule.Kind); err != nil {

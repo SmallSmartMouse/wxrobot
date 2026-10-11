@@ -91,7 +91,7 @@ func newApp(path string) (*App, error) {
 		links:           map[string]phoneConn{},
 		pairings:        map[string]*phonePairing{},
 		linkAttempts:    map[string]time.Time{},
-		linkSlots:       make(chan struct{}, 32),
+		linkSlots:       make(chan struct{}, maxLinkSessions),
 		discoveryWake:   make(chan struct{}, 1),
 		discoveryPort:   defaultDiscoveryPort,
 		discoveryNonces: map[string]time.Time{},
@@ -167,9 +167,15 @@ func parseStamp(s string) time.Time {
 	return t
 }
 
+// shortIDLength 手机、转发规则等少量记录的编号长度（十六进制位数）：数量少，12 位不会重复，网页上也便于辨认。
+const shortIDLength = 12
+
+// shortID 生成 12 位十六进制随机编号。
+func shortID() string { return randomID()[:shortIDLength] }
+
 // randomID 生成 32 位十六进制随机编号，用于任务、AI 记录等。
 func randomID() string {
-	b := make([]byte, 16)
+	b := make([]byte, 16) // 128 位随机数：全局不会重复
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}

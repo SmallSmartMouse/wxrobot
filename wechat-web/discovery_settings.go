@@ -16,6 +16,9 @@ const (
 	maxDiscoveryAddresses = 4096 // 所有网段合计的地址上限
 	maxNetworkAddresses   = 1024 // 单个网段的地址上限（/22）
 	maxDiscoveryNetworks  = 8
+	defaultDiscoveryGap   = 30  // 秒：默认每轮搜索的间隔，手机开机后半分钟内能被发现
+	minDiscoveryGap       = 10  // 秒：搜索太频繁会占用网络
+	maxDiscoveryGap       = 300 // 秒：再长，新手机要等太久才能连上
 )
 
 type DiscoverySettings struct {
@@ -33,8 +36,9 @@ type discoveryProgress struct {
 	LastScan  string `json:"last_scan"`
 }
 
+// defaultDiscoverySettings 默认的搜索设置：定时搜索本地网络，不跨网段。
 func defaultDiscoverySettings() DiscoverySettings {
-	return DiscoverySettings{Enabled: true, LocalBroadcast: true, Networks: []string{}, IntervalSeconds: 30}
+	return DiscoverySettings{Enabled: true, LocalBroadcast: true, Networks: []string{}, IntervalSeconds: defaultDiscoveryGap}
 }
 
 // discoveryEnabledLocked 服务配置开启了发现端口，且网页设置里开启了自动搜索。
@@ -43,8 +47,8 @@ func (a *App) discoveryEnabledLocked() bool { return a.discoveryPort != 0 && a.s
 // validateDiscoverySettings 校验并规范化搜索设置，返回规范化后的设置、网段和地址总数。
 // 网段限制在私有 IPv4 地址；先核算上限，再展开地址，避免超大网段分配内存。
 func validateDiscoverySettings(s DiscoverySettings) (DiscoverySettings, []netip.Prefix, int, error) {
-	if s.IntervalSeconds < 10 || s.IntervalSeconds > 300 {
-		return s, nil, 0, errors.New("搜索间隔请设置为 10～300 秒")
+	if s.IntervalSeconds < minDiscoveryGap || s.IntervalSeconds > maxDiscoveryGap {
+		return s, nil, 0, fmt.Errorf("搜索间隔请设置为 %d～%d 秒", minDiscoveryGap, maxDiscoveryGap)
 	}
 	if len(s.Networks) > maxDiscoveryNetworks {
 		return s, nil, 0, fmt.Errorf("最多添加 %d 个网段", maxDiscoveryNetworks)

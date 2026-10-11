@@ -1,6 +1,19 @@
 // 网页公共工具：元素创建、接口调用、提示、浏览器本地存储和显示格式。
 
 export const $ = (id) => document.getElementById(id);
+
+// 与服务端、手机桥一致的上限
+export const MAX_MESSAGE_LENGTH = 2000; // 一条消息最多的字数
+export const MAX_READ_LIMIT = 100; // 一次读取最多的条数
+export const DEFAULT_REPLY_INTERVAL = 30; // AI 回复默认的最短间隔（秒）
+
+const TOAST_MS = 5000; // 提示显示的时长
+const BADGE_MAX = 99; // 角标最多显示到 99，再多显示“99+”
+
+// badgeText 角标文字：超过 99 显示“99+”。
+export function badgeText(count) {
+    return count > BADGE_MAX ? BADGE_MAX + "+" : String(count);
+}
 export const KINDS = { unknown: "待分类", person: "联系人", group: "群聊" };
 
 // app 是各功能模块共享的数据和操作：app.js 启动时设置，其他模块只读取和调用。
@@ -39,12 +52,12 @@ export function checkbox(checked, key) {
 // ---------- 接口与提示 ----------
 
 let toastTimer;
-// toast 在页面底部显示提示，5 秒后消失。
+// toast 在页面底部显示提示，一会儿后消失。
 export function toast(text) {
     $("toast").textContent = text;
     $("toast").hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => ($("toast").hidden = true), 5000);
+    toastTimer = setTimeout(() => ($("toast").hidden = true), TOAST_MS);
 }
 
 // api 调用 /api/ 接口：有 body 时 POST JSON，否则 GET；失败时抛出带服务端说明的错误。

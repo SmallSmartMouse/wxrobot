@@ -2,7 +2,11 @@ package main
 
 // 转发规则的网页接口：列出规则和转发情况，逐条保存、删除（不整体替换，避免覆盖别处同时修改的其他规则）。
 
-import "github.com/gin-gonic/gin"
+import (
+	"fmt"
+
+	"github.com/gin-gonic/gin"
+)
 
 // forwardRuleView 网页上的一条规则：规则本身，加上最近的转发情况。
 type forwardRuleView struct {
@@ -69,12 +73,12 @@ func (a *App) saveForwardRule(c *gin.Context) {
 		fail(c, 404, "规则已删除，请刷新")
 		return
 	case index < 0 && len(a.state.ForwardRules) >= maxForwardRules:
-		fail(c, 400, "最多 50 条规则")
+		fail(c, 400, fmt.Sprintf("最多 %d 条规则", maxForwardRules))
 		return
 	}
 	old := append([]ForwardRule(nil), a.state.ForwardRules...)
 	if index < 0 {
-		rule.ID = randomID()[:12]
+		rule.ID = shortID()
 		a.state.ForwardRules = append(a.state.ForwardRules, rule)
 	} else {
 		a.state.ForwardRules[index] = rule

@@ -16,6 +16,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	maxRequestBytes = 16 << 20         // 请求体上限：最大的是上传图片（Base64）
+	stateOperations = 50               // 总览里返回的最近任务数
+	sseKeepalive    = 15 * time.Second // SSE 保活间隔：防止代理和浏览器把空闲连接断开
+)
+
 // handler 注册所有接口；不是接口的路径返回内嵌的网页文件。
 func (a *App) handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
@@ -85,8 +91,7 @@ func (a *App) localOnly(c *gin.Context) {
 		c.Abort()
 		return
 	}
-	// 请求体最多 16 MB（上传图片）
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<20)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBytes)
 }
 
 // fromLocal 请求来自本机（或已允许远程来源）。
@@ -179,9 +184,9 @@ func (a *App) conversationSummariesLocked() []Conversation {
 	return conversations
 }
 
-// operationSummariesLocked 最近 50 个任务（新的在前）加上更早但还没结束的；步骤明细只在诊断页显示。
+// operationSummariesLocked 最近的任务（新的在前）加上更早但还没结束的；步骤明细只在诊断页显示。
 func (a *App) operationSummariesLocked() []*Operation {
-	operations := a.recentOperationsLocked(50)
+	operations := a.recentOperationsLocked(stateOperations)
 	listed := map[string]bool{}
 	for _, op := range operations {
 		listed[op.ID] = true
@@ -199,12 +204,12 @@ func (a *App) operationSummariesLocked() []*Operation {
 	return operations
 }
 
-// stream 是 SSE：数据有变化时推送 refresh，网页收到后重新拉取；每 15 秒发一次保活。
+// stream 是 SSE：数据有变化时推送 refresh，网页收到后重新拉取；定时发保活。
 func (a *App) stream(c *gin.Context) {
 	ch := a.addListener()
 	defer a.removeListener(ch)
 	c.Header("Content-Type", "text/event-stream")
-	keepalive := time.NewTicker(15 * time.Second)
+	keepalive := time.NewTicker(sseKeepalive)
 	defer keepalive.Stop()
 	for {
 		select {

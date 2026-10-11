@@ -11,6 +11,8 @@ export const STATUS = {
   unknown: "结果未知",
 };
 
+const STICK_PX = 80; // 离底部这么近就算停在底部，新消息自动跟随
+
 const list = { conversationId: null, nodes: new Map(), stick: true, unseen: 0 };
 
 // resetMessageList 重新打开会话时调用：下次渲染时跳到最新消息。
@@ -100,10 +102,10 @@ function showChildren(children, opened, added) {
   }
 }
 
-// atBottom 消息列表是否停在底部（距底部 80 像素以内）。
+// atBottom 消息列表是否停在底部。
 function atBottom() {
   const box = $("messages");
-  return box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  return box.scrollHeight - box.scrollTop - box.clientHeight < STICK_PX;
 }
 
 // scrollToLatest 滚到最新消息，并清除新消息提示。

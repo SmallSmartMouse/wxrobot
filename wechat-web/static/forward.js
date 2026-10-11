@@ -6,6 +6,13 @@ import { deviceStatus, deviceProblems } from "./device-status.js";
 
 const editor = $("forward-editor");
 const discard = $("forward-discard");
+// 与服务端一致的规则上限
+const MAX_NAME = 40; // 规则名称最多的字数
+const MAX_FILTER_ITEMS = 100; // 发送人、包含词、排除词各自的上限
+const MAX_DEDUP_MINUTES = 1440; // 去重时间最长一天
+const MAX_TEMPLATE = 200; // 转发格式最多的字数
+const DEFAULT_DEDUP_MINUTES = 30; // 新规则默认的去重时间
+const SHOWN_ROUTES = 3; // 已选会话超过这么多时折叠
 const SAMPLE = { text: "客户需要售后帮助，请尽快联系。", sender: "王宁", chat: "客户服务群" }; // 格式预览的示例
 
 let rules = []; // 已保存的规则
@@ -15,7 +22,7 @@ let baseline = ""; // 打开编辑框时规则的签名，用来判断有没有�
 let includeWords = []; // 编辑中的包含关键词
 let openPicker = null; // 展开的会话选择：sources | targets
 let healthKey = ""; // 会话和设备的快照，变了才重绘编辑框里的设备状态
-const expanded = { sources: false, targets: false }; // 已选会话超过 3 个时是否展开
+const expanded = { sources: false, targets: false }; // 已选会话折叠时是否展开
 
 const conversations = () => app.state?.conversations || [];
 const phones = () => app.state?.phones || [];
@@ -117,7 +124,7 @@ async function deleteRule(rule) {
 
 // edit 打开编辑框；rule 为 null 时新建。
 function edit(rule) {
-  draft = structuredClone(rule || { enabled: true, sources: [], targets: [], dedup_minutes: 30 });
+  draft = structuredClone(rule || { enabled: true, sources: [], targets: [], dedup_minutes: DEFAULT_DEDUP_MINUTES });
   draft.sources ||= [];
   draft.targets ||= [];
   draft.target_phones ||= {};
@@ -359,18 +366,18 @@ function targetHealth(id) {
   return { policy: `自动选择 · ${available.length} 台可用`, text };
 }
 
-// renderSelected 已选的来源或目标（超过 3 个时折叠），目标附带设备策略，来源附带能否读取的提示。
+// renderSelected 已选的来源或目标（较多时折叠），目标附带设备策略，来源附带能否读取的提示。
 function renderSelected(kind) {
   const box = $("f-" + kind),
     ids = draft[kind];
   box.tabIndex = -1;
   const openedPolicy = box.querySelector(".forward-policy[open]")?.dataset.target;
   $("f-" + kind + "-count").textContent = ids.length + " 个";
-  box.replaceChildren(...(expanded[kind] ? ids : ids.slice(0, 3)).map((id) => selectedRow(kind, id, openedPolicy)));
+  box.replaceChildren(...(expanded[kind] ? ids : ids.slice(0, SHOWN_ROUTES)).map((id) => selectedRow(kind, id, openedPolicy)));
   if (!ids.length) box.append(el("p", "尚未选择会话", "forward-empty"));
-  if (ids.length > 3)
+  if (ids.length > SHOWN_ROUTES)
     box.append(
-      button(expanded[kind] ? "收起列表" : `另有 ${ids.length - 3} 个，展开查看`, "forward-more", () => {
+      button(expanded[kind] ? "收起列表" : `另有 ${ids.length - SHOWN_ROUTES} 个，展开查看`, "forward-more", () => {
         expanded[kind] = !expanded[kind];
         renderSelected(kind);
       }),
@@ -479,12 +486,12 @@ function validate(rule) {
   if (rule.targets.some((id) => rule.sources.includes(id))) return fieldError("来源和目标不能是同一个会话。", "f-targets");
   if (rule.targets.some((id) => !conv(id).kind || conv(id).kind === "unknown")) return fieldError("请先在消息台设置目标会话类型。", "f-targets");
   if (rule.targets.some((id) => targetHealth(id).error)) return fieldError("指定设备已移除或不属于目标微信号，请重新选择执行设备。", "f-targets");
-  if (Array.from(rule.name).length > 40) return fieldError("规则名称最多 40 字", "f-name");
-  if (Math.max(rule.include.length, rule.exclude.length, rule.senders.length) > 100) return fieldError("发送人和关键词各最多 100 个", "f-include");
-  if (!$("f-dedup").value || !Number.isInteger(rule.dedup_minutes) || rule.dedup_minutes < 0 || rule.dedup_minutes > 1440)
-    return fieldError("去重时间为 0–1440 的整数分钟", "f-dedup");
-  if (customFormat() && (!rule.template.includes("{text}") || Array.from(rule.template).length > 200))
-    return fieldError("自定义格式必须包含 {text}，最多 200 字", "f-template");
+  if (Array.from(rule.name).length > MAX_NAME) return fieldError(`规则名称最多 ${MAX_NAME} 字`, "f-name");
+  if (Math.max(rule.include.length, rule.exclude.length, rule.senders.length) > MAX_FILTER_ITEMS) return fieldError(`发送人和关键词各最多 ${MAX_FILTER_ITEMS} 个`, "f-include");
+  if (!$("f-dedup").value || !Number.isInteger(rule.dedup_minutes) || rule.dedup_minutes < 0 || rule.dedup_minutes > MAX_DEDUP_MINUTES)
+    return fieldError(`去重时间为 0–${MAX_DEDUP_MINUTES} 的整数分钟`, "f-dedup");
+  if (customFormat() && (!rule.template.includes("{text}") || Array.from(rule.template).length > MAX_TEMPLATE))
+    return fieldError(`自定义格式必须包含 {text}，最多 ${MAX_TEMPLATE} 字`, "f-template");
   return true;
 }
 

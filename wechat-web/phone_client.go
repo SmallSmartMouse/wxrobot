@@ -15,8 +15,10 @@ import (
 // phoneCallTimeout 一次请求等手机响应的上限：事件长轮询最多等 20 秒，留出余量。
 const phoneCallTimeout = 35 * time.Second
 
-// maxOriginalBytes 一张原图文件的上限。
-const maxOriginalBytes = 40 << 20
+const (
+	maxOriginalBytes = 40 << 20  // 一张原图文件的上限：手机拍的大图也在这之内
+	maxChunkBytes    = 256 << 10 // 原图分块的上限：与手机桥的 FILE_CHUNK_BYTES 一致，避免一条消息过大
+)
 
 // phoneConn 是到一台手机的请求通道。正式运行时是手机主动建立的 WSS 连接，测试时用内存实现代替。
 type phoneConn interface {
@@ -99,7 +101,7 @@ func rejection(response linkMessage) *phoneError {
 	return &phoneError{response.Status, fault.Error.Message}
 }
 
-// phoneDownload 分块下载手机上的文件（原图），每块最多 256 KB，全部取完后通知手机删除。
+// phoneDownload 分块下载手机上的文件（原图），全部取完后通知手机删除。
 func (a *App) phoneDownload(ctx context.Context, phoneID, path string) ([]byte, error) {
 	var data []byte
 	for {
@@ -132,7 +134,7 @@ func (a *App) downloadChunk(ctx context.Context, phoneID, path string, offset in
 		return nil, 0, errors.New("原图大小无效")
 	}
 	chunk, err := base64.StdEncoding.DecodeString(part.Data)
-	if err != nil || len(chunk) > 256<<10 || offset+len(chunk) > part.Size {
+	if err != nil || len(chunk) > maxChunkBytes || offset+len(chunk) > part.Size {
 		return nil, 0, errors.New("原图分块无效")
 	}
 	return chunk, part.Size, nil

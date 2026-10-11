@@ -9,12 +9,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
+
+// maxPhoneNameRunes 设备名称最多的字数。
+const maxPhoneNameRunes = 40
 
 // 网页上显示的手机连接状态
 const (
@@ -364,7 +368,7 @@ func (a *App) deletePhone(c *gin.Context) {
 	a.saved(c, gin.H{"ok": true})
 }
 
-// renamePhone 设置设备名称（最多 40 字，空为不设置）。
+// renamePhone 设置设备名称（空为不设置）。
 func (a *App) renamePhone(c *gin.Context) {
 	var body struct {
 		Name string `json:"name"`
@@ -373,8 +377,8 @@ func (a *App) renamePhone(c *gin.Context) {
 		return
 	}
 	name := strings.TrimSpace(body.Name)
-	if len([]rune(name)) > 40 {
-		fail(c, 400, "设备名称最多 40 字")
+	if len([]rune(name)) > maxPhoneNameRunes {
+		fail(c, 400, fmt.Sprintf("设备名称最多 %d 字", maxPhoneNameRunes))
 		return
 	}
 	a.mu.Lock()

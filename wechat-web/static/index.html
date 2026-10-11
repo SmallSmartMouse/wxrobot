@@ -277,17 +277,25 @@
           <label class="compact-check"><input type="checkbox" id="diag-auto" role="switch" checked>自动刷新</label>
           <button class="secondary" id="diag-refresh" aria-label="刷新诊断" title="刷新诊断"><span data-icon="refresh"></span></button>
         </div>
-        <small id="diag-status" class="muted">最近 100 个任务，筛选仅作用于已加载数据</small>
+        <small id="diag-status" class="muted">最近 100 个手机任务、50 条 AI 记录，筛选仅作用于已加载数据</small>
       </div>
       <div id="diag-error" class="form-error" role="alert"></div>
       <div id="diag-warning" class="info-strip warning" hidden></div>
       <section id="diag-device-health" class="panel" aria-label="当前设备状态"></section>
       <section class="panel">
-        <nav class="tabs" aria-label="诊断分类">
-          <button data-diag-filter="issues" class="selected">需要关注</button>
-          <button data-diag-filter="all">全部</button>
-          <button data-diag-filter="ai">AI 任务</button>
-        </nav>
+        <div class="diagnostic-filters">
+          <label>任务类型<select id="diag-task-type">
+            <option value="all">全部类型</option>
+            <option value="read">读取消息</option>
+            <option value="send">发送消息</option>
+            <option value="ai">AI 回复</option>
+          </select></label>
+          <label>显示范围<select id="diag-task-scope">
+            <option value="issues">需要关注</option>
+            <option value="all">全部任务</option>
+          </select></label>
+        </div>
+        <p class="muted">需要关注：失败、结果未知或有降级警告的任务。AI 回复生成后，还需查看发送结果。</p>
         <div id="diag-tasks"></div>
       </section>
       <details class="panel" id="diag-events"><summary>设备异常与降级</summary><div id="diag-event-list"></div></details>

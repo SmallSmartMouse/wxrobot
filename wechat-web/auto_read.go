@@ -3,7 +3,7 @@ package main
 // 自动读取：worker 空闲时挑一个需要读取的会话建立读取任务。
 //   - 收到通知或未读提示：距上次读取满 5 秒即读（优先）
 //   - 开启了定时读取：距上次读取满设定间隔
-//   - 还有图片没取原图：距上次读取满 1 分钟（仅新增模式不回头取历史原图）
+//   - 还有图片没取原图：距上次读取满 1 分钟（只补最近 originalWindow 条消息里的图片）
 //
 // 同类会话中先读最久没读的。自动读取失败或没读到内容时按退避稍后重读。
 
@@ -15,7 +15,11 @@ const (
 	shallowRead      = 30               // 没有已记录的文字可作停止点时，自动读取的条数
 	deepRead         = 100              // 有停止点时自动读取的条数（读到已记录的消息就停）；也是接不上时加深读取的条数
 	readRetryBase    = 30 * time.Second // 自动读取失败后第一次重读的等待时间，之后每次加倍
-	readRetryMax     = 10 * time.Minute
+	readRetryMax     = 10 * time.Minute // 退避的上限：手机脚本过旧这类不会自己恢复的错误，最慢 10 分钟试一次
+	stopTextCount    = 3                // 历史模式的停止点条数：3 条文字连续相同才认定读到了已有记录，减少误判
+	liveStopTexts    = 1                // 仅新增模式的停止点条数：只为翻回上次读到的位置，1 条即可衔接，少翻页
+	originalsPerRead = 2                // 一次自动读取最多取几张原图：点开大图很慢，多了会长时间占住手机
+	maxOriginalTries = 2                // 一张图片取原图失败几次后不再尝试
 )
 
 // 自动读取的原因，按优先级从高到低
@@ -82,7 +86,7 @@ func (a *App) autoReadReasonLocked(c *Conversation) (string, time.Time) {
 		return readForNotice, last
 	case c.ReadEvery > 0 && since >= time.Duration(c.ReadEvery)*time.Second:
 		return readForSchedule, last
-	case !a.state.NewMessagesOnly && c.OriginalsDue && since >= originalsReadGap:
+	case c.OriginalsDue && since >= originalsReadGap:
 		return readForOriginals, last
 	}
 	return "", last
@@ -112,6 +116,7 @@ func (a *App) queueReadLocked(c *Conversation, limit int, reason string) {
 func (a *App) retryReadLocked(c *Conversation) {
 	c.ReadFailures++
 	c.NeedsRead = true
+	// 加倍最多 6 次（30 秒 × 64 已超过上限），防止移位溢出；结果再受 readRetryMax 限制
 	c.ReadRetryAt = stamp(time.Now().Add(min(readRetryBase<<min(c.ReadFailures-1, 6), readRetryMax)))
 }
 
@@ -124,7 +129,7 @@ func autoReadUntil(c *Conversation) []string {
 			known = c.Messages[:i]
 		}
 	}
-	return lastTexts(c.withAnchor(known), 3)
+	return lastTexts(c.withAnchor(known), stopTextCount)
 }
 
 // lastTexts 返回最后 n 条文字消息（跳过图片、表情和系统提示，它们无法区分位置）。
@@ -138,11 +143,29 @@ func lastTexts(messages []Message, n int) []string {
 	return texts
 }
 
+// liveOriginalsUntil 仅新增模式补取原图时的停止点：最早一张待取原图的图片之前的最后 1 条文字，
+// 手机向上翻回那里（最多 NEW_ONLY_MAX_PAGES 页），这张图片就落在“新消息”范围里，由手机点开取原图。
+func liveOriginalsUntil(c *Conversation) []string {
+	i := c.firstPendingOriginal()
+	if i < 0 {
+		return lastTexts(c.LiveAnchor, liveStopTexts)
+	}
+	return lastTexts(c.withAnchor(c.Messages[:i]), liveStopTexts)
+}
+
+// noteOriginalsProgress 合并后还有图片没取原图、且最早待取的位置变了（新到了图片，或上一张已取到）时，
+// 安排稍后补取。位置没变（例如图片没能在屏幕上定位）不再安排，等有新进展时再取，避免每分钟重复读取同一处。
+func (c *Conversation) noteOriginalsProgress(pendingBefore int) {
+	if pending := c.firstPendingOriginal(); c.wantsOriginals() && pending >= 0 && pending != pendingBefore {
+		c.OriginalsDue = true
+	}
+}
+
 // firstPendingOriginal 返回最近 originalWindow 条消息中最早一张还需要取原图的图片位置，没有返回 -1。
 func (c *Conversation) firstPendingOriginal() int {
 	for i := max(0, len(c.Messages)-originalWindow); i < len(c.Messages); i++ {
 		m := c.Messages[i]
-		if m.Kind == msgImage && m.OriginalHash == "" && m.OriginalTries < 2 {
+		if m.Kind == msgImage && m.OriginalHash == "" && m.OriginalTries < maxOriginalTries {
 			return i
 		}
 	}

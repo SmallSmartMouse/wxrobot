@@ -18,7 +18,9 @@ import (
 const (
 	defaultDiscoveryPort = 39000
 	discoveryRequestType = "wxrobot-discover-v2"
-	discoveryNonceTTL    = 2 * time.Minute // 发现请求的挑战有效期：手机须在这之内连过来才能配对
+	discoveryNonceTTL    = 2 * time.Minute        // 发现请求的挑战有效期：手机须在这之内连过来才能配对
+	discoveryBurst       = 32                     // 每发这么多个请求暂停一次
+	discoveryBurstPause  = 125 * time.Millisecond // 合计约 256 包/秒：跨网段单播不至于冲击路由器和防火墙
 )
 
 // discoveryLoop 按设置定时搜索；关闭自动搜索时只等网页点“搜索设备”唤醒。
@@ -38,6 +40,13 @@ func (a *App) discoveryLoop(ctx context.Context) {
 	}
 }
 
+// discoveryEnabled 加锁后调用 discoveryEnabledLocked。
+func (a *App) discoveryEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.discoveryEnabledLocked()
+}
+
 // discoverySettings 当前的搜索设置。
 func (a *App) discoverySettings() DiscoverySettings {
 	a.mu.Lock()
@@ -54,9 +63,13 @@ func (a *App) searchPhones(ctx context.Context, settings DiscoverySettings) {
 	if err == nil {
 		err = a.sendDiscovery(ctx, targets)
 	}
-	if ctx.Err() != nil {
-		return
+	if ctx.Err() == nil { // 服务正在退出时不再更新
+		a.finishSearch(err)
 	}
+}
+
+// finishSearch 一轮搜索结束：记下出错原因（没有就清空）和搜索时间，通知网页。
+func (a *App) finishSearch(err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.discoveryError = ""
@@ -87,9 +100,9 @@ func (a *App) sendDiscovery(ctx context.Context, targets []*net.UDPAddr) error {
 		if _, err = conn.WriteToUDP(packet, target); err == nil {
 			sent++
 		}
-		if i%32 == 31 {
+		if i%discoveryBurst == discoveryBurst-1 {
 			a.setDiscoveryProgress(func(p *discoveryProgress) { p.Sent = sent })
-			if !pause(ctx, 125*time.Millisecond) {
+			if !pause(ctx, discoveryBurstPause) {
 				return ctx.Err()
 			}
 		}
@@ -155,7 +168,8 @@ func localBroadcastTargets(port int) ([]*net.UDPAddr, error) {
 	return append(targets, &net.UDPAddr{IP: net.IPv4bcast, Port: port}), nil
 }
 
-// broadcastAddress 网卡地址所在网段的定向广播地址；不是 IPv4、或网段太小（/31、/32）时返回 nil。
+// broadcastAddress 网卡地址所在网段的定向广播地址；不是 IPv4、或网段太小时返回 nil
+// （/31、/32 没有广播地址，下面的 32 和 30 是 IPv4 掩码位数）。
 func broadcastAddress(address net.Addr) net.IP {
 	ip, network, err := net.ParseCIDR(address.String())
 	if err != nil || ip.To4() == nil {
@@ -200,10 +214,7 @@ func openDiscoverySocket(ctx context.Context) (conn *net.UDPConn, release func()
 
 // discoverPhones 网页点“搜索设备”：立即开始一轮搜索。
 func (a *App) discoverPhones(c *gin.Context) {
-	a.mu.Lock()
-	enabled := a.discoveryEnabledLocked()
-	a.mu.Unlock()
-	if !enabled {
+	if !a.discoveryEnabled() {
 		fail(c, 409, "自动发现已关闭")
 		return
 	}

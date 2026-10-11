@@ -57,7 +57,9 @@ type observedMessage struct {
 	ImageError    string `json:"image_error"`
 	OriginalHash  string `json:"original_hash"`  // 电脑已从手机下载并保存的原图
 	OriginalError string `json:"original_error"` // 手机取原图失败的原因
-	OriginalNote  string `json:"original_note"`
+	// 手机没有尝试取原图的原因（例如没能在屏幕上定位这张图片）：没点开过大图，不计入失败次数
+	OriginalSkipped string `json:"original_skipped"`
+	OriginalNote    string `json:"original_note"`
 }
 
 // snapshot 是手机上报的一屏消息，或一次读取向上翻页拼出的多屏消息。
@@ -162,10 +164,13 @@ func (a *App) mergeHistoryLocked(c *Conversation, snap snapshot) bool {
 	return aligned
 }
 
-// recentKnown 用来衔接的已有记录：最近 100 条；记录被删除过且不足 100 条时，前面接上删除时留下的衔接点。
+// alignWindow 衔接时比对的已有记录条数：与手机一次最多读取的条数一致，读回来的窗口都能落在里面。
+const alignWindow = 100
+
+// recentKnown 用来衔接的已有记录：最近 alignWindow 条；记录被删除过且不足 100 条时，前面接上删除时留下的衔接点。
 func (c *Conversation) recentKnown() []Message {
-	recent := c.Messages[max(0, len(c.Messages)-100):]
-	if len(recent) < 100 {
+	recent := c.Messages[max(0, len(c.Messages)-alignWindow):]
+	if len(recent) < alignWindow {
 		return c.withAnchor(recent)
 	}
 	return recent
@@ -229,10 +234,13 @@ func (a *App) appendNewLocked(c *Conversation, window []Message, observed []obse
 	}
 }
 
-// attachObserved 把这次观察到的发送人、缩略图和原图补到消息上（已有的不覆盖），返回消息是否有变化。
+// attachObserved 把这次观察到的方向、发送人、缩略图和原图补到消息上（已有的不覆盖），返回消息是否有变化。
 func (a *App) attachObserved(m *Message, seen observedMessage) bool {
 	before := *m
-	// 发送人：之前被屏幕边缘截断没识别出来的，这次补上
+	// 方向和发送人：之前被屏幕边缘截断、没看到头像的，这次补上
+	if m.Direction == dirUnknown && (seen.Direction == dirIncoming || seen.Direction == dirOutgoing) {
+		m.Direction = seen.Direction
+	}
 	if m.Sender == "" {
 		m.Sender = seen.Sender
 	}
@@ -240,7 +248,8 @@ func (a *App) attachObserved(m *Message, seen observedMessage) bool {
 	if isMedia(*m) && m.ImageHash == "" && seen.Thumbnail != "" {
 		m.ImageHash, m.ImageError = a.saveThumbnail(seen.Thumbnail)
 	}
-	// 原图：已有就不动；这次取到了就记下；这次取失败就记下原因并累计次数（满 2 次不再尝试）
+	// 原图：已有就不动；这次取到了就记下；这次取失败就记下原因并累计次数（满 maxOriginalTries 次不再尝试）；
+	// 手机没有尝试（没能定位）只记下原因，下次读取还会再取
 	if m.Kind == msgImage {
 		switch {
 		case m.OriginalHash != "":
@@ -249,6 +258,8 @@ func (a *App) attachObserved(m *Message, seen observedMessage) bool {
 		case seen.OriginalError != "":
 			m.OriginalError = seen.OriginalError
 			m.OriginalTries++
+		case seen.OriginalSkipped != "":
+			m.OriginalError = seen.OriginalSkipped
 		}
 	}
 	return *m != before

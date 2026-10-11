@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+const (
+	reconnectDelay   = 3 * time.Second // 连不上手机时，等这么久再试
+	eventBatchSize   = 100             // 一次长轮询最多取的事件数
+	eventWaitSeconds = 20              // 长轮询最多等的秒数，须小于 phoneCallTimeout
+	maxLiveNotices   = 20              // 每个会话保留的最近通知正文条数，用来定位新增消息
+)
+
 // PhoneEvent 是手机推送的消息事件：
 //   - notification：微信通知（只有预览文字）
 //   - unread_chat：首页出现新的未读会话
@@ -48,7 +55,7 @@ func (a *App) eventLoop(ctx context.Context, phoneID string) {
 			if ctx.Err() == nil { // 服务退出导致的失败不算连接失败
 				a.setPhoneStatus(phoneID, connFailed, nil, err)
 			}
-			pause(ctx, 3*time.Second)
+			pause(ctx, reconnectDelay)
 			continue
 		}
 		a.applyEvents(phoneID, cfg, batch)
@@ -83,10 +90,10 @@ func connectionStatus(device json.RawMessage) string {
 	return connOnline
 }
 
-// pollEvents 长轮询游标之后的新事件：手机有事件时立即返回，否则最多等 20 秒。
+// pollEvents 长轮询游标之后的新事件：手机有事件时立即返回，否则最多等 eventWaitSeconds 秒。
 func (a *App) pollEvents(ctx context.Context, phoneID string, cursor int64) (eventBatch, error) {
 	var batch eventBatch
-	err := a.phoneRequest(ctx, phoneID, "GET", fmt.Sprintf("/v1/events?after=%d&limit=100&wait=20", cursor), nil, "", &batch)
+	err := a.phoneRequest(ctx, phoneID, "GET", fmt.Sprintf("/v1/events?after=%d&limit=%d&wait=%d", cursor, eventBatchSize, eventWaitSeconds), nil, "", &batch)
 	return batch, err
 }
 
@@ -126,10 +133,10 @@ func (a *App) ingestLocked(e PhoneEvent) {
 	case "unread_chat":
 		c.noteUnread(e)
 	case "visible_snapshot":
+		// 监测不点开图片，由读取任务去取原图
+		pendingBefore := c.firstPendingOriginal()
 		a.mergeLocked(c, e.Snapshot)
-		if c.wantsOriginals() && c.firstPendingOriginal() >= 0 {
-			c.OriginalsDue = true // 监测不点开图片，由读取任务去取原图
-		}
+		c.noteOriginalsProgress(pendingBefore)
 	}
 }
 
@@ -138,12 +145,12 @@ func chatEvent(e PhoneEvent) bool {
 	return strings.TrimSpace(e.Chat) != "" && !unsupportedChats[e.Chat] && !(e.Kind == "notification" && e.Chat == wechatSystemTitle)
 }
 
-// noteNotification 记下微信通知：新消息提示（最近 20 条通知正文用于定位新增部分）、列表预览，并等待读取。
+// noteNotification 记下微信通知：新消息提示（最近的通知正文用于定位新增部分）、列表预览，并等待读取。
 func (c *Conversation) noteNotification(e PhoneEvent) {
 	c.LiveSignal, c.LiveSignalAt = true, e.ReceivedAt
 	if e.Text != "" {
 		c.LiveNotices = append(c.LiveNotices, e.Text)
-		c.LiveNotices = c.LiveNotices[max(0, len(c.LiveNotices)-20):]
+		c.LiveNotices = c.LiveNotices[max(0, len(c.LiveNotices)-maxLiveNotices):]
 	}
 	c.Preview, c.Updated = e.Text, now()
 	c.NeedsRead = true

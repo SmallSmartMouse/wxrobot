@@ -629,6 +629,23 @@ func TestOriginalFailuresStopAfterTwoTries(t *testing.T) {
 	}
 }
 
+// 手机没能在屏幕上定位图片、没点开过大图：记下原因，但不算一次失败，之后还会再取。
+func TestUnlocatedOriginalIsNotCountedAsTry(t *testing.T) {
+	a := testApp(t)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c := a.conversationLocked("acc", "小王")
+	c.Kind = "person"
+	window := `{"messages":[{"text":"a","direction":"incoming"},{"text":"[图片]","kind":"image","direction":"incoming","original_skipped":"没能在屏幕上定位这张图片"}]}`
+	for i := 0; i < maxOriginalTries+1; i++ {
+		a.mergeOrAppendLocked(c, json.RawMessage(window))
+	}
+	img := c.Messages[1]
+	if c.firstPendingOriginal() != 1 || img.OriginalTries != 0 || img.OriginalError != "没能在屏幕上定位这张图片" {
+		t.Fatalf("unlocated image should stay pending with its reason: %+v", img)
+	}
+}
+
 func TestOriginalsOnByDefault(t *testing.T) {
 	group := &Conversation{Kind: "group"}
 	person := &Conversation{Kind: "person"}
@@ -674,6 +691,9 @@ func TestGroupSenderAndAvatarPersist(t *testing.T) {
 	got := b.state.Conversations[c.ID]
 	if texts(got) != "早,好,[表情]" || got.Messages[0].Sender != "张三" || got.Messages[1].Sender != "李四" {
 		t.Fatalf("senders not merged or persisted: %s %+v", texts(got), got.Messages)
+	}
+	if got.Messages[1].Direction != "incoming" {
+		t.Fatalf("direction of the clipped message should be filled in: %+v", got.Messages[1])
 	}
 	if got.Messages[2].ImageHash == "" || got.Members["张三"] == "" || got.Members["李四"] != "" {
 		t.Fatalf("sticker thumbnail and avatar should be saved: %+v %+v", got.Messages[2], got.Members)

@@ -13,14 +13,55 @@ var BASE = "/sdcard/wechat-bridge/";
 var config = JSON.parse(files.read(BASE + "config.json"));
 var ui = require(files.join(files.cwd(), "wechat.js"))(config, BASE);
 
+// 任务
 var TASK_TIMEOUT_MS = 150000; // 单个任务的界面操作上限（翻页读取 100 条可能较慢）
+var TASK_GRACE_MS = 15000; // 任务执行中不更新心跳：超过任务上限再等这么久仍没结束，才认为主线程卡住
 var QUEUE_TIMEOUT_MS = 60000; // 手机一直未就绪时，排队任务超过该时间视为失败
-var MAX_FINISHED_TASKS = 50;
-var MAX_EVENTS = 300;
-var MAX_EVENT_RESPONSE_CHARS = 2000000;
-var MAX_BODY_BYTES = 16000000;
+var MAX_FINISHED_TASKS = 50; // 保留的任务数：电脑重启后续查最近的任务够用
+var HEARTBEAT_TIMEOUT_MS = 45000; // 主循环这么久没有心跳就报告不在线（一轮监测最长约 25 秒的账号识别）
+
+// 电脑请求的参数上限（与电脑端的校验一致）
+var MAX_CHAT_LENGTH = 128; // 聊天名称最多的字数
+var DEFAULT_READ_LIMIT = 20; // 读取没指定条数时读多少条
+var MAX_READ_LIMIT = 100; // 一次读取最多的条数
+var MAX_UNTIL_TEXTS = 5; // 停止点最多几条文字
+var MAX_UNTIL_CHARS = 10000; // 每条停止点文字的长度上限
+var MAX_ORIGINALS = 3; // 一次读取最多取几张原图：点开大图很慢
+var MAX_TEXT_LENGTH = 2000; // 发送文字的长度上限：与微信输入框一致
+var MAX_IMAGE_CHARS = 12000000; // 发送图片的 Base64 长度上限（约 9 MB）
+var MAX_PATH_LENGTH = 4096; // 请求路径的长度上限
+var MAX_BODY_BYTES = 16000000; // 请求体上限：发送图片时最大
+
+// 事件
+var MAX_EVENTS = 300; // 保留的事件数：电脑断开一会儿再连上也能取回
+var MAX_EVENT_RESPONSE_CHARS = 2000000; // 一次返回的事件总长度上限（快照可能带缩略图）
+var DEFAULT_EVENT_LIMIT = 20; // 一次返回的事件数（电脑没指定时）
+var MAX_EVENT_LIMIT = 100; // 一次最多返回的事件数
+var MAX_EVENT_WAIT_SECONDS = 25; // 长轮询最多等的秒数，须小于电脑端的请求超时
+
+// 原图文件
 var MAX_FILE_BYTES = 40 * 1024 * 1024; // 原图文件上限
 var FILE_CHUNK_BYTES = 256 * 1024; // 原图分块发送，避免连接的发送队列一次装入大文件
+
+// 主循环与后台监测
+var LOOP_IDLE_MS = 400; // 主循环每轮之间的间歇：期间收到任务立即开始
+var LOOP_ERROR_PAUSE_MS = 2000; // 主循环出错后等这么久再继续，避免反复出错刷屏
+var MONITOR_TIMEOUT_MS = 5000; // 一轮后台监测的界面操作上限
+var VISIBLE_CHECK_MS = 3000; // 检查当前聊天内容的间隔
+var KEEP_SCREEN_ON_MS = 30 * 60 * 1000; // 每轮把常亮续到这么久之后：脚本退出后屏幕最终会熄灭
+var ACCOUNT_TIMEOUT_MS = 25000; // 识别账号（进“我”页面再回来）的界面操作上限
+var ACCOUNT_RETRY_MS = 60000; // 识别账号失败后多久重试
+
+// 诊断与日志
+var MAX_DIAGNOSTICS = 50; // 保留的异常和降级事件数
+var DIAGNOSTIC_MERGE_MS = 600000; // 同一问题 10 分钟内重复出现只累加次数
+var MAX_LOG_BYTES = 2 * 1024 * 1024; // bridge.log 超过这么大就轮转
+
+// 启动
+var RETRY_STEP_MS = 250; // 启动阶段轮询（等旧实例退出、等应用切到前台、等授权弹窗）的间隔
+var LOCK_TRIES = 60; // 等旧实例释放锁的次数（约 15 秒）
+var FOREGROUND_TRIES = 20; // 等 AutoJs6 切到前台的次数（约 5 秒）
+var CAPTURE_DIALOG_TRIES = 60; // 等截图授权弹窗出现的次数（约 15 秒）
 
 // ---------- 共享状态：连接线程与主线程共用，读写都在 withLock 内 ----------
 
@@ -64,13 +105,13 @@ function sha256(value) {
     return String(android.util.Base64.encodeToString(digest, android.util.Base64.NO_WRAP));
 }
 
-// log 同时输出到控制台和 bridge.log；日志超过 2 MB 时轮转为 bridge.log.1。
+// log 同时输出到控制台和 bridge.log；日志超过 MAX_LOG_BYTES 时轮转为 bridge.log.1。
 function log(message) {
     var line = new Date().toISOString() + " " + message;
     console.log(line);
     try {
         var path = BASE + "bridge.log";
-        if (files.exists(path) && new java.io.File(path).length() > 2 * 1024 * 1024) {
+        if (files.exists(path) && new java.io.File(path).length() > MAX_LOG_BYTES) {
             files.remove(path + ".1");
             files.rename(path, "bridge.log.1");
         }
@@ -88,7 +129,7 @@ function httpError(status, code, message) {
 
 // ---------- 诊断事件 ----------
 // 最近的异常（error）和降级（warning），通过 /v1/device 提供给电脑的诊断页。
-// 同一问题（级别、代码、会话、内容相同）10 分钟内重复出现只累加次数，避免监测循环刷屏。
+// 同一问题（级别、代码、会话、内容相同）在 DIAGNOSTIC_MERGE_MS 内重复出现只累加次数，避免监测循环刷屏。
 var diagnosticsLog = [];
 
 // addDiagnostic 记录一条异常或降级，并写入日志。context 可带 task_id、operation、chat、source。
@@ -97,10 +138,10 @@ function addDiagnostic(level, code, message, context) {
     log((level === "error" ? "异常 " : "降级 ") + code + " " + (context.task_id || "") + " " + message);
     withLock(function () {
         var now = Date.now();
-        // 从最新的往前找 10 分钟内的同一问题，找到就累计次数
+        // 从最新的往前找时间窗口内的同一问题，找到就累计次数
         for (var i = diagnosticsLog.length - 1; i >= 0; i--) {
             var d = diagnosticsLog[i];
-            if (now - d.last_ms > 600000) break;
+            if (now - d.last_ms > DIAGNOSTIC_MERGE_MS) break;
             if (d.level === level && d.code === code && d.chat === (context.chat || "") && d.message === message) {
                 d.count++;
                 d.last_ms = now;
@@ -109,7 +150,7 @@ function addDiagnostic(level, code, message, context) {
                 return;
             }
         }
-        // 新问题：追加一条，最多保留 50 条
+        // 新问题：追加一条，超过上限时丢掉最早的
         diagnosticsLog.push({
             level: level,
             code: code,
@@ -123,7 +164,7 @@ function addDiagnostic(level, code, message, context) {
             last_at: new Date(now).toISOString(),
             last_ms: now
         });
-        if (diagnosticsLog.length > 50) diagnosticsLog.shift();
+        if (diagnosticsLog.length > MAX_DIAGNOSTICS) diagnosticsLog.shift();
     });
 }
 
@@ -146,7 +187,7 @@ function taskView(task) {
 function validatePayload(operation, data) {
     if (!data || typeof data !== "object") httpError(400, "BAD_BODY", "需要 JSON 对象");
     var chat = data.chat;
-    if (typeof chat !== "string" || !chat.trim() || chat.length > 128 || /[\x00-\x1f]/.test(chat))
+    if (typeof chat !== "string" || !chat.trim() || chat.length > MAX_CHAT_LENGTH || /[\x00-\x1f]/.test(chat))
         httpError(400, "BAD_CHAT", "需要明确聊天名称");
     if (data.chat_type !== undefined && data.chat_type !== "person" && data.chat_type !== "group")
         httpError(400, "BAD_CHAT_TYPE", "会话类型必须为 person 或 group");
@@ -161,16 +202,16 @@ function validatePayload(operation, data) {
 
 // addReadOptions 读取：条数、是否读历史、是否识别会话类型、读完是否回到首页、读到哪几条已知消息停止、最多取几张原图。
 function addReadOptions(payload, data) {
-    var limit = data.limit === undefined ? 20 : data.limit;
-    if (typeof limit !== "number" || limit % 1 !== 0 || limit < 1 || limit > 100) httpError(400, "BAD_LIMIT", "limit 必须为 1–100 的整数");
+    var limit = data.limit === undefined ? DEFAULT_READ_LIMIT : data.limit;
+    if (typeof limit !== "number" || limit % 1 !== 0 || limit < 1 || limit > MAX_READ_LIMIT) httpError(400, "BAD_LIMIT", "limit 必须为 1–" + MAX_READ_LIMIT + " 的整数");
     if (data.read_history !== undefined && typeof data.read_history !== "boolean") httpError(400, "BAD_READ_HISTORY", "read_history 必须是布尔值");
     var until = data.until === undefined ? [] : data.until;
-    var validUntil = Array.isArray(until) && until.length <= 5 && until.every(function (t) {
-        return typeof t === "string" && t.length <= 10000;
+    var validUntil = Array.isArray(until) && until.length <= MAX_UNTIL_TEXTS && until.every(function (t) {
+        return typeof t === "string" && t.length <= MAX_UNTIL_CHARS;
     });
-    if (!validUntil) httpError(400, "BAD_UNTIL", "until 必须是最多 5 条文字");
+    if (!validUntil) httpError(400, "BAD_UNTIL", "until 必须是最多 " + MAX_UNTIL_TEXTS + " 条文字");
     var originals = data.originals === undefined ? 0 : data.originals;
-    if (typeof originals !== "number" || originals % 1 !== 0 || originals < 0 || originals > 3) httpError(400, "BAD_ORIGINALS", "originals 必须为 0–3 的整数");
+    if (typeof originals !== "number" || originals % 1 !== 0 || originals < 0 || originals > MAX_ORIGINALS) httpError(400, "BAD_ORIGINALS", "originals 必须为 0–" + MAX_ORIGINALS + " 的整数");
     payload.limit = limit;
     payload.read_history = data.read_history !== false;
     payload.identify_kind = data.identify_kind === true;
@@ -182,14 +223,14 @@ function addReadOptions(payload, data) {
 // addImage 发送图片：Base64 图片数据，不能同时带文字。
 function addImage(payload, data) {
     var image = data.image_base64;
-    if (data.text !== undefined || typeof image !== "string" || image.length > 12000000 || !/^[A-Za-z0-9+/=]+$/.test(image))
+    if (data.text !== undefined || typeof image !== "string" || image.length > MAX_IMAGE_CHARS || !/^[A-Za-z0-9+/=]+$/.test(image))
         httpError(400, "BAD_IMAGE", "图片数据无效");
     payload.image_base64 = image;
 }
 
-// addText 发送文字：1–2000 字。
+// addText 发送文字：1–MAX_TEXT_LENGTH 字。
 function addText(payload, data) {
-    if (typeof data.text !== "string" || !data.text.trim() || data.text.length > 2000) httpError(400, "BAD_TEXT", "文本必须为 1–2000 字符");
+    if (typeof data.text !== "string" || !data.text.trim() || data.text.length > MAX_TEXT_LENGTH) httpError(400, "BAD_TEXT", "文本必须为 1–" + MAX_TEXT_LENGTH + " 字符");
     payload.text = data.text;
 }
 
@@ -205,7 +246,7 @@ function createTask(operation, data, key) {
             if (existing.fingerprint !== fingerprint) httpError(409, "IDEMPOTENCY_CONFLICT", "同一 key 不能用于不同请求");
             return taskView(existing);
         }
-        // 主循环 45 秒没有心跳或手机未就绪时，不接新任务
+        // 主循环没有心跳或手机未就绪时，不接新任务
         if (!alive() || !deviceInfo.ready)
             httpError(409, "DEVICE_NOT_READY", "手机未就绪：" + (deviceInfo.reasons || []).join(", "));
         // 同一时刻只允许一个排队任务（电脑端本来就是逐个提交）
@@ -263,10 +304,10 @@ function finishTask(task, status, result) {
     log("任务 " + task.id + " " + task.operation + " " + status + " " + detail);
 }
 
-// alive 主线程是否在工作：最近 45 秒内有心跳，或者正在执行一个没超时的任务（任务期间主循环不转，不更新心跳）。
+// alive 主线程是否在工作：最近有心跳，或者正在执行一个没超时的任务（任务期间主循环不转，不更新心跳）。
 function alive() {
     var now = Date.now();
-    return now - heartbeat < 45000 || (taskStarted > 0 && now - taskStarted < TASK_TIMEOUT_MS + 15000);
+    return now - heartbeat < HEARTBEAT_TIMEOUT_MS || (taskStarted > 0 && now - taskStarted < TASK_TIMEOUT_MS + TASK_GRACE_MS);
 }
 
 // 取出下一个可执行的任务；手机长时间未就绪时让排队任务失败（未执行，可安全重试）。
@@ -404,7 +445,7 @@ function currentAccountId() {
 function accountDue() {
     return withLock(function () {
         var now = Date.now();
-        return accountWanted ? now - lastAccountTry > 60000 : now - accountCheckedAt > ACCOUNT_RECHECK_MS;
+        return accountWanted ? now - lastAccountTry > ACCOUNT_RETRY_MS : now - accountCheckedAt > ACCOUNT_RECHECK_MS;
     });
 }
 
@@ -446,7 +487,7 @@ function readAccount() {
 
 // identifyAccount 空闲时识别当前账号；日志只记操作流程、结果和耗时。
 function identifyAccount() {
-    ui.begin(25000);
+    ui.begin(ACCOUNT_TIMEOUT_MS);
     var id = "";
     try {
         id = readAccount();
@@ -511,9 +552,9 @@ function readEvents(after, limit) {
 
 // 长轮询：有新事件立即返回（pushEvent 会唤醒），否则等到超时。
 function waitEvents(query) {
-    var after = intParam(query.after, 0, 0, 9007199254740991),
-        limit = intParam(query.limit, 20, 1, 100),
-        wait = intParam(query.wait, 25, 0, 25);
+    var after = intParam(query.after, 0, 0, Number.MAX_SAFE_INTEGER),
+        limit = intParam(query.limit, DEFAULT_EVENT_LIMIT, 1, MAX_EVENT_LIMIT),
+        wait = intParam(query.wait, MAX_EVENT_WAIT_SECONDS, 0, MAX_EVENT_WAIT_SECONDS);
     var until = Date.now() + wait * 1000;
     return withLock(function () {
         var result;
@@ -607,7 +648,7 @@ function monitor() {
         monitorAccount = owner; unreadSeen = {}; lastSignature = null; lastChat = null;
     }
     // 在首页时：比较每个未读会话的行内容，变化了说明有新消息
-    ui.begin(5000);
+    ui.begin(MONITOR_TIMEOUT_MS);
     var unread = ui.unreadChats();
     if (unread) {
         for (var chat in unread) {
@@ -617,7 +658,7 @@ function monitor() {
     }
 
     // 当前聊天内容每 3 秒检查一次
-    if (Date.now() - lastVisibleCheck < 3000) return;
+    if (Date.now() - lastVisibleCheck < VISIBLE_CHECK_MS) return;
     lastVisibleCheck = Date.now();
     // 识别当前打开的聊天：先看标题控件；当前微信没有标题控件，就看是否仍在最近操作的聊天里（屏幕内容接得上）。
     // 接不上时不生成快照，避免把别的聊天的消息记错地方，改为请电脑补读最近操作的聊天。
@@ -678,7 +719,7 @@ function handleComputerRequest(message) {
 
 // parseComputerRequest 检查请求格式，拆出路径和查询参数。
 function parseComputerRequest(message) {
-    if ((message.method !== "GET" && message.method !== "POST") || typeof message.path !== "string" || message.path.length > 4096)
+    if ((message.method !== "GET" && message.method !== "POST") || typeof message.path !== "string" || message.path.length > MAX_PATH_LENGTH)
         httpError(400, "BAD_REQUEST", "请求格式无效");
     if (message.body != null && JSON.stringify(message.body).length > MAX_BODY_BYTES) httpError(413, "BODY_TOO_LARGE", "请求体过大");
     var target = message.path.split("?"),
@@ -771,15 +812,15 @@ function bringAutoJsForward() {
     var capturePackage = String(context.getPackageName());
     if (currentPackage() === capturePackage) return;
     app.launchPackage(capturePackage);
-    for (var attempt = 0; attempt < 20 && currentPackage() !== capturePackage; attempt++) sleep(250);
+    for (var attempt = 0; attempt < FOREGROUND_TRIES && currentPackage() !== capturePackage; attempt++) sleep(RETRY_STEP_MS);
     if (currentPackage() !== capturePackage)
         throw new Error("AutoJs6 未能进入前台，请手动打开 AutoJs6；若仍失败，请允许后台弹出界面，稍后自动重试");
 }
 
 // clickStartCapture 在另一个线程里等系统弹出“AutoJs6 将开始截取屏幕”，点“立即开始”。
 function clickStartCapture() {
-    for (var i = 0; i < 60; i++) {
-        sleep(250);
+    for (var i = 0; i < CAPTURE_DIALOG_TRIES; i++) {
+        sleep(RETRY_STEP_MS);
         if (currentPackage() !== "com.android.systemui") continue;
         var start = text("立即开始").findOnce();
         if (start && textMatches(/AutoJs6.*截取.*屏幕.*/).exists()) {
@@ -834,16 +875,16 @@ function stopOtherInstances() {
     }
 }
 
-// acquireProcessLock 等旧实例退出、释放 bridge.lock 后加锁，最多约 15 秒，返回 { file, lock }。
+// acquireProcessLock 等旧实例退出、释放 bridge.lock 后加锁（最多 LOCK_TRIES 次），返回 { file, lock }。
 // 旧实例与本实例在同一进程（AutoJs6）里，它仍持有锁时 tryLock 会抛出异常而不是返回 null。
 function acquireProcessLock() {
     var file = new java.io.RandomAccessFile(BASE + "bridge.lock", "rw");
-    for (var attempt = 0; attempt < 60; attempt++) {
+    for (var attempt = 0; attempt < LOCK_TRIES; attempt++) {
         try {
             var acquired = file.getChannel().tryLock();
             if (acquired) return { file: file, lock: acquired };
         } catch (_) {}
-        sleep(250);
+        sleep(RETRY_STEP_MS);
     }
     throw Error("旧的微信桥仍未停止，请稍后重试");
 }
@@ -886,9 +927,9 @@ function mainLoop() {
             loopOnce();
         } catch (e) {
             addDiagnostic("error", e.code || "LOOP_ERROR", "监测或主循环异常：" + String(e.message || e), { source: "monitor" });
-            sleep(2000);
+            sleep(LOOP_ERROR_PAUSE_MS);
         }
-        waitForTask(400);
+        waitForTask(LOOP_IDLE_MS);
     }
 }
 
@@ -901,7 +942,7 @@ function loopOnce() {
         return;
     }
     var info = refreshDeviceInfo();
-    device.keepScreenOn(30 * 60 * 1000); // 界面操作和截图都需要亮屏
+    device.keepScreenOn(KEEP_SCREEN_ON_MS); // 界面操作和截图都需要亮屏
     var task = takeTask();
     if (task) runTaskOnMainThread(task);
     else if (info.ready && accountDue()) identifyAccount();

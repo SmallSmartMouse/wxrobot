@@ -1,6 +1,6 @@
 // AI 回复页：全局默认或某个微信号的模型、角色提示词、看图设置和名称回复规则。
 // 微信号的设置可以分别跟随全局：跟随的项显示全局的值并禁止编辑。
-import { $, el, button, api, toast, app, accountLabel } from "./common.js";
+import { $, el, button, api, toast, app, accountLabel, DEFAULT_REPLY_INTERVAL } from "./common.js";
 import { registerPage, markDirty } from "./workspace.js";
 
 let scope = ""; // 编辑的范围：空为全局默认，否则是微信号
@@ -115,7 +115,7 @@ function syncScope() {
     $(id).classList.toggle("selected", selected);
     $(id).setAttribute("aria-pressed", String(selected));
   }
-  $("ai-scope-account").disabled = $("ai-scope").options.length < 2;
+  $("ai-scope-account").disabled = $("ai-scope").options.length < 2; // 只有“全局默认”一项：还没有微信号
 }
 
 // changeScope 切换编辑范围；有未保存的修改时先确认。
@@ -172,9 +172,9 @@ function changeRules(change) {
 // editRule 打开规则编辑框；i 为 -1 时新建。
 function editRule(i) {
   editing = i;
-  const r = rules[i] || { kind: "person", matcher: "wildcard", pattern: "", mode: "off", keyword: "", interval_seconds: 30 };
+  const r = rules[i] || { kind: "person", matcher: "wildcard", pattern: "", mode: "off", keyword: "", interval_seconds: DEFAULT_REPLY_INTERVAL };
   for (const k of ["kind", "matcher", "pattern", "mode", "keyword"]) $("rule-" + k).value = r[k] || "";
-  $("rule-interval").value = r.interval_seconds || 30;
+  $("rule-interval").value = r.interval_seconds || DEFAULT_REPLY_INTERVAL;
   $("rule-error").textContent = "";
   $("ai-rule-editor").dataset.changed = "false";
   $("ai-rule-editor").showModal();

@@ -11,6 +11,8 @@ import "./ai.js";
 import "./forward.js";
 import "./diagnostics.js";
 
+const FALLBACK_REFRESH_MS = 20000; // SSE 断开时的兜底刷新间隔
+
 let refreshing = false;
 let refreshAgain = false;
 
@@ -55,11 +57,11 @@ function showOffline(e) {
   toast(e.message);
 }
 
-// 其他模块通过 app 调用刷新和重绘。服务端数据变化时通过 SSE 通知刷新；另外每 20 秒兜底刷新一次。
+// 其他模块通过 app 调用刷新和重绘。服务端数据变化时通过 SSE 通知刷新；另外定时兜底刷新。
 app.refresh = refresh;
 app.render = render;
 const stream = new EventSource("/api/stream");
 stream.onmessage = () => void refresh();
 stream.onerror = () => ($("connection").textContent = "实时连接恢复中");
-setInterval(() => void refresh(), 20000);
+setInterval(() => void refresh(), FALLBACK_REFRESH_MS);
 void refresh();

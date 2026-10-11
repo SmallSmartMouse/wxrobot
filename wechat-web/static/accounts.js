@@ -1,8 +1,10 @@
 // 消息页顶部：当前查看的微信号、执行设备、手机连接状态和设备问题提示，以及诊断入口的红点。
 // 切换微信号时发出 account-change 事件（聊天区据此关闭不属于新账号的会话）。
-import { $, el, storage, accountLabel, app } from "./common.js";
+import { $, el, storage, accountLabel, badgeText, app } from "./common.js";
 import { deviceProblems, deviceStatus, deviceWarnings } from "./device-status.js";
 import { phoneName, icon, closeMenuOnOutsideClick } from "./workspace.js";
+
+const BADGE_WINDOW_MS = 24 * 60 * 60 * 1000; // 诊断红点只统计最近一天的问题：更早的看过诊断页就知道了
 
 let selectedAccount = storage.get("account"); // 当前查看的微信号
 
@@ -184,7 +186,7 @@ function renderDeviceNotes(phone) {
 
 // renderDiagBadge 诊断入口红点：最近 24 小时内、上次打开诊断页之后新出现的失败任务、降级任务和手机上报的异常。
 function renderDiagBadge() {
-  const seenAt = Math.max(Number(storage.get("diag-seen-at")) || 0, Date.now() - 86400000);
+  const seenAt = Math.max(Number(storage.get("diag-seen-at")) || 0, Date.now() - BADGE_WINDOW_MS);
   const fresh = (time) => new Date(time).getTime() > seenAt;
   const opIssues = app.state.operations.filter(
     (op) => fresh(op.created) && (["failed", "unknown"].includes(op.status) || op.warnings?.length),
@@ -192,7 +194,7 @@ function renderDiagBadge() {
   const phoneIssues = app.state.phones.flatMap((p) => p.device?.diagnostics || []).filter((d) => fresh(d.last_at) && !d.task_id);
   const count = opIssues.length + phoneIssues.length;
   $("diag-badge").hidden = !count;
-  $("diag-badge").textContent = count > 99 ? "99+" : String(count);
+  $("diag-badge").textContent = badgeText(count);
   $("diag-link").title = count ? "执行诊断：" + count + " 条新的异常或降级" : "执行诊断";
 }
 

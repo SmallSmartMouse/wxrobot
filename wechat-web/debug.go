@@ -9,10 +9,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// maxLogBytes 诊断页显示的服务日志长度（最后这么多字节）。
-const maxLogBytes = 64 << 10
+const (
+	maxLogBytes     = 64 << 10 // 诊断页显示的服务日志长度（最后这么多字节）：够看最近的问题，又不拖慢页面
+	debugOperations = 100      // 诊断页列出的最近任务数（含执行步骤）
+	debugAIJobs     = 50       // 诊断页列出的最近 AI 记录数
+)
 
-// getDebug 只读诊断：返回最近 100 个任务（含执行步骤）、50 条 AI 记录、手机上报的状态和服务日志的末尾。
+// getDebug 只读诊断：返回最近的任务（含执行步骤）和 AI 记录、手机上报的状态，以及服务日志的末尾。
 // 沿用本机访问限制；不返回凭证，也不开放任意文件读取。
 func (a *App) getDebug(c *gin.Context) {
 	a.mu.Lock()
@@ -22,14 +25,14 @@ func (a *App) getDebug(c *gin.Context) {
 		"phones":        a.phoneViewsLocked(),
 		"error":         a.lastError,
 		"conversations": a.conversationTitlesLocked(),
-		"operations":    a.recentOperationsLocked(100),
-		"ai_jobs":       newest(mapValues(a.state.AIJobs), func(j *AIJob) string { return j.Created }, 50),
+		"operations":    a.recentOperationsLocked(debugOperations),
+		"ai_jobs":       newest(mapValues(a.state.AIJobs), func(j *AIJob) string { return j.Created }, debugAIJobs),
 		"log":           a.hideSecretsLocked(logText),
 		"log_error":     logError,
 	})
 }
 
-// serverLogTail 读取数据目录中 server.log 的最后 64 KB；不可用时返回说明。
+// serverLogTail 读取数据目录中 server.log 的末尾 maxLogBytes 字节；不可用时返回说明。
 func (a *App) serverLogTail() (text, problem string) {
 	file, err := os.Open(filepath.Join(filepath.Dir(a.path), "server.log"))
 	if err != nil {

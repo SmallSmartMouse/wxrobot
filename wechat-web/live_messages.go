@@ -35,7 +35,7 @@ func (a *App) mergeLiveLocked(c *Conversation, snap snapshot, atLatest bool) boo
 	if stale && c.recorded(window) {
 		return true
 	}
-	c.seedLiveAnchor(false)
+	c.ensureLiveAnchor()
 	known := c.LiveAnchor
 	start, base, aligned := newMessagesStart(known, window)
 	if !c.LiveReady {
@@ -68,11 +68,10 @@ func (a *App) mergeLiveLocked(c *Conversation, snap snapshot, atLatest bool) boo
 	return aligned
 }
 
-// mergeLiveResultLocked 并入仅新增模式读取到的聊天底部；读取期间切回了历史模式也按发起时的模式衔接。
-func (a *App) mergeLiveResultLocked(c *Conversation, raw json.RawMessage) {
-	if snap, ok := a.observeLocked(c, raw); ok {
-		a.mergeLiveLocked(c, snap, true)
-	}
+// mergeLiveResultLocked 并入仅新增模式读取到的聊天底部，返回是否衔接上；读取期间切回了历史模式也按发起时的模式衔接。
+func (a *App) mergeLiveResultLocked(c *Conversation, raw json.RawMessage) bool {
+	snap, ok := a.observeLocked(c, raw)
+	return ok && a.mergeLiveLocked(c, snap, true)
 }
 
 // noteEmptyScreenLocked读到聊天底部却没有消息：有新消息提示时（聊天还没加载出来，或消息都无法识别）
@@ -129,12 +128,15 @@ func liveAnchorOf(messages []Message) []Message {
 	return out
 }
 
-// seedLiveAnchor 切换模式、首次进入已有会话时沿用已保存的末尾，不能重新吃掉一屏新增。
-// force 为 true 时即使已初始化也重新取（切换到仅新增模式时）。
-func (c *Conversation) seedLiveAnchor(force bool) {
-	if c.LiveReady && !force {
-		return
+// ensureLiveAnchor 首次在仅新增模式下读取已有会话时，沿用已保存的末尾作为观察窗口，不能重新吃掉一屏新增。
+func (c *Conversation) ensureLiveAnchor() {
+	if !c.LiveReady {
+		c.resetLiveAnchor()
 	}
+}
+
+// resetLiveAnchor 用已保存的末尾重新作为观察窗口（切换到仅新增模式时）。还没有任何记录时保持未初始化。
+func (c *Conversation) resetLiveAnchor() {
 	if known := c.withAnchor(c.Messages); len(known) > 0 {
 		c.LiveAnchor, c.LiveReady = liveAnchorOf(known), true
 	}

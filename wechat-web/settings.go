@@ -56,7 +56,7 @@ func (a *App) switchReadModeLocked(newMessagesOnly bool) (undo func()) {
 	for id, c := range a.state.Conversations {
 		saved[id] = *c
 		if newMessagesOnly {
-			c.seedLiveAnchor(true)
+			c.resetLiveAnchor()
 			if !c.NeedsRead {
 				c.clearLiveSignal()
 			}

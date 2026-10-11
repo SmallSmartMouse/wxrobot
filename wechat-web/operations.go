@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -36,8 +37,11 @@ const (
 	opUnknown   = "unknown" // 发送可能已执行，结果无法确认
 )
 
-// operationTimeout 一个任务从提交到手机返回结果的上限：读取时可能要点开大图取原图。
-const operationTimeout = 4 * time.Minute
+const (
+	operationTimeout = 4 * time.Minute // 一个任务从提交到手机返回结果的上限：读取时可能要点开大图取原图
+	maxReadLimit     = 100             // 一次读取最多的条数：与手机桥的限制一致
+	maxTaskSteps     = 60              // 每个任务保留的执行步骤条数：够看清出错前后，不让记录无限增长
+)
 
 // Operation 是一次读取或发送任务。ID 同时作为手机任务的 Idempotency-Key，
 // 因此服务重启后重新提交也不会让手机重复执行。
@@ -126,6 +130,7 @@ func (a *App) pruneOperationsLocked() {
 
 // ---------- 网页提交 ----------
 
+// idempotencyKey 请求编号的格式：与手机桥接受的 Idempotency-Key 一致。
 var idempotencyKey = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
 // operationRequest 是网页提交读取或发送的请求。
@@ -136,17 +141,17 @@ type operationRequest struct {
 	Limit     int    `json:"limit"`
 }
 
-// problem 检查请求编号、读取条数和发送内容（图片和文字二选一，文字 1–2000 字），没问题返回空字符串。
+// problem 检查请求编号、读取条数和发送内容（图片和文字二选一），没问题返回空字符串。
 func (r operationRequest) problem(kind, key string) string {
 	switch {
 	case !idempotencyKey.MatchString(key):
 		return "缺少有效的 Idempotency-Key"
-	case kind == opRead && (r.Limit < 1 || r.Limit > 100):
-		return "读取数量必须为 1–100"
+	case kind == opRead && (r.Limit < 1 || r.Limit > maxReadLimit):
+		return fmt.Sprintf("读取数量必须为 1–%d", maxReadLimit)
 	case kind == opSend && r.ImageHash != "" && r.Text != "":
 		return "图片与文字请分别发送"
-	case kind == opSend && r.ImageHash == "" && (strings.TrimSpace(r.Text) == "" || len([]rune(r.Text)) > 2000):
-		return "消息必须为 1–2000 字符"
+	case kind == opSend && r.ImageHash == "" && (strings.TrimSpace(r.Text) == "" || len([]rune(r.Text)) > maxMessageRunes):
+		return fmt.Sprintf("消息必须为 1–%d 字符", maxMessageRunes)
 	}
 	return ""
 }
@@ -399,13 +404,16 @@ func (a *App) addReadOptionsLocked(body map[string]any, op *Operation, c *Conver
 		return
 	}
 	if c.wantsOriginals() && (!op.NewMessagesOnly || len(c.LiveAnchor) > 0) {
-		body["originals"] = 2
+		body["originals"] = originalsPerRead
 	}
-	if op.NewMessagesOnly {
+	switch {
+	case op.NewMessagesOnly && op.Reason == readForOriginals:
+		body["until"] = liveOriginalsUntil(c)
+	case op.NewMessagesOnly:
 		// 仅新增模式只为翻回上次读到的位置：停在最后 1 条文字即可衔接，
 		// 要求 3 条会多翻回 2 条旧文字，在手机的翻页上限内能接住的新消息更少
-		body["until"] = lastTexts(c.LiveAnchor, 1)
-	} else {
+		body["until"] = lastTexts(c.LiveAnchor, liveStopTexts)
+	default:
 		body["until"] = autoReadUntil(c)
 	}
 }
@@ -507,11 +515,11 @@ func (a *App) finishLocked(op *Operation, status string, result json.RawMessage,
 	}
 }
 
-// recordExecutionLocked 保存手机上报的执行记录：步骤只留最后 60 条，截图另存为图片文件、记录里只留哈希；
+// recordExecutionLocked 保存手机上报的执行记录：步骤只留最后 maxTaskSteps 条，截图另存为图片文件、记录里只留哈希；
 // 发送后补读失败也算一处降级。
 func (a *App) recordExecutionLocked(op *Operation, r taskResult) {
 	d := r.Diagnostics
-	op.DurationMS, op.Steps, op.Warnings = d.DurationMS, d.Steps[max(0, len(d.Steps)-60):], d.Warnings
+	op.DurationMS, op.Steps, op.Warnings = d.DurationMS, d.Steps[max(0, len(d.Steps)-maxTaskSteps):], d.Warnings
 	for i := range op.Steps {
 		if img := op.Steps[i].Image; img != "" {
 			op.Steps[i].Image, _ = a.saveThumbnail(img)
@@ -559,10 +567,13 @@ func (a *App) mergeReadLocked(op *Operation, c *Conversation, result json.RawMes
 }
 
 // mergeLiveReadLocked 合并仅新增模式的读取结果。没读到内容、需要稍后再读时合并过程会重新安排；
-// 否则这次读取有效，退避从头计算。衔接有缺口时记一条降级。
+// 否则这次读取有效，退避从头计算。衔接有缺口时记一条降级。还有图片没取原图且有进展时，过一会儿补取。
 func (a *App) mergeLiveReadLocked(op *Operation, c *Conversation, result json.RawMessage) {
 	c.ReadRetryAt = ""
-	a.mergeLiveResultLocked(c, result)
+	pendingBefore := c.firstPendingOriginal()
+	if a.mergeLiveResultLocked(c, result) {
+		c.noteOriginalsProgress(pendingBefore)
+	}
 	if c.ReadRetryAt == "" {
 		c.ReadFailures = 0
 	}
@@ -589,7 +600,7 @@ func (a *App) mergeHistoryReadLocked(op *Operation, c *Conversation, result json
 		return
 	}
 	// 还有图片没取原图，且这次有进展：过一会儿接着读
-	if pending := c.firstPendingOriginal(); aligned && c.wantsOriginals() && pending >= 0 && pending != pendingBefore {
-		c.OriginalsDue = true
+	if aligned {
+		c.noteOriginalsProgress(pendingBefore)
 	}
 }
